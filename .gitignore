@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.python-version
+
+# Environment + secrets
+.env
+.env.local
+.env.*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Radar data — local researcher state, never commit
+*.db
+*.sqlite
+*.sqlite3
+data/
+vault/
+chroma/
+ollama/
+rag_vault/
+
+# Model caches
+.cache/
+models/

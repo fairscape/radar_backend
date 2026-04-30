@@ -1,0 +1,43 @@
+# Local virtualenvs and editor caches
+.venv
+venv
+env
+.env
+.env.*
+.idea
+.vscode
+
+# Python build / cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+*.egg
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Stateful directories — the compose volumes provide these at runtime;
+# we never want a developer's local DB / vault / chroma to bake into the
+# image and ship to a fresh deploy.
+data
+vault
+chroma
+ollama
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Source control + node bleed-through
+.git
+.gitignore
+node_modules
+
+# Misc
+*.log
+.DS_Store
