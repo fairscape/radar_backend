@@ -30,14 +30,21 @@ class FakeOpenAlexClient:
         self,
         canned_works: dict[str, dict] | None = None,
         search_results: list[dict] | None = None,
+        tier_results: list[list[dict]] | None = None,
     ):
         # keyed by doi (lowercased)
         self.canned_works = {k.lower(): v for k, v in (canned_works or {}).items()}
         self.search_results = list(search_results or [])
+        # Optional per-call result list for paginate_filter — pop one
+        # batch per call so a tier-walking test can simulate "tier 1
+        # returns 0, tier 2 returns 100". When exhausted, falls back to
+        # search_results.
+        self._tier_results = list(tier_results) if tier_results is not None else None
         self.api_calls = 0
         self.lookups_by_doi: list[str] = []
         self.lookups_by_title: list[tuple[str, int | None]] = []
         self.searches: list[dict] = []
+        self.paginate_calls: list[dict] = []
 
     def lookup_by_doi(self, doi: str) -> dict | None:
         self.api_calls += 1
@@ -68,6 +75,29 @@ class FakeOpenAlexClient:
             "topic_filters": topic_filters, "since": since, "limit": limit,
         })
         out = list(self.search_results)
+        if limit is not None:
+            out = out[:limit]
+        return out
+
+    def paginate_filter(
+        self,
+        filter_str: str,
+        *,
+        limit: int | None = None,
+        per_page: int = 200,
+    ) -> list[dict]:
+        """In-memory stand-in for ``OpenAlexClient.paginate_filter``.
+
+        Returns the next batch from ``tier_results`` if configured, else
+        falls back to ``search_results``. Records the call so tests can
+        assert on the rendered filter string."""
+        self.api_calls += 1
+        self.paginate_calls.append({"filter_str": filter_str, "limit": limit})
+        if self._tier_results is not None:
+            batch = self._tier_results.pop(0) if self._tier_results else []
+            out = list(batch)
+        else:
+            out = list(self.search_results)
         if limit is not None:
             out = out[:limit]
         return out

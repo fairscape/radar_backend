@@ -30,7 +30,8 @@ from ..paper import Paper
 from ..persistence.db_store import dedup_and_insert_candidates
 from ..profile import Profile
 from ..radar import _days_ago_iso
-from ..selectors.centroid import CentroidSelector
+from ..selector import Selector
+from ..selectors import get_selector, selector_from_config
 
 log = structlog.get_logger("rag_lib.scheduler.jobs")
 
@@ -97,20 +98,46 @@ def _load_profile(conn, profile_row) -> Profile:
     )
 
 
-def _build_selector(profile_row, profile: Profile) -> CentroidSelector:
-    """Reuse the persisted centroid when available, else refit from seeds."""
+def _build_selector(profile_row, profile: Profile) -> Selector:
+    """Reuse the persisted selector config when available, else refit.
+
+    Dispatches by ``selector_config_json["type"]`` through the selector
+    registry, so any registered selector (centroid, max_seed, or a
+    plugin) hydrates without changes here. Falls back to a fresh
+    centroid fit when the profile has no persisted config (legacy rows
+    written before the registry landed).
+    """
     sel_json = profile_row["selector_config_json"]
+    cfg: dict | None = None
     if sel_json:
         try:
             cfg = json.loads(sel_json)
         except json.JSONDecodeError:
             cfg = None
-        if cfg and cfg.get("centroid"):
-            return CentroidSelector.from_config(cfg)
 
-    selector = CentroidSelector(embedding_model=profile.embedding_model)
+    if cfg and cfg.get("type"):
+        selector = selector_from_config(cfg)
+        # If the persisted config carries fitted state, use it as-is.
+        # Otherwise fit now against the live profile so the scheduler
+        # never hands an unfit selector to ``select()``.
+        if not _is_fit_payload(cfg):
+            selector.fit(profile)
+        return selector
+
+    cls = get_selector("centroid")
+    selector = cls(embedding_model=profile.embedding_model)
     selector.fit(profile)
     return selector
+
+
+def _is_fit_payload(cfg: dict) -> bool:
+    """Heuristic: a persisted config is "fit" if it carries any of the
+    state keys produced by ``fit()``. Adding a selector with new state
+    keys means extending this check."""
+    return any(
+        cfg.get(k) is not None
+        for k in ("centroid", "seed_matrix")
+    )
 
 
 def gather_for_profile(
@@ -162,12 +189,18 @@ def gather_for_profile(
 
             candidates = gatherer.fetch(profile, since=since, limit=limit)
             ranked = selector.select(candidates, profile, threshold=profile.threshold)
+            # Carry the actual tier the gatherer landed on (e.g.
+            # "must-have-AND") through to the audit row + per-candidate
+            # rows. Falls back to ``tier`` (the scheduler's calling
+            # context — "scheduled" / "manual") when no tier ran (empty
+            # topic_filters, gatherer.last_tier_used is None).
+            tier_label = gatherer.last_tier_used or tier
             n_new, n_redup = dedup_and_insert_candidates(
                 conn,
                 profile_id=profile_id,
                 gather_run_id=run_id,
                 ranked=ranked,
-                tier_used="scheduled",
+                tier_used=tier_label,
             )
             api_calls = gatherer.cost().get("api_calls", 0)
             gather_runs_repo.finish(
@@ -177,7 +210,7 @@ def gather_for_profile(
                 n_new=n_new,
                 n_redup=n_redup,
                 api_calls=int(api_calls),
-                tier_used="scheduled",
+                tier_used=tier_label,
             )
             log.info(
                 "scheduler.gather_ok",

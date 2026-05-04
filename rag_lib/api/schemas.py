@@ -287,6 +287,13 @@ class Draft(_Model):
 
 class DraftCreateRequest(_Model):
     name: str
+    # Plugin keys. Both default to ``None`` so the router can fall back
+    # to the configured ``RADAR_DEFAULT_EMBEDDING_MODEL`` and the
+    # built-in ``"centroid"`` selector. Any registered key from
+    # ``rag_lib.embedders.EMBEDDERS`` / ``rag_lib.selectors.SELECTORS``
+    # is accepted; unknown keys raise 400.
+    embedding_model: str | None = None
+    selector: str | None = None
 
 
 class DraftCoherence(_Model):
@@ -329,6 +336,28 @@ class DraftDryRun(_Model):
     sweep: list[SweepRow] = Field(default_factory=list)
     preview: list[Card] = Field(default_factory=list)
     scores: list[float] = Field(default_factory=list)
+
+
+class WizardOption(_Model):
+    """One row in the wizard's embedder/selector dropdowns.
+
+    ``key`` is the registry key the create-draft body expects.
+    ``label`` and ``description`` are human-friendly strings the UI
+    renders. ``default`` is true on exactly one row per list — the value
+    the dropdown should pre-select.
+    """
+
+    key: str
+    label: str
+    description: str = ""
+    default: bool = False
+
+
+class WizardOptions(_Model):
+    """Output of ``GET /api/profiles/wizard/options``."""
+
+    embedders: list[WizardOption] = Field(default_factory=list)
+    selectors: list[WizardOption] = Field(default_factory=list)
 
 
 class CommitDraftRequest(_Model):

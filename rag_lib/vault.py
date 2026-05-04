@@ -104,6 +104,38 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
     )
 
 
+def fetch_pdf_text(url: str, *, timeout: float = 30.0) -> str:
+    """Download a PDF from ``url`` and return its extracted body text.
+
+    Writes to a temp file, delegates to :func:`ingest_pdf` for parsing,
+    then deletes the temp file. Raises on network or parse errors so the
+    caller can decide whether to fall back. Nothing is persisted to the
+    papers DB or vault — selectors that fetch on demand treat the
+    returned text as transient.
+    """
+    import os
+    import tempfile
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "radar-fulltext/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        record = ingest_pdf(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    return record.body_text
+
+
 def compute_file_hash(data: bytes | str | Path) -> str:
     """sha256 of file bytes, hex-encoded.
 

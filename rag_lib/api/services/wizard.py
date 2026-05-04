@@ -19,7 +19,10 @@ their FK on commit without copy.
             10-card preview of the top hits.
   Commit  — ``commit_draft`` flips ``is_draft`` to 0, persists the
             chosen threshold + the pruned topic_filters, fits and
-            stores the CentroidSelector, and registers a daily schedule.
+            stores whichever selector the draft picked (registry
+            dispatch — when it's the centroid selector, the fitted
+            centroid lands on ``profiles.centroid`` for fast restart),
+            and registers a daily schedule.
 """
 
 from __future__ import annotations
@@ -41,10 +44,9 @@ from ...db.repos import (
     schedules as schedules_repo,
 )
 from ...gatherers.openalex import OpenAlexGatherer
-from ...openalex_client import _build_filter_string
 from ...paper import Paper, Topic
 from ...profile import Profile
-from ...selectors.centroid import CentroidSelector
+from ...selectors import get_selector
 from ..mappers import _bucket_for, _read_minutes
 from ..schemas import Card, DraftCoherence, DraftDryRun, SweepRow
 
@@ -72,6 +74,7 @@ def create_draft(
     user_id: int,
     name: str,
     embedding_model: str = "placeholder-v1",
+    selector: str = "centroid",
 ) -> dict:
     """Insert a draft profiles row. Returns ``{slug, name}``.
 
@@ -81,19 +84,35 @@ def create_draft(
     name when needed; the user sees the suffix and can rename later.
 
     ``embedding_model`` is stored on the profile so coherence joins and
-    selector fits use the same vectors the upload path produced. Pass
-    ``settings.RADAR_DEFAULT_EMBEDDING_MODEL`` from the router.
+    selector fits use the same vectors the upload path produced.
+
+    ``selector`` is the registry key (``"centroid"``, ``"max_seed"``, or
+    a plugin-registered name). Stored as ``selector_config_json={"type":
+    <key>}`` on the draft so the dry-run and commit steps know which
+    selector to fit. Both knobs are validated up-front; an unknown key
+    raises ``ValueError`` before any DB write.
     """
+    from ...embedders import get_embedder
+    get_embedder(embedding_model)  # validate; raises ValueError if unknown
+    get_selector(selector)         # validate; raises ValueError if unknown
+
     base_slug = profiles_repo.slugify(name)
     slug, suffix = _unique_slug(conn, user_id, base_slug)
     final_name = name if suffix == 0 else f"{name} ({suffix})"
-    profiles_repo.create_draft(
+    profile_id = profiles_repo.create_draft(
         conn,
         user_id=user_id,
         name=final_name,
         slug=slug,
         embedding_model=embedding_model,
     )
+    # Stash the chosen selector type so dry-run + commit pick it up.
+    # No fitted state yet — that lands on commit.
+    conn.execute(
+        "UPDATE profiles SET selector_config_json = ? WHERE id = ?",
+        (json.dumps({"type": selector}), profile_id),
+    )
+    conn.commit()
     return {"slug": slug, "name": final_name}
 
 
@@ -229,28 +248,25 @@ def dry_run_draft(
     if not profile.papers:
         return DraftDryRun(sweep=[], preview=[])
 
-    selector = CentroidSelector(embedding_model=profile.embedding_model)
+    selector = _new_selector_for_draft(row, profile)
     selector.fit(profile)
 
     gatherer = gatherer or OpenAlexGatherer(mailto=settings.RADAR_DEFAULT_MAILTO)
     since = _days_ago(days)
 
-    try:
-        filter_str = _build_filter_string(
-            profile.topic_filters or {}, since, gatherer.extras,
-        )
-    except Exception as exc:
-        filter_str = f"<unavailable: {exc!r}>"
     log.info(
         "dry_run.openalex_query",
         slug=slug, days=days, since=since,
-        limit=DRY_RUN_FETCH_LIMIT, filter=filter_str,
+        limit=DRY_RUN_FETCH_LIMIT,
     )
 
     candidates = gatherer.fetch(profile, since=since, limit=DRY_RUN_FETCH_LIMIT)
     log.info(
         "dry_run.fetched",
-        slug=slug, n=len(candidates), cost=dict(gatherer.cost()),
+        slug=slug, n=len(candidates),
+        tier_used=getattr(gatherer, "last_tier_used", None),
+        filter=getattr(gatherer, "last_filter_str", None),
+        cost=dict(gatherer.cost()),
     )
 
     sample = random.sample(candidates, min(5, len(candidates)))
@@ -335,8 +351,10 @@ def commit_draft(
     1. Prune ``topic_filters_json`` to the user's chosen topic ids
        (other levels — subfields/fields/domains — are preserved as
        gatherer hints; the user toggles topics specifically).
-    2. Re-fit ``CentroidSelector`` so ``profiles.centroid`` and
-       ``selector_config_json`` carry the calibrated state.
+    2. Re-fit the chosen selector. When the fitted state includes a
+       centroid (the centroid selector's case), store it as a BLOB on
+       ``profiles.centroid`` for fast read-side access; the full
+       selector state still goes into ``selector_config_json``.
     3. Update n_seed from the actual ``profile_seeds`` count.
     4. ``schedules_repo.upsert`` so the scheduler picks the profile up
        on the next boot at the chosen cron (default: daily 04:00 UTC).
@@ -348,9 +366,7 @@ def commit_draft(
     pruned = _prune_topic_filters(full_topics, set(selected_topic_ids))
 
     profile = _load_profile(conn, row, topic_filters=pruned)
-    selector = CentroidSelector(
-        embedding_model=profile.embedding_model, threshold=threshold,
-    )
+    selector = _new_selector_for_draft(row, profile, threshold=threshold)
     selector.fit(profile)
     sel_cfg = selector.config()
     diag = sel_cfg.get("diagnostics_snapshot") or {}
@@ -403,6 +419,32 @@ def _require_draft(
     if row is None or not row["is_draft"]:
         raise LookupError(f"draft '{slug}' not found for user {user_id}")
     return row
+
+
+def _new_selector_for_draft(
+    row: sqlite3.Row, profile: Profile, *, threshold: float | None = None,
+):
+    """Instantiate the selector type the wizard recorded on the draft.
+
+    Reads ``selector_config_json["type"]`` and looks the class up in the
+    selectors registry. Drafts created before the selector field landed
+    (or rows where the JSON is null/malformed) fall back to the
+    centroid default so existing profiles keep working.
+    """
+    sel_json = row["selector_config_json"]
+    sel_type = "centroid"
+    if sel_json:
+        try:
+            cfg = json.loads(sel_json)
+            if isinstance(cfg, dict) and isinstance(cfg.get("type"), str):
+                sel_type = cfg["type"]
+        except (TypeError, ValueError):
+            pass
+    cls = get_selector(sel_type)
+    return cls(
+        embedding_model=profile.embedding_model,
+        threshold=threshold,
+    )
 
 
 def _require_profile(

@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
 from pathlib import Path
 
 from rag_lib.db import apply_migrations, connect
@@ -45,6 +44,7 @@ from rag_lib.db.repos import profiles as profiles_repo
 from rag_lib.embed import build_embedding_input
 from rag_lib.embedders import get_embedder
 from rag_lib.openalex_client import OpenAlexClient
+from rag_lib.openalex_tiers import build_filter_string, tier_specs
 from rag_lib.persistence import (
     dedup_and_insert_candidates,
     resolve_user_id,
@@ -52,131 +52,12 @@ from rag_lib.persistence import (
 )
 from rag_lib.profile import Profile
 from rag_lib.radar import _days_ago_iso
-from rag_lib.selectors.centroid import CentroidSelector
-from rag_lib.selectors.max_seed import MaxSeedSelector
-
-
-_SELECTORS = {"centroid": CentroidSelector, "max_seed": MaxSeedSelector}
-
-
-# ---------------------------------------------------------------------------
-# Topic prevalence + tier construction
-# ---------------------------------------------------------------------------
-
-
-def _bare_id(oa_id: str) -> str:
-    """Strip the OpenAlex URL prefix; the filter API accepts both forms but
-    bare IDs keep the URL short."""
-    return oa_id.rsplit("/", 1)[-1] if "/" in oa_id else oa_id
-
-
-def _distinct_paper_prevalence(profile: Profile) -> dict[str, float]:
-    """For each topic-id, the fraction of seed papers it appears in
-    (counting a paper once even if the topic shows up as both primary and
-    in topics[]). Exact, unlike profile.topic_filters which uses an
-    inflated tally."""
-    n = len(profile.papers)
-    if n == 0:
-        return {}
-    topic_to_papers: dict[str, set[int]] = defaultdict(set)
-    for i, p in enumerate(profile.papers):
-        seen: set[str] = set()
-        if p.primary_topic and p.primary_topic.id:
-            seen.add(p.primary_topic.id)
-        for t in p.topics:
-            if t and t.id:
-                seen.add(t.id)
-        for tid in seen:
-            topic_to_papers[tid].add(i)
-    return {tid: len(papers) / n for tid, papers in topic_to_papers.items()}
-
-
-def _top_ids(profile_filters: dict, level: str, n: int) -> list[str]:
-    items = profile_filters.get(level) or []
-    return [_bare_id(it["id"]) for it in items[:n] if it.get("id")]
-
-
-def _build_filter_string(parts: list[tuple[str, list[str], str]], since: str) -> str:
-    """Build an OpenAlex filter string.
-
-    parts: list of (oa_filter_key, ids, mode) where mode is "or" or "and".
-      - "or"  -> joined with '|' (single key=val1|val2)
-      - "and" -> emitted as repeated key=val1, key=val2 entries
-
-    Standard non-topic filters (date, type, language) are added by the
-    caller as additional ('key', [val], 'or') entries.
-    """
-    out = [f"from_publication_date:{since}", "type:article", "language:en"]
-    for oa_key, ids, mode in parts:
-        if not ids:
-            continue
-        if mode == "or":
-            out.append(f"{oa_key}:{'|'.join(ids)}")
-        else:  # and
-            for v in ids:
-                out.append(f"{oa_key}:{v}")
-    return ",".join(out)
-
-
-def _tier_specs(
-    profile: Profile,
-    *,
-    must_have_prevalence: float,
-    top_topics_n: int,
-    top_subfields_n: int,
-) -> list[tuple[str, list[tuple[str, list[str], str]]]]:
-    """Return the three tiers as a list of (tier_name, parts) pairs, where
-    parts is the input to _build_filter_string. Empty tiers are dropped."""
-    prev = _distinct_paper_prevalence(profile)
-    must_have = sorted(
-        [tid for tid, p in prev.items() if p >= must_have_prevalence],
-        key=lambda t: -prev[t],
-    )
-    must_have_bare = [_bare_id(t) for t in must_have]
-    top_topics = _top_ids(profile.topic_filters, "topics", top_topics_n)
-    top_subfields = _top_ids(profile.topic_filters, "subfields", top_subfields_n)
-
-    tiers: list[tuple[str, list[tuple[str, list[str], str]]]] = []
-    if must_have_bare:
-        tiers.append(("must-have-AND", [("topics.id", must_have_bare, "and")]))
-    if top_topics or top_subfields:
-        tiers.append(("top-topics-OR-subfields-AND", [
-            ("topics.id", top_topics, "or"),
-            ("topics.subfield.id", top_subfields, "and"),
-        ]))
-    if top_subfields:
-        tiers.append(("subfields-OR", [("topics.subfield.id", top_subfields, "or")]))
-    return tiers
+from rag_lib.selectors import SELECTORS as _SELECTORS, get_selector
 
 
 # ---------------------------------------------------------------------------
 # Cursor-paginated walk -- one tier at a time, no retries
 # ---------------------------------------------------------------------------
-
-
-def _paged_search(
-    client: OpenAlexClient,
-    filter_str: str,
-    *,
-    limit: int,
-    per_page: int,
-) -> list[dict]:
-    """Cursor-paginated /works query. Single attempt -- on any error,
-    propagate. Stops when limit is reached or cursor is null."""
-    out: list[dict] = []
-    cursor: str | None = "*"
-    while cursor:
-        params = {"filter": filter_str, "per-page": per_page, "cursor": cursor}
-        j = client._get("/works", params=params)
-        results = j.get("results") or []
-        remaining = limit - len(out)
-        if len(results) > remaining:
-            results = results[:remaining]
-        out.extend(results)
-        if len(out) >= limit:
-            break
-        cursor = (j.get("meta") or {}).get("next_cursor")
-    return out
 
 
 def _cascade_fetch(
@@ -191,7 +72,7 @@ def _cascade_fetch(
     limit: int,
     per_page: int,
 ):
-    tiers = _tier_specs(
+    tiers = tier_specs(
         profile,
         must_have_prevalence=must_have_prevalence,
         top_topics_n=top_topics_n,
@@ -199,17 +80,30 @@ def _cascade_fetch(
     )
     if not tiers:
         return [], None, "", []
-    last = None
+    pile: list = []
+    seen_ids: set[str] = set()
+    last_name: str | None = None
+    last_filter: str = ""
+    last_parts: list = []
     for name, parts in tiers:
-        filter_str = _build_filter_string(parts, since)
+        filter_str = build_filter_string(parts, since)
         print(f"\n-- tier: {name}\n   filter: {filter_str}")
-        works = _paged_search(client, filter_str, limit=limit, per_page=per_page)
+        works = client.paginate_filter(filter_str, limit=limit, per_page=per_page)
         papers = [client.paper_from_work(w, source="openalex_gatherer") for w in works]
-        print(f"   fetched: {len(papers)}")
-        last = (papers, name, filter_str, parts)
-        if len(papers) >= min_results:
+        new_count = 0
+        for p in papers:
+            oid = p.openalex_id
+            if oid is not None and oid in seen_ids:
+                continue
+            if oid is not None:
+                seen_ids.add(oid)
+            pile.append(p)
+            new_count += 1
+        last_name, last_filter, last_parts = name, filter_str, parts
+        print(f"   fetched: {len(papers)}  new: {new_count}  cumulative: {len(pile)}")
+        if len(pile) >= min_results:
             break
-    return last
+    return pile, last_name, last_filter, last_parts
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +184,7 @@ def main() -> int:
 
     profile = Profile.from_json(args.profile)
     client = OpenAlexClient(mailto=args.email, rate_limit_sleep=args.rate_sleep)
-    selector_cls = _SELECTORS[args.selector]
+    selector_cls = get_selector(args.selector)
     selector = selector_cls(embedding_model=profile.embedding_model)
     selector.fit(profile)
 

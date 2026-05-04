@@ -20,6 +20,7 @@ from rag_lib.paper import Paper
 from rag_lib.profile import Profile
 from rag_lib.selector import Selector
 from rag_lib.selectors.centroid import CentroidSelector
+from rag_lib.selectors.full_text import FullTextSelector
 from rag_lib.selectors.llm_retrain import LLMRetrainSelector
 from rag_lib.selectors.max_seed import MaxSeedSelector
 from tests.fixture_selector import FixtureSelector
@@ -57,7 +58,8 @@ def _sample_candidates() -> list[Paper]:
     ]
 
 
-FULL_SELECTORS = [FixtureSelector, CentroidSelector, MaxSeedSelector]
+FULL_SELECTORS = [FixtureSelector, CentroidSelector, MaxSeedSelector,
+                  FullTextSelector]
 STUB_SELECTORS = [LLMRetrainSelector]
 
 

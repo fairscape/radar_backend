@@ -66,6 +66,7 @@ class CentroidSelector:
     # ------------------------------------------------------------------
 
     def fit(self, profile: Profile) -> None:
+        """Find centroid based on text embeddings"""
         t0 = time.time()
         key = self.embedding_model or profile.embedding_model
         self.embedding_model = key
@@ -90,10 +91,6 @@ class CentroidSelector:
         if self._centroid is None:
             raise RuntimeError("CentroidSelector.select() called before fit().")
         if self._seeds is None:
-            # Configs persisted before Phase 3 only carry the centroid;
-            # rebuild the seed matrix from the profile so score_max_seed
-            # can still be reported. The profile must carry the same
-            # embedding key the centroid was fit against.
             key = self.embedding_model or profile.embedding_model
             self._seeds = _normalize_rows(
                 np.asarray(profile.seed_embeddings(key), dtype=float)

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # (which filter paper_embeddings by profile.embedding_model) come
     # back empty.
     RADAR_DEFAULT_EMBEDDING_MODEL: str = "specter2"
+    # Default selector key when the wizard's create-draft body omits one.
+    # Keep symmetric with RADAR_DEFAULT_EMBEDDING_MODEL so operators can
+    # swap defaults without code changes.
+    RADAR_DEFAULT_SELECTOR: str = "centroid"
     RADAR_CORS_ORIGINS: list[str] = ["*"]
     RADAR_LOG_JSON: bool = True
     RADAR_SCHEDULER_ENABLED: bool = True

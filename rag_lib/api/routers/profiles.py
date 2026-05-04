@@ -34,6 +34,8 @@ from ..schemas import (
     Schedule,
     ScheduleUpdate,
     Topic,
+    WizardOption,
+    WizardOptions,
 )
 from ..services import profiles as profiles_service
 from ..services import wizard as wizard_service
@@ -54,8 +56,75 @@ def get_wizard_gatherer():
 
 # ---------------------------------------------------------------------------
 # Phase 11 — wizard draft endpoints. Declared before ``/{key}`` so the
-# ``/draft`` prefix isn't shadowed by the slug-route catch-all.
+# ``/draft`` and ``/wizard`` prefixes aren't shadowed by the slug-route
+# catch-all.
 # ---------------------------------------------------------------------------
+
+
+# Human-readable copy for the wizard dropdowns. Keys must match the
+# registry keys; missing keys render with the bare key as the label so
+# plugin-registered embedders/selectors still appear in the dropdown
+# without code changes here.
+_EMBEDDER_LABELS: dict[str, tuple[str, str]] = {
+    "specter2": (
+        "SPECTER2 (proximity)",
+        "Scientific paper embeddings with the proximity adapter. Recommended.",
+    ),
+    "placeholder-v1": (
+        "Placeholder (hash-only)",
+        "Deterministic hash-seeded vectors. For tests / offline runs only.",
+    ),
+}
+
+_SELECTOR_LABELS: dict[str, tuple[str, str]] = {
+    "centroid": (
+        "Centroid",
+        "Cosine similarity to the seed mean vector. Lightweight default.",
+    ),
+    "max_seed": (
+        "Max-seed similarity",
+        "Score against the closest matching seed. Better when seeds are multimodal.",
+    ),
+}
+
+
+def _wizard_options(default_embedder: str, default_selector: str) -> WizardOptions:
+    from ...embedders import EMBEDDERS
+    from ...selectors import SELECTORS
+
+    def _row(key: str, labels: dict[str, tuple[str, str]], default_key: str) -> WizardOption:
+        label, desc = labels.get(key, (key, ""))
+        return WizardOption(
+            key=key, label=label, description=desc, default=(key == default_key),
+        )
+
+    embedders = [_row(k, _EMBEDDER_LABELS, default_embedder) for k in sorted(EMBEDDERS)]
+    selectors = [_row(k, _SELECTOR_LABELS, default_selector) for k in sorted(SELECTORS)]
+    # Belt-and-braces: if the configured default isn't actually
+    # registered (operator typo in .env), no row will carry default=True.
+    # Fall back to flagging the first row so the UI still has a
+    # selectable default.
+    if embedders and not any(e.default for e in embedders):
+        embedders[0] = embedders[0].model_copy(update={"default": True})
+    if selectors and not any(s.default for s in selectors):
+        selectors[0] = selectors[0].model_copy(update={"default": True})
+    return WizardOptions(embedders=embedders, selectors=selectors)
+
+
+@router.get("/wizard/options", response_model=WizardOptions)
+def get_wizard_options(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> WizardOptions:
+    """List registered embedders + selectors with the current defaults.
+
+    The wizard's name step renders these in two dropdowns; pre-selecting
+    the row with ``default: true`` matches what the create-draft endpoint
+    would pick when ``embedding_model`` / ``selector`` are omitted.
+    """
+    return _wizard_options(
+        default_embedder=settings.RADAR_DEFAULT_EMBEDDING_MODEL,
+        default_selector=settings.RADAR_DEFAULT_SELECTOR,
+    )
 
 
 @router.post("/draft", response_model=Draft)
@@ -70,12 +139,23 @@ def create_draft(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="profile name must be non-empty",
         )
-    result = wizard_service.create_draft(
-        db,
-        user_id=int(user["id"]),
-        name=body.name.strip(),
-        embedding_model=settings.RADAR_DEFAULT_EMBEDDING_MODEL,
-    )
+    embedding_model = body.embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    selector_name = body.selector or settings.RADAR_DEFAULT_SELECTOR
+    try:
+        result = wizard_service.create_draft(
+            db,
+            user_id=int(user["id"]),
+            name=body.name.strip(),
+            embedding_model=embedding_model,
+            selector=selector_name,
+        )
+    except ValueError as e:
+        # Unknown embedder/selector key — surfaces the registry error so
+        # the partner team's CI sees exactly which key is missing.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
     return Draft(**result)
 
 

@@ -158,16 +158,17 @@ class OpenAlexClient:
         """
         for variant in self._filter_variants(topic_filters):
             filter_str = _build_filter_string(variant, since, extras)
-            results = self._paginate_filter(filter_str, limit, per_page)
+            results = self.paginate_filter(filter_str, limit=limit, per_page=per_page)
             if results:
                 return results
         return []
 
-    def _paginate_filter(
+    def paginate_filter(
         self,
         filter_str: str,
-        limit: int | None,
-        per_page: int,
+        *,
+        limit: int | None = None,
+        per_page: int = 200,
     ) -> list[dict]:
         out: list[dict] = []
         cursor: str | None = "*"

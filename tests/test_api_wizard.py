@@ -277,3 +277,44 @@ def test_dry_run_unknown_draft_404(app):
         json={"days": 7},
     )
     assert resp.status_code == 404
+
+
+def test_wizard_options_lists_registries_with_defaults(app):
+    resp = _request(app, "GET", "/api/profiles/wizard/options")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body.keys()) == {"embedders", "selectors"}
+
+    embedder_keys = {e["key"] for e in body["embedders"]}
+    selector_keys = {s["key"] for s in body["selectors"]}
+    # Built-ins from the registries should always be present.
+    assert {"specter2", "placeholder-v1"} <= embedder_keys
+    assert {"centroid", "max_seed"} <= selector_keys
+
+    # Exactly one default per list, matching the configured settings.
+    e_defaults = [e for e in body["embedders"] if e["default"]]
+    s_defaults = [s for s in body["selectors"] if s["default"]]
+    assert len(e_defaults) == 1
+    assert len(s_defaults) == 1
+    assert e_defaults[0]["key"] == "specter2"
+    assert s_defaults[0]["key"] == "centroid"
+
+    # Every row carries label + description so the UI doesn't have to
+    # invent copy.
+    for row in body["embedders"] + body["selectors"]:
+        assert isinstance(row["label"], str) and row["label"]
+        assert "description" in row
+
+
+def test_wizard_options_unknown_default_falls_back_to_first(app, monkeypatch):
+    monkeypatch.setenv("RADAR_DEFAULT_EMBEDDING_MODEL", "does-not-exist")
+    settings_module.get_settings.cache_clear()
+    try:
+        resp = _request(app, "GET", "/api/profiles/wizard/options")
+        assert resp.status_code == 200
+        body = resp.json()
+        defaults = [e for e in body["embedders"] if e["default"]]
+        # Misconfigured default still yields exactly one selectable row.
+        assert len(defaults) == 1
+    finally:
+        settings_module.get_settings.cache_clear()
