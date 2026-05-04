@@ -17,6 +17,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
+import structlog
+
+
+log = structlog.get_logger("rag_lib.rag.retriever")
 
 Embedder = Callable[[str], list[float]]
 
@@ -42,38 +46,110 @@ def retrieve(
     exception) when the collection holds no matching chunks.
     """
     if not query or not query.strip():
+        log.info("retrieve.empty_query")
         return []
 
     scope_list = [s for s in (scope or []) if s]
     where = _scope_where_clause(scope_list)
 
+    target_k = max(1, int(k))
+    max_per_paper = 4
+    # Pull a wider candidate pool than the caller asked for so the
+    # per-paper cap below has room to drop near-duplicates without
+    # starving the final result. Embedders cluster sibling chunks from
+    # the same paper, so without diversification the top-k is often
+    # dominated by 5–9 slices of one paper, crowding out the actual
+    # answer that lives in a different paper.
+    n_results = target_k * 4
+
     kwargs: dict[str, Any] = {
-        "n_results": max(1, int(k)),
+        "n_results": n_results,
         "include": ["documents", "metadatas", "distances"],
     }
     if where is not None:
         kwargs["where"] = where
 
+    query_vec = None
     if embedder is not None:
-        kwargs["query_embeddings"] = [embedder(query)]
+        query_vec = embedder(query)
+        kwargs["query_embeddings"] = [query_vec]
     else:
         kwargs["query_texts"] = [query]
 
-    raw = collection.query(**kwargs)
+    log.info(
+        "retrieve.start",
+        query_preview=query[:120],
+        scope=scope_list,
+        k=kwargs["n_results"],
+        where=where,
+        embedder_used=embedder is not None,
+        query_vec_dim=(len(query_vec) if query_vec is not None else None),
+    )
+
+    try:
+        raw = collection.query(**kwargs)
+    except Exception as exc:
+        log.error(
+            "retrieve.chroma_error",
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+            where=where,
+        )
+        raise
 
     documents = _first_row(raw, "documents")
     metadatas = _first_row(raw, "metadatas")
     distances = _first_row(raw, "distances")
 
+    log.info(
+        "retrieve.raw",
+        n_documents=len(documents),
+        n_metadatas=len(metadatas),
+        n_distances=len(distances),
+        raw_keys=sorted(list(raw.keys())) if isinstance(raw, dict) else None,
+    )
+
+    # Diversify: walk candidates in best-score order; keep up to
+    # ``max_per_paper`` chunks per ``openalex_id`` until we hit
+    # ``target_k`` total. Skipped near-duplicates are recorded so the
+    # log makes the trim visible.
     out: list[dict] = []
+    per_paper: dict[str, int] = {}
+    skipped_dupes = 0
     for text, meta, dist in zip(documents, metadatas, distances):
         meta = meta or {}
+        oa = str(meta.get("openalex_id") or "")
+        if per_paper.get(oa, 0) >= max_per_paper:
+            skipped_dupes += 1
+            continue
         out.append({
             "text": text or "",
             "title": str(meta.get("title") or ""),
-            "openalex_id": str(meta.get("openalex_id") or ""),
+            "openalex_id": oa,
             "score": _distance_to_score(dist),
         })
+        per_paper[oa] = per_paper.get(oa, 0) + 1
+        if len(out) >= target_k:
+            break
+
+    log.info(
+        "retrieve.done",
+        n_results=len(out),
+        target_k=target_k,
+        candidates_pulled=len(documents),
+        skipped_same_paper=skipped_dupes,
+        max_per_paper=max_per_paper,
+        papers_represented=len(per_paper),
+        top_hits=[
+            {
+                "title": r["title"][:80],
+                "openalex_id": r["openalex_id"],
+                "score": round(r["score"], 4),
+                "chunk_chars": len(r["text"]),
+            }
+            for r in out[:5]
+        ],
+    )
     return out
 
 
@@ -85,19 +161,17 @@ def retrieve(
 def _scope_where_clause(slugs: list[str]) -> dict | None:
     """Build a Chroma ``where`` clause matching any of ``slugs``.
 
-    Each slug is searched as the substring ``"|slug|"`` against the
-    delimiter-padded ``profile_slugs`` metadata. Multiple slugs are
-    joined with ``$or``. Empty list returns ``None`` (= search all).
+    Chroma 0.5+ does not support ``$contains`` on metadata ``where`` —
+    that operator is only valid on ``where_document``. We match the
+    encoded ``"|slug|"`` value with ``$in`` instead, which gives the
+    same any-of semantics for the common case where each chunk's
+    ``profile_slugs`` is a single ``"|slug|"`` literal. Multi-tagged
+    chunks (``"|a|b|"``) are not supported by this scheme — switch to
+    per-slug boolean metadata if that becomes a real case.
     """
     if not slugs:
         return None
-    if len(slugs) == 1:
-        return {"profile_slugs": {"$contains": f"|{slugs[0]}|"}}
-    return {
-        "$or": [
-            {"profile_slugs": {"$contains": f"|{s}|"}} for s in slugs
-        ]
-    }
+    return {"profile_slugs": {"$in": [f"|{s}|" for s in slugs]}}
 
 
 def _first_row(result: dict, key: str) -> list:

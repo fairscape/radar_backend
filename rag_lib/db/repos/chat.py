@@ -65,6 +65,15 @@ def recent(
     return list(reversed(rows))
 
 
+def delete_all_for_user(conn: sqlite3.Connection, user_id: int) -> int:
+    """Delete every chat turn for a user. Returns rows affected."""
+    cursor = conn.execute(
+        "DELETE FROM chat_turns WHERE user_id = ?", (user_id,)
+    )
+    conn.commit()
+    return cursor.rowcount or 0
+
+
 def decode_sources(row: sqlite3.Row) -> list[dict]:
     raw = row["sources_json"] if row is not None else None
     if not raw:

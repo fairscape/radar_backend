@@ -140,6 +140,20 @@ def index_user_collection(settings: Any, user_id: int) -> Any:
     surfaced to the caller so the upload / chat path can return a
     targeted 503.
     """
+    return _open_collection(settings, user_id, "vault")
+
+
+def index_user_chat_collection(settings: Any, user_id: int) -> Any:
+    """Return the per-user *chat* Chroma collection.
+
+    Parallel to ``vault`` but indexed with the chat-optimized embedder
+    (e.g. ``mxbai-embed-large``). The chat retrieval path queries this
+    one; selector / centroid / coherence code keeps using ``vault``.
+    """
+    return _open_collection(settings, user_id, "vault_chat")
+
+
+def _open_collection(settings: Any, user_id: int, name: str) -> Any:
     try:
         import chromadb  # type: ignore
     except ImportError as e:  # pragma: no cover — exercised only when extras absent
@@ -151,7 +165,7 @@ def index_user_collection(settings: Any, user_id: int) -> Any:
     base = Path(settings.RADAR_CHROMA_DIR) / str(user_id)
     base.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(base))
-    return client.get_or_create_collection(name="vault")
+    return client.get_or_create_collection(name=name)
 
 
 def collection_size(collection: Any) -> int:

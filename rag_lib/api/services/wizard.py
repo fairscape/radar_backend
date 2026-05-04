@@ -230,25 +230,64 @@ def dry_run_draft(
     days: int = MAX_DRY_RUN_DAYS,
     thresholds: list[float] | None = None,
     gatherer: Any | None = None,
+    reporter: Any | None = None,
 ) -> DraftDryRun:
-    """Run ``radar.dry_run`` against the last ``days`` of OpenAlex output.
+    """Resolve the draft + invoke the dry-run compute.
 
-    Returns a SweepRow per threshold plus a 10-card preview of the
-    top-scoring candidates at the *lowest* threshold (so the preview is
-    useful before the user has chosen one). Tests inject ``gatherer``;
-    in production we build an ``OpenAlexGatherer`` from settings.
+    Thin wrapper that does the slug→draft lookup and hands off to
+    :func:`compute_dry_run_for_profile`. The async dry-run job calls
+    the compute function directly (it already has the profile_id from
+    the kickoff request), bypassing this slug lookup.
     """
     row = _require_draft(conn, user_id, slug)
-    profile_id = int(row["id"])
+    return compute_dry_run_for_profile(
+        conn,
+        settings,
+        profile_row=row,
+        slug=slug,
+        days=days,
+        thresholds=thresholds,
+        gatherer=gatherer,
+        reporter=reporter,
+    )
+
+
+def compute_dry_run_for_profile(
+    conn: sqlite3.Connection,
+    settings: Any,
+    *,
+    profile_row: sqlite3.Row,
+    slug: str,
+    days: int = MAX_DRY_RUN_DAYS,
+    thresholds: list[float] | None = None,
+    gatherer: Any | None = None,
+    reporter: Any | None = None,
+) -> DraftDryRun:
+    """Run a dry-run sweep + preview against the last ``days`` of OpenAlex.
+
+    Returns a SweepRow per threshold plus a 10-card preview of the
+    top-scoring candidates. Tests inject ``gatherer``; in production
+    we build an ``OpenAlexGatherer`` from settings.
+
+    ``reporter`` is an optional ``_ProgressReporter`` (or duck) the
+    caller hands in when running under the scheduler — it stages step
+    transitions through ``gather_runs.set_step``. ``embed_progress``
+    is the caller's responsibility (it has to wrap ``select()``); pass
+    ``None`` for the inline / test path which doesn't need progress
+    reporting.
+    """
+    profile_id = int(profile_row["id"])
 
     days = max(1, min(int(days), MAX_DRY_RUN_DAYS))
     thresholds = sorted(thresholds or DEFAULT_THRESHOLDS)
 
-    profile = _load_profile(conn, row)
+    if reporter is not None:
+        reporter.step("loading_profile", message="Loading draft seeds")
+    profile = _load_profile(conn, profile_row)
     if not profile.papers:
         return DraftDryRun(sweep=[], preview=[])
 
-    selector = _new_selector_for_draft(row, profile)
+    selector = _new_selector_for_draft(profile_row, profile)
     selector.fit(profile)
 
     gatherer = gatherer or OpenAlexGatherer(mailto=settings.RADAR_DEFAULT_MAILTO)
@@ -260,6 +299,8 @@ def dry_run_draft(
         limit=DRY_RUN_FETCH_LIMIT,
     )
 
+    if reporter is not None:
+        reporter.step("fetching", message="Querying OpenAlex")
     candidates = gatherer.fetch(profile, since=since, limit=DRY_RUN_FETCH_LIMIT)
     log.info(
         "dry_run.fetched",
@@ -278,6 +319,15 @@ def dry_run_draft(
             abstract=(p.abstract or "")[:240],
         )
 
+    if reporter is not None:
+        reporter.step(
+            "embedding",
+            total=len(candidates),
+            message=f"Embedding {len(candidates)} candidates",
+        )
+    # Caller wraps the select() call in embed_progress() when it wants
+    # per-paper ticks — this function stays embedder-agnostic so the
+    # inline / test path doesn't need a thread-local hook.
     ranked = selector.select(candidates, profile, threshold=None)
 
     if ranked:

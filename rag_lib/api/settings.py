@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     # (which filter paper_embeddings by profile.embedding_model) come
     # back empty.
     RADAR_DEFAULT_EMBEDDING_MODEL: str = "specter2"
+    # Embedder used specifically for the chat retrieval path. Indexed
+    # into a parallel per-user ``vault_chat`` collection at upload time.
+    # When set, PDF upload tries to write to both ``vault`` (SPECTER2,
+    # for selectors/centroids) and ``vault_chat`` (this model, for RAG).
+    # The chat-side index is *best-effort*: if ollama is unreachable or
+    # the model isn't pulled, we log a warning and skip — upload still
+    # succeeds. Set to empty string to disable the parallel index.
+    RADAR_CHAT_EMBEDDING_MODEL: str = "mxbai-embed-large"
     # Default selector key when the wizard's create-draft body omits one.
     # Keep symmetric with RADAR_DEFAULT_EMBEDDING_MODEL so operators can
     # swap defaults without code changes.

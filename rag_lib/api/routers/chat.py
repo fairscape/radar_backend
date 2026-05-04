@@ -39,6 +39,15 @@ def chat_history(
     return [ChatTurn.model_validate(t) for t in turns]
 
 
+@router.delete("/history")
+def clear_chat_history(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict[str, int]:
+    deleted = chat_service.clear_history(db, int(user["id"]))
+    return {"deleted": deleted}
+
+
 @router.post("", response_model=ChatTurn)
 def chat(
     body: ChatRequest,

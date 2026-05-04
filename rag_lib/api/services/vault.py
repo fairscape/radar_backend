@@ -27,6 +27,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import structlog
+
+
+log = structlog.get_logger("rag_lib.api.services.vault")
+
 from ...db.repos import (
     embeddings as embeddings_repo,
     papers as papers_repo,
@@ -163,6 +168,39 @@ def upload(
         # transaction. The paper is in SQLite; the operator can re-run
         # an indexing pass later.
         collection = None
+
+    # Parallel chat-retrieval index. Best-effort: ollama may be down or
+    # the embedder model not pulled — log and skip. SPECTER2 indexing
+    # above is unaffected, so the upload still succeeds.
+    chat_model = (settings.RADAR_CHAT_EMBEDDING_MODEL or "").strip()
+    if chat_model:
+        try:
+            chat_embedder = get_embedder(chat_model)
+            chat_collection = rag_indexer.index_user_chat_collection(
+                settings, user_id
+            )
+            # Smaller windows: mxbai-embed-large / nomic-embed-text /
+            # bge-large all cap at 512 tokens. PDF-extracted text often
+            # tokenizes to 1.5–3 tokens per word (URLs, formulas, fused
+            # words), so a 500-word window can blow past the limit and
+            # ollama returns 500. ~300 words keeps us safely under 512
+            # BPE tokens for typical English text.
+            rag_indexer.index_paper(
+                chat_collection,
+                row,
+                chat_embedder,
+                profile_slugs=profile_slugs,
+                target_tokens=300,
+                overlap=40,
+            )
+        except Exception as exc:
+            log.warning(
+                "vault.upload.chat_index_skipped",
+                openalex_id=openalex_id,
+                chat_embedder=chat_model,
+                reason=type(exc).__name__,
+                detail=str(exc)[:200],
+            )
 
     return _row_to_vault_doc(
         conn, user_id, row, settings=settings, collection=collection,

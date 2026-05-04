@@ -179,24 +179,50 @@ def test_topics_endpoint_returns_aggregated_topic(app, tmp_path):
 
 def test_dry_run_with_fixture_gatherer(app, tmp_path):
     db = str(tmp_path / "radar.db")
-    resp = _request(app, "POST", "/api/profiles/draft", json={"name": "Neonatal"})
+    # Pin the embedder to placeholder-v1 explicitly: _seed_user_papers
+    # writes 128-dim placeholder vectors, so the draft's selector has to
+    # match. The server-side default has shifted to specter2 over time
+    # — leaving this implicit makes the test fragile to that default.
+    resp = _request(
+        app, "POST", "/api/profiles/draft",
+        json={"name": "Neonatal", "embedding_model": "placeholder-v1"},
+    )
     slug = resp.json()["slug"]
     _attach_seeds(db, user_id=1, slug=slug)
     # Step 3 must run before Step 4 so topic_filters are populated.
     _request(app, "GET", f"/api/profiles/draft/{slug}/topics")
 
+    # Kickoff: returns a run_id that the wizard frontend polls. The
+    # fixture-gatherer dependency override makes the route run the
+    # dry-run inline, so by the time the response returns the run is
+    # already finished and the result is stashed on the gather_runs row.
     resp = _request(
         app, "POST", f"/api/profiles/draft/{slug}/dry-run",
         json={"days": 7, "thresholds": [0.50, 0.75, 0.95]},
     )
     assert resp.status_code == 200, resp.text
+    start = resp.json()
+    assert start["ok"] is True
+    run_id = start["run_id"]
+    assert isinstance(run_id, int)
+
+    # Status poll: result is populated because the fixture path ran inline.
+    resp = _request(
+        app, "GET", f"/api/profiles/draft/{slug}/dry-run/{run_id}",
+    )
+    assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert {"sweep", "preview", "scores"} <= set(body.keys())
+    assert body["run"]["id"] == run_id
+    assert body["run"]["finished_at"] is not None
+    assert body["run"]["error"] is None
+    result = body["result"]
+    assert result is not None
+    assert {"sweep", "preview", "scores"} <= set(result.keys())
     # ``scores`` carries one raw cosine per fetched candidate so the
     # wizard can render a slider-driven histogram. Length matches the
     # number of ranked candidates.
-    assert isinstance(body["scores"], list)
-    sweep = body["sweep"]
+    assert isinstance(result["scores"], list)
+    sweep = result["sweep"]
     assert [round(s["th"], 2) for s in sweep] == [0.50, 0.75, 0.95]
     # Selector primary score is raw cosine; sweep counts how many papers
     # clear each cosine threshold. Lower thresholds always admit at least
@@ -204,8 +230,8 @@ def test_dry_run_with_fixture_gatherer(app, tmp_path):
     counts = [s["n"] for s in sweep]
     assert counts[0] >= counts[-1]
     # Preview cards have the wizard's slug as the profile field.
-    if body["preview"]:
-        assert body["preview"][0]["profile"] == slug
+    if result["preview"]:
+        assert result["preview"][0]["profile"] == slug
 
 
 def test_commit_draft_flips_is_draft_and_lists_profile(app, tmp_path):

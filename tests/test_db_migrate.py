@@ -34,6 +34,8 @@ EXPECTED_VERSIONS = [
     "0007_vault",
     "0008_drafts",
     "0009_oa",
+    "0010_gather_run_progress",
+    "0011_gather_run_result",
 ]
 
 

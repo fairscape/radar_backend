@@ -34,6 +34,7 @@ class _Model(BaseModel):
 class Health(_Model):
     status: HealthStatus = "ok"
     version: str
+    ollama_model: str | None = None
 
 
 class Profile(_Model):
@@ -242,6 +243,14 @@ class GatherRun(_Model):
     n_redup: int | None = None
     api_calls: int | None = None
     error: str | None = None
+    # Live-progress fields for in-flight runs. Populated incrementally
+    # by gather_for_profile via gather_runs.set_step / .tick; the
+    # frontend polls /runs and reads these to render a per-step
+    # progress chip instead of a bare spinner.
+    current_step: str | None = None
+    n_processed: int | None = None
+    n_total: int | None = None
+    last_message: str | None = None
 
 
 class GatherNowResponse(_Model):
@@ -336,6 +345,26 @@ class DraftDryRun(_Model):
     sweep: list[SweepRow] = Field(default_factory=list)
     preview: list[Card] = Field(default_factory=list)
     scores: list[float] = Field(default_factory=list)
+
+
+class DraftDryRunStart(_Model):
+    """Kickoff response from ``POST /api/profiles/draft/{slug}/dry-run``.
+
+    The dry-run is dispatched async and writes progress + result to a
+    ``gather_runs`` row keyed by ``run_id``. The wizard polls
+    ``GET /api/profiles/draft/{slug}/dry-run/{run_id}`` until ``run.
+    finished_at`` is set, then reads ``result``.
+    """
+
+    ok: bool = True
+    run_id: int
+
+
+class DraftDryRunStatus(_Model):
+    """Status-poll response: in-flight progress + final result if done."""
+
+    run: GatherRun
+    result: DraftDryRun | None = None
 
 
 class WizardOption(_Model):

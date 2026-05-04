@@ -21,11 +21,22 @@ from .exceptions import OllamaUnreachable
 
 
 SYSTEM_PROMPT = (
-    "You are a research assistant answering questions strictly from "
-    "the provided passages.\n"
-    "Cite each claim using [N] markers matching the passage numbers.\n"
-    "If the passages do not contain the answer, say so. Do not invent "
-    "citations."
+    "You are a research assistant. Answer the user's question using "
+    "ONLY information that appears literally in the numbered passages "
+    "below. Do not use outside knowledge.\n"
+    "\n"
+    "Rules:\n"
+    "1. For every factual claim, immediately follow it with the [N] "
+    "marker of the passage that LITERALLY contains the words supporting "
+    "that claim. The passage text must back the exact claim — do not "
+    "cite a passage on a related topic if it does not state the fact.\n"
+    "2. When useful, quote the supporting sentence verbatim in "
+    "quotation marks before the citation.\n"
+    "3. If no passage states the answer, reply exactly: "
+    "\"The provided passages do not state this.\" — do not guess and "
+    "do not draw on training data.\n"
+    "4. Never fabricate a citation. If a [N] marker doesn't actually "
+    "support the claim next to it, you have made an error."
 )
 
 
@@ -59,6 +70,23 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
+            # Ollama defaults num_ctx to 2048 regardless of the model's
+            # native window. qwen2.5 natively supports 32k. 16k fits a
+            # 10-chunk RAG prompt (~10k tokens) plus answer with room
+            # to spare; on qwen2.5:7b Q4 it costs ~0.9 GB of KV cache
+            # on top of ~5 GB model+overhead — comfortable on an 8 GB
+            # GTX 1080. Bump to 32768 if you have more VRAM (tight on
+            # 8 GB), or drop to 8192 if running on a smaller GPU.
+            "options": {
+                "num_ctx": 16384,
+                # Low temperature keeps the model anchored to the
+                # retrieved passages instead of wandering into
+                # training-data priors. RAG quality is sensitive to
+                # this — at default (0.7+) qwen2.5 will happily make
+                # up plausible-sounding details. 0.2 is conservative
+                # without being deterministic.
+                "temperature": 0.2,
+            },
         }
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -102,7 +130,7 @@ def build_prompt(query: str, retrieved_chunks: Iterable[dict]) -> list[dict]:
     for n, chunk in enumerate(retrieved_chunks, start=1):
         title = (chunk.get("title") or "").strip() or "untitled"
         text = (chunk.get("text") or "").strip()
-        text = _truncate_words(text, max_words=300)
+        text = _truncate_words(text, max_words=500)
         passage_lines.append(f"[{n}] {title} — {text}")
 
     if passage_lines:

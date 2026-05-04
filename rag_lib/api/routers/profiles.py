@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from datetime import datetime, timezone
 
@@ -23,6 +23,8 @@ from ..schemas import (
     DraftCreateRequest,
     DraftDryRun,
     DraftDryRunRequest,
+    DraftDryRunStart,
+    DraftDryRunStatus,
     DryRunResponse,
     FeedbackEventOut,
     GatherNowResponse,
@@ -203,31 +205,167 @@ def draft_topics(
     return out
 
 
-@router.post("/draft/{slug}/dry-run", response_model=DraftDryRun)
+@router.post("/draft/{slug}/dry-run", response_model=DraftDryRunStart)
 def draft_dry_run(
     slug: str,
     body: DraftDryRunRequest,
+    request: Request,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     gatherer: Annotated[object | None, Depends(get_wizard_gatherer)] = None,
-) -> DraftDryRun:
-    """Sweep + preview against the last ``days`` of OpenAlex output.
+) -> DraftDryRunStart:
+    """Kick off an async dry-run; returns the run_id to poll.
 
-    Tests inject a fixture gatherer via
-    ``app.dependency_overrides[get_wizard_gatherer]``.
+    The wizard's calibrate step polls
+    ``GET /api/profiles/draft/{slug}/dry-run/{run_id}`` for stage +
+    progress, then reads ``result`` once ``run.finished_at`` is set.
+
+    When tests inject a fixture gatherer via
+    ``app.dependency_overrides[get_wizard_gatherer]``, the dry-run is
+    executed inline (synchronously) so the test harness doesn't need
+    to drive APScheduler. The response shape is unchanged — the
+    fixture run finishes before the response returns and the
+    status-poll endpoint returns the cached result on first call.
     """
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.scheduler.jobs import dry_run_for_draft
+
     try:
-        return wizard_service.dry_run_draft(
+        profile_row = wizard_service._require_draft(db, int(user["id"]), slug)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    profile_id = int(profile_row["id"])
+
+    # Open the audit row eagerly so we can echo a real run_id even when
+    # the inline / test path runs synchronously.
+    run_id = gather_runs_repo.start(
+        db,
+        profile_id=profile_id,
+        user_id=int(user["id"]),
+        tier_used="dry_run",
+    )
+
+    if gatherer is not None:
+        # Test path: run synchronously with the injected gatherer so
+        # tests don't have to coordinate with APScheduler. Errors
+        # propagate as 500s — the test harness expects them surfaced
+        # rather than buried in the audit row.
+        result = wizard_service.dry_run_draft(
             db, settings,
             user_id=int(user["id"]), slug=slug,
             days=body.days, thresholds=body.thresholds,
             gatherer=gatherer,
         )
+        gather_runs_repo.finish(
+            db, run_id,
+            n_fetched=len(result.scores),
+            n_new=0, n_redup=0,
+            tier_used="dry_run",
+            result_json=result.model_dump_json(),
+        )
+        return DraftDryRunStart(ok=True, run_id=run_id)
+
+    # Pull the scheduler off app.state lazily — when the scheduler is
+    # disabled (e.g., test runs with RADAR_SCHEDULER_ENABLED=false) we
+    # only 503 here on the async path; the inline-with-fixture path
+    # above never reaches this branch.
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        gather_runs_repo.finish(
+            db, run_id,
+            n_fetched=0, n_new=0, n_redup=0,
+            tier_used="dry_run",
+            error="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
+        )
+    scheduler.add_job(
+        dry_run_for_draft,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc),
+        args=[int(user["id"]), profile_id, slug],
+        kwargs={
+            "run_id": run_id,
+            "days": body.days,
+            "thresholds": body.thresholds,
+        },
+        id=f"dry-run:{profile_id}:{run_id}",
+        replace_existing=False,
+        max_instances=1,
+    )
+    return DraftDryRunStart(ok=True, run_id=run_id)
+
+
+@router.get(
+    "/draft/{slug}/dry-run/{run_id}", response_model=DraftDryRunStatus,
+)
+def draft_dry_run_status(
+    slug: str,
+    run_id: int,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> DraftDryRunStatus:
+    """Status + result for one async dry-run.
+
+    Returns the gather_runs row reshaped as ``GatherRun`` plus a
+    ``result`` field populated only when the job succeeded — i.e.
+    ``finished_at`` is set, ``error`` is null, and ``result_json``
+    parsed cleanly. The wizard polls this until ``run.finished_at``
+    flips, then renders ``result``.
+    """
+    import json
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    try:
+        profile_row = wizard_service._require_draft(db, int(user["id"]), slug)
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+
+    row = gather_runs_repo.get(db, run_id)
+    if row is None or int(row["profile_id"]) != int(profile_row["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"dry-run {run_id} not found for draft '{slug}'",
+        )
+
+    run = GatherRun(
+        id=int(row["id"]),
+        profile_id=int(row["profile_id"]),
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        since_date=row["since_date"],
+        filter_string=row["filter_string"],
+        tier_used=row["tier_used"],
+        n_fetched=row["n_fetched"],
+        n_new=row["n_new"],
+        n_redup=row["n_redup"],
+        api_calls=row["api_calls"],
+        error=row["error"],
+        current_step=row["current_step"],
+        n_processed=row["n_processed"],
+        n_total=row["n_total"],
+        last_message=row["last_message"],
+    )
+
+    result: DraftDryRun | None = None
+    if row["finished_at"] and not row["error"] and row["result_json"]:
+        try:
+            result = DraftDryRun.model_validate(json.loads(row["result_json"]))
+        except (ValueError, TypeError):
+            # A malformed result_json shouldn't 500 the poll endpoint —
+            # the run row still tells the frontend the job finished, and
+            # surfacing result=None lets the UI render a graceful "no
+            # result" path rather than spinning forever.
+            result = None
+
+    return DraftDryRunStatus(run=run, result=result)
 
 
 @router.delete("/draft/{slug}")
@@ -571,6 +709,10 @@ def list_runs(
             n_redup=r["n_redup"],
             api_calls=r["api_calls"],
             error=r["error"],
+            current_step=r["current_step"],
+            n_processed=r["n_processed"],
+            n_total=r["n_total"],
+            last_message=r["last_message"],
         )
         for r in rows
     ]

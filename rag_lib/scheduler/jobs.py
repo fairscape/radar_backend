@@ -25,6 +25,7 @@ from ..db.repos import (
     profiles as profiles_repo,
     users as users_repo,
 )
+from ..embedders import embed_progress
 from ..gatherers.openalex import OpenAlexGatherer
 from ..paper import Paper
 from ..persistence.db_store import dedup_and_insert_candidates
@@ -38,6 +39,76 @@ log = structlog.get_logger("rag_lib.scheduler.jobs")
 
 GATHER_DAYS_DEFAULT = 1
 GATHER_LIMIT_DEFAULT = 500
+
+# How often the embedding-loop tick writes to gather_runs. Each write is
+# a tiny SQLite UPDATE so the cost is small, but with hundreds of
+# candidates and a 2.5s frontend poll there's no point updating more
+# often than the UI can show.
+_EMBED_TICK_EVERY = 5
+
+
+class _ProgressReporter:
+    """Bind a (conn, run_id) so jobs can mark phases and tick the
+    embedding counter without threading bookkeeping through every call.
+
+    The class owns nothing the gather body doesn't already own — the
+    conn passed in is the same connection ``gather_for_profile`` uses
+    for its other writes, so progress updates land on the same
+    transaction discipline as the audit row itself.
+    """
+
+    def __init__(self, conn, run_id: int) -> None:
+        self._conn = conn
+        self._run_id = run_id
+        self._embed_done = 0
+        self._last_total: int | None = None
+
+    def step(
+        self,
+        name: str,
+        *,
+        total: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        self._embed_done = 0
+        self._last_total = total
+        gather_runs_repo.set_step(
+            self._conn, self._run_id, name, n_total=total, message=message,
+        )
+
+    def make_embed_tick(self, total: int | None = None) -> "callable":
+        """Return a zero-arg callback for embed_progress().
+
+        ``total`` is optional — if the caller already knows the total
+        candidate count it can pass it here, otherwise the tick reads
+        the most recent total set via ``step()`` (so a later
+        ``step("embedding", total=...)`` call still produces a correct
+        N/M message).
+        """
+        # Reset the counter on each fresh embedding pass so a retried
+        # gather doesn't carry forward a stale value.
+        self._embed_done = 0
+        if total is not None:
+            self._last_total = total
+
+        def _tick() -> None:
+            self._embed_done += 1
+            current_total = self._last_total
+            if self._embed_done % _EMBED_TICK_EVERY != 0 and (
+                current_total is None or self._embed_done != current_total
+            ):
+                return
+            msg = (
+                f"Embedded {self._embed_done} / {current_total} candidates"
+                if current_total
+                else f"Embedded {self._embed_done} candidates"
+            )
+            gather_runs_repo.tick(
+                self._conn, self._run_id,
+                n_processed=self._embed_done, message=msg,
+            )
+
+        return _tick
 
 
 def _resolve_mailto(user_row, default_mailto: str) -> str:
@@ -182,19 +253,39 @@ def gather_for_profile(
                 tier_used=tier,
             )
 
+        reporter = _ProgressReporter(conn, run_id)
         try:
+            reporter.step(
+                "loading_profile",
+                message="Loading profile and seed embeddings",
+            )
             profile = _load_profile(conn, profile_row)
             selector = _build_selector(profile_row, profile)
             gatherer = OpenAlexGatherer(mailto=mailto)
 
+            reporter.step("fetching", message="Querying OpenAlex")
             candidates = gatherer.fetch(profile, since=since, limit=limit)
-            ranked = selector.select(candidates, profile, threshold=profile.threshold)
+
+            reporter.step(
+                "embedding",
+                total=len(candidates),
+                message=f"Embedding {len(candidates)} candidates",
+            )
+            with embed_progress(reporter.make_embed_tick(len(candidates))):
+                ranked = selector.select(
+                    candidates, profile, threshold=profile.threshold,
+                )
             # Carry the actual tier the gatherer landed on (e.g.
             # "must-have-AND") through to the audit row + per-candidate
             # rows. Falls back to ``tier`` (the scheduler's calling
             # context — "scheduled" / "manual") when no tier ran (empty
             # topic_filters, gatherer.last_tier_used is None).
             tier_label = gatherer.last_tier_used or tier
+            reporter.step(
+                "persisting",
+                total=len(ranked),
+                message=f"Saving {len(ranked)} ranked candidates",
+            )
             n_new, n_redup = dedup_and_insert_candidates(
                 conn,
                 profile_id=profile_id,
@@ -240,4 +331,93 @@ def gather_for_profile(
         conn.close()
 
 
-__all__ = ["gather_for_profile"]
+def dry_run_for_draft(
+    user_id: int,
+    profile_id: int,
+    slug: str,
+    *,
+    settings: Any | None = None,
+    days: int = 30,
+    thresholds: list[float] | None = None,
+    run_id: int,
+) -> int | None:
+    """Async dry-run body for the wizard's calibrate step.
+
+    Mirrors :func:`gather_for_profile` for the dry-run flow: opens its
+    own connection, drives the same ``_ProgressReporter`` plumbing, and
+    closes the audit row with the serialized DraftDryRun stashed in
+    ``result_json`` for the status-poll endpoint to hand back.
+
+    The kickoff route pre-creates ``run_id`` so it can echo it to the
+    caller; we always reuse it (no slug→profile re-lookup needed since
+    the route already has the row).
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+
+    # Local import keeps scheduler/jobs.py free of an api/services
+    # dependency at module load (rag_lib is occasionally imported from
+    # contexts that don't pull api in).
+    from ..api.services.wizard import compute_dry_run_for_profile
+    from ..db.repos import profiles as profiles_repo
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        profile_row = profiles_repo.get(conn, profile_id)
+        if profile_row is None:
+            log.error("dry_run.profile_missing", profile_id=profile_id)
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                error=f"profile {profile_id} not found at dispatch time",
+            )
+            return run_id
+
+        reporter = _ProgressReporter(conn, run_id)
+        try:
+            with embed_progress(reporter.make_embed_tick(None)):
+                # The reporter doesn't know the embed total ahead of
+                # time — compute_dry_run_for_profile sets it via
+                # reporter.step("embedding", total=...) once the
+                # candidate list is known.
+                result = compute_dry_run_for_profile(
+                    conn, settings,
+                    profile_row=profile_row,
+                    slug=slug,
+                    days=days,
+                    thresholds=thresholds,
+                    reporter=reporter,
+                )
+            reporter.step("persisting", message="Saving dry-run result")
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=len(result.scores),
+                n_new=0,
+                n_redup=0,
+                tier_used="dry_run",
+                result_json=result.model_dump_json(),
+            )
+            log.info(
+                "dry_run.ok",
+                profile_id=profile_id, run_id=run_id,
+                n=len(result.scores),
+            )
+            return run_id
+        except Exception as exc:  # noqa: BLE001 — surface into audit row
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="dry_run",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception(
+                "dry_run.failed",
+                profile_id=profile_id, run_id=run_id,
+            )
+            return run_id
+    finally:
+        conn.close()
+
+
+__all__ = ["gather_for_profile", "dry_run_for_draft"]
