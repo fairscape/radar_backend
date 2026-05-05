@@ -36,7 +36,12 @@ def _service_version() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    configure_logging(json=settings.RADAR_LOG_JSON)
+    configure_logging(
+        json=settings.RADAR_LOG_JSON,
+        file_path=settings.RADAR_LOG_FILE,
+        file_max_bytes=settings.RADAR_LOG_FILE_MAX_BYTES,
+        file_backup_count=settings.RADAR_LOG_FILE_BACKUP_COUNT,
+    )
     log = structlog.get_logger("rag_lib.api")
 
     conn = connect(settings.RADAR_DB_PATH)
@@ -74,7 +79,12 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(json=settings.RADAR_LOG_JSON)
+    configure_logging(
+        json=settings.RADAR_LOG_JSON,
+        file_path=settings.RADAR_LOG_FILE,
+        file_max_bytes=settings.RADAR_LOG_FILE_MAX_BYTES,
+        file_backup_count=settings.RADAR_LOG_FILE_BACKUP_COUNT,
+    )
 
     app = FastAPI(
         title="RADAR API",

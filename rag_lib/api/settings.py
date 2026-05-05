@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     RADAR_DEFAULT_SELECTOR: str = "centroid"
     RADAR_CORS_ORIGINS: list[str] = ["*"]
     RADAR_LOG_JSON: bool = True
+    # Optional path to a log file. When set, every record (request lines,
+    # tracebacks, structlog events) is also written here via a rotating
+    # handler so logs survive container restarts.
+    RADAR_LOG_FILE: str | None = None
+    RADAR_LOG_FILE_MAX_BYTES: int = 10_000_000
+    RADAR_LOG_FILE_BACKUP_COUNT: int = 5
     RADAR_SCHEDULER_ENABLED: bool = True
     RADAR_HOST: str = "127.0.0.1"
     RADAR_PORT: int = 8000

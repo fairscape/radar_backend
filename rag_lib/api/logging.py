@@ -9,12 +9,20 @@ otherwise for friendlier local dev output.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
+from pathlib import Path
 
 import structlog
 
 
-def configure_logging(json: bool = True, level: int = logging.INFO) -> None:
+def configure_logging(
+    json: bool = True,
+    level: int = logging.INFO,
+    file_path: str | Path | None = None,
+    file_max_bytes: int = 10_000_000,
+    file_backup_count: int = 5,
+) -> None:
     """Wire structlog + stdlib logging into a single processor chain.
 
     Idempotent — safe to call from both the FastAPI lifespan and tests.
@@ -43,10 +51,25 @@ def configure_logging(json: bool = True, level: int = logging.INFO) -> None:
         cache_logger_on_first_use=True,
     )
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handlers: list[logging.Handler] = []
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    handlers.append(stdout_handler)
+
+    if file_path:
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            path,
+            maxBytes=file_max_bytes,
+            backupCount=file_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        handlers.append(file_handler)
+
     root = logging.getLogger()
-    root.handlers[:] = [handler]
+    root.handlers[:] = handlers
     root.setLevel(level)
 
     # uvicorn.access stays at INFO so every request line is visible —
