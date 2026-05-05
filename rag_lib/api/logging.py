@@ -49,5 +49,8 @@ def configure_logging(json: bool = True, level: int = logging.INFO) -> None:
     root.handlers[:] = [handler]
     root.setLevel(level)
 
-    for noisy in ("uvicorn.access",):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # uvicorn.access stays at INFO so every request line is visible —
+    # the in-app middleware emits its own structured record too, but
+    # uvicorn's line is the ground truth that the request reached the
+    # app at all (useful when middleware itself misbehaves).
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)

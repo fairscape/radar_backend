@@ -9,12 +9,14 @@ APScheduler instance. The module-level ``app`` is what uvicorn imports
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
@@ -90,6 +92,38 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["*"],
     )
+
+    access_log = structlog.get_logger("rag_lib.api.access")
+
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            access_log.exception(
+                "request.unhandled",
+                method=request.method,
+                path=request.url.path,
+                query=request.url.query or None,
+                client=request.client.host if request.client else None,
+                duration_ms=duration_ms,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "internal server error"},
+            )
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_fn = access_log.warning if response.status_code >= 500 else access_log.info
+        log_fn(
+            "request",
+            method=request.method,
+            path=request.url.path,
+            status=response.status_code,
+            duration_ms=duration_ms,
+        )
+        return response
 
     app.include_router(health.router, prefix="/api", tags=["health"])
     app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
