@@ -140,6 +140,7 @@ def post_chat(
     client = rag_llm.OllamaClient(
         settings.RADAR_OLLAMA_URL,
         settings.RADAR_OLLAMA_MODEL,
+        timeout=settings.RADAR_OLLAMA_TIMEOUT,
     )
     answer = client.generate(messages)  # raises OllamaUnreachable
     log.info(

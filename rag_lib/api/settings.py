@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     RADAR_CHROMA_DIR: Path = Path("data/chroma")
     RADAR_OLLAMA_URL: str = "http://localhost:11434"
     RADAR_OLLAMA_MODEL: str = "llama3.1:8b"
+    # Per-request timeout for the chat LLM call. A 7B model answering a
+    # full 20-chunk RAG prompt (~60k chars in) on a small GPU can run
+    # well past 60s — the prior default — so the ceiling is generous.
+    RADAR_OLLAMA_TIMEOUT: float = 6000.0
     # Embedding model used by upload, chat retrieval, and the wizard's
     # draft creation. All three must agree, otherwise coherence joins
     # (which filter paper_embeddings by profile.embedding_model) come
