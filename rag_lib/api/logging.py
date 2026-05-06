@@ -47,7 +47,10 @@ def configure_logging(
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        # Use the stdlib factory (not PrintLoggerFactory) so structlog
+        # records flow through the root logger's handlers — that is what
+        # gets them into the rotating log file, not just stdout.
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
 
@@ -72,8 +75,13 @@ def configure_logging(
     root.handlers[:] = handlers
     root.setLevel(level)
 
-    # uvicorn.access stays at INFO so every request line is visible —
-    # the in-app middleware emits its own structured record too, but
-    # uvicorn's line is the ground truth that the request reached the
-    # app at all (useful when middleware itself misbehaves).
-    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    # Strip uvicorn's own handlers and force propagation so its records
+    # (access lines, startup banners, exception tracebacks) flow up to
+    # root and therefore into the rotating file. By default uvicorn sets
+    # propagate=False on these loggers, which is why uvicorn lines were
+    # visible in docker stdout but never landed in the log file.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        lg.handlers = []
+        lg.propagate = True
+        lg.setLevel(logging.INFO)
