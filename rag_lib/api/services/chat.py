@@ -151,7 +151,12 @@ def post_chat(
     )
 
     sources = [
-        {"n": i + 1, "title": c["title"], "score": float(c["score"])}
+        {
+            "n": i + 1,
+            "title": c["title"],
+            "score": float(c["score"]),
+            "text": c["text"],
+        }
         for i, c in enumerate(retrieved)
     ]
 

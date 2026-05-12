@@ -107,6 +107,10 @@ class ChatSource(_Model):
     n: int
     title: str
     score: float
+    # The retrieved chunk text the LLM saw. Optional so older
+    # assistant rows persisted before this field existed still
+    # decode cleanly — they render with an empty evidence panel.
+    text: str | None = None
 
 
 class ChatTurn(_Model):
