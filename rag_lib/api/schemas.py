@@ -25,6 +25,7 @@ HealthStatus = Literal["ok", "warn", "err"]
 Bucket = Literal["high", "medium", "low"]
 CardState = Literal["saved", "dismissed"]
 ChatRole = Literal["user", "assistant"]
+LLMProvider = Literal["ollama", "anthropic", "openai"]
 
 
 class _Model(BaseModel):
@@ -34,7 +35,13 @@ class _Model(BaseModel):
 class Health(_Model):
     status: HealthStatus = "ok"
     version: str
+    # ``ollama_model`` is retained for back-compat with frontends shipped
+    # before /api/chat grew provider support — populate only when the
+    # active provider is Ollama. New clients should read ``llm_provider``
+    # and ``llm_model`` instead.
     ollama_model: str | None = None
+    llm_provider: LLMProvider | None = None
+    llm_model: str | None = None
 
 
 class Profile(_Model):
@@ -124,11 +131,31 @@ class ChatRequest(_Model):
     """Body of ``POST /api/chat``.
 
     ``scope`` is the list of profile slugs retrieval is restricted to;
-    an empty list searches across the whole user's vault.
+    an empty list searches across the whole user's vault. ``provider``
+    overrides ``RADAR_LLM_PROVIDER`` for this one request; omit it (or
+    pass ``null``) to use the server default.
     """
 
     query: str
     scope: list[str] = Field(default_factory=list)
+    provider: LLMProvider | None = None
+
+
+class ProviderInfo(_Model):
+    id: LLMProvider
+    # The model identifier the operator has configured for this provider.
+    # Exposed so the UI can label the dropdown without a second round
+    # trip. Never includes the API key or any portion of it.
+    model: str
+    # True when the operator has supplied everything this provider
+    # needs (API key for Anthropic/OpenAI, URL for Ollama). Frontends
+    # render un-configured options as disabled.
+    configured: bool
+
+
+class ProvidersResponse(_Model):
+    default: LLMProvider
+    available: list[ProviderInfo]
 
 
 class DailyRadarFilters(_Model):

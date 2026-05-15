@@ -41,15 +41,25 @@ def post_chat(
     user_id: int,
     query: str,
     scope: list[str] | None = None,
+    provider: str | None = None,
 ) -> dict:
-    """Run a single user → assistant turn. Returns the assistant ChatTurn."""
+    """Run a single user → assistant turn. Returns the assistant ChatTurn.
+
+    ``provider`` overrides ``RADAR_LLM_PROVIDER`` for this request only;
+    pass ``None`` to use the server default. Resolution + key validation
+    happen inside ``rag_llm.get_llm_client``.
+    """
     scope_list = list(scope or [])
+    active_provider = rag_llm.resolve_provider(settings, provider)
+    active_model = rag_llm.provider_model(settings, active_provider)
 
     log.info(
         "chat.post.start",
         user_id=user_id,
         query_preview=query[:120],
         scope=scope_list,
+        llm_provider=active_provider,
+        llm_model=active_model,
     )
 
     chat_repo.append_turn(
@@ -133,16 +143,13 @@ def post_chat(
     log.info(
         "chat.post.prompt",
         user_id=user_id,
-        model=settings.RADAR_OLLAMA_MODEL,
+        llm_provider=active_provider,
+        llm_model=active_model,
         n_messages=len(messages),
         total_chars=total_chars,
     )
-    client = rag_llm.OllamaClient(
-        settings.RADAR_OLLAMA_URL,
-        settings.RADAR_OLLAMA_MODEL,
-        timeout=settings.RADAR_OLLAMA_TIMEOUT,
-    )
-    answer = client.generate(messages)  # raises OllamaUnreachable
+    client = rag_llm.get_llm_client(settings, active_provider)
+    answer = client.generate(messages)  # raises LLMUnreachable
     log.info(
         "chat.post.answer",
         user_id=user_id,

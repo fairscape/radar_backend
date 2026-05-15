@@ -14,7 +14,14 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Mirrors rag_lib.rag.llm.SUPPORTED_PROVIDERS; kept duplicated to avoid
+# importing the RAG module just for validation (it would pull httpx +
+# pydantic-ai during settings construction).
+_SUPPORTED_LLM_PROVIDERS = {"ollama", "anthropic", "openai"}
 
 
 class Settings(BaseSettings):
@@ -22,12 +29,29 @@ class Settings(BaseSettings):
     RADAR_DEFAULT_MAILTO: str = "demo@example.com"
     RADAR_VAULT_DIR: Path = Path("data/vault")
     RADAR_CHROMA_DIR: Path = Path("data/chroma")
+    # Default LLM provider for /api/chat. One of: ollama | anthropic | openai.
+    # Per-request override is honored by the chat endpoint; this just sets
+    # the fallback when the request omits ``provider``.
+    RADAR_LLM_PROVIDER: str = "ollama"
     RADAR_OLLAMA_URL: str = "http://localhost:11434"
     RADAR_OLLAMA_MODEL: str = "llama3.1:8b"
     # Per-request timeout for the chat LLM call. A 7B model answering a
     # full 20-chunk RAG prompt (~60k chars in) on a small GPU can run
     # well past 60s — the prior default — so the ceiling is generous.
     RADAR_OLLAMA_TIMEOUT: float = 6000.0
+    # Third-party providers. API keys live ONLY in the gitignored .env
+    # file — never in the DB, never returned by any API, never logged.
+    # The provider's client raises LLMNotConfigured at construction
+    # time when its key is missing, mapped to a 503 by the router with
+    # an actionable hint.
+    RADAR_ANTHROPIC_API_KEY: str | None = None
+    RADAR_ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
+    RADAR_OPENAI_API_KEY: str | None = None
+    RADAR_OPENAI_MODEL: str = "gpt-4o-mini"
+    # Shared per-request timeout (seconds) for the non-Ollama providers.
+    # Ollama keeps its own much larger ceiling because local models are
+    # CPU-bound for many seconds even on small prompts.
+    RADAR_LLM_TIMEOUT: float = 120.0
     # Embedding model used by upload, chat retrieval, and the wizard's
     # draft creation. All three must agree, otherwise coherence joins
     # (which filter paper_embeddings by profile.embedding_model) come
@@ -62,6 +86,19 @@ class Settings(BaseSettings):
     RADAR_REQUIRE_AUTH: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
+
+    @field_validator("RADAR_LLM_PROVIDER", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: object) -> str:
+        if value is None or value == "":
+            return "ollama"
+        name = str(value).strip().lower()
+        if name not in _SUPPORTED_LLM_PROVIDERS:
+            raise ValueError(
+                f"RADAR_LLM_PROVIDER must be one of "
+                f"{sorted(_SUPPORTED_LLM_PROVIDERS)}, got {value!r}"
+            )
+        return name
 
 
 @lru_cache(maxsize=1)

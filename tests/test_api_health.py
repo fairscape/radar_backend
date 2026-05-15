@@ -49,6 +49,14 @@ def test_api_health_returns_ok(app):
     body = resp.json()
     assert body["status"] == "ok"
     assert "version" in body and isinstance(body["version"], str)
+    # Provider-aware fields (the chat dropdown reads these).
+    assert body["llm_provider"] in {"ollama", "anthropic", "openai"}
+    assert isinstance(body["llm_model"], str) and body["llm_model"]
+    # Back-compat field is populated only when active provider is Ollama.
+    if body["llm_provider"] == "ollama":
+        assert isinstance(body["ollama_model"], str) and body["ollama_model"]
+    else:
+        assert body["ollama_model"] is None
 
 
 def test_root_health_returns_ok(app):

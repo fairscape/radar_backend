@@ -107,6 +107,36 @@ class FailingOllama:
         raise OllamaUnreachable("connection refused at http://localhost:11434")
 
 
+class FakeAnthropic:
+    """Stand-in for ``AnthropicClient`` — records call args, no SDK use."""
+
+    last_messages: list[dict] | None = None
+    last_model: str | None = None
+
+    def __init__(self, api_key: str, model: str, *, timeout: float = 120.0) -> None:
+        self.api_key = api_key
+        self.model = model
+        FakeAnthropic.last_model = model
+
+    def generate(self, messages: list[dict]) -> str:
+        FakeAnthropic.last_messages = list(messages)
+        return "Anthropic patched reply citing [1]."
+
+
+class FakeOpenAI:
+    last_messages: list[dict] | None = None
+    last_model: str | None = None
+
+    def __init__(self, api_key: str, model: str, *, timeout: float = 120.0) -> None:
+        self.api_key = api_key
+        self.model = model
+        FakeOpenAI.last_model = model
+
+    def generate(self, messages: list[dict]) -> str:
+        FakeOpenAI.last_messages = list(messages)
+        return "OpenAI patched reply citing [1]."
+
+
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
@@ -184,8 +214,16 @@ def app(tmp_path, monkeypatch, collection):
         rag_indexer, "index_user_collection", _fake_index_user_collection,
     )
 
-    # Patch the OllamaClient so /api/chat never makes a real network call.
+    # Patch the LLM client classes so /api/chat never makes a real
+    # network call. ``get_llm_client`` resolves these via module globals,
+    # so swapping the attribute is enough.
     monkeypatch.setattr(rag_llm, "OllamaClient", FakeOllama)
+    monkeypatch.setattr(rag_llm, "AnthropicClient", FakeAnthropic)
+    monkeypatch.setattr(rag_llm, "OpenAIClient", FakeOpenAI)
+    FakeAnthropic.last_messages = None
+    FakeAnthropic.last_model = None
+    FakeOpenAI.last_messages = None
+    FakeOpenAI.last_model = None
 
     from rag_lib.api.app import create_app
     app = create_app()
@@ -305,3 +343,80 @@ def test_chat_post_persists_user_turn_even_on_503(app, monkeypatch):
         for t in history
     )
     assert all(t["who"] != "assistant" for t in history)
+
+
+# -----------------------------------------------------------------------------
+# Multi-provider routing
+# -----------------------------------------------------------------------------
+
+
+def test_chat_post_provider_override_routes_to_anthropic(app, monkeypatch):
+    monkeypatch.setenv("RADAR_ANTHROPIC_API_KEY", "sk-test-key")
+    monkeypatch.setenv("RADAR_ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    settings_module.get_settings.cache_clear()
+
+    resp = _request(
+        app, "POST", "/api/chat",
+        json={"query": "q", "scope": [], "provider": "anthropic"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "Anthropic patched reply" in body["body"]
+    assert FakeAnthropic.last_messages is not None
+    assert FakeAnthropic.last_model == "claude-sonnet-4-6"
+
+
+def test_chat_post_default_provider_used_when_request_omits_one(app, monkeypatch):
+    monkeypatch.setenv("RADAR_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("RADAR_OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("RADAR_OPENAI_MODEL", "gpt-4o-mini")
+    settings_module.get_settings.cache_clear()
+
+    resp = _request(app, "POST", "/api/chat", json={"query": "q", "scope": []})
+    assert resp.status_code == 200, resp.text
+    assert "OpenAI patched reply" in resp.json()["body"]
+    assert FakeOpenAI.last_model == "gpt-4o-mini"
+
+
+def test_chat_post_returns_503_when_provider_key_missing(app, monkeypatch):
+    # No RADAR_ANTHROPIC_API_KEY in env → the request should 503 with
+    # an actionable hint naming the right variable.
+    monkeypatch.delenv("RADAR_ANTHROPIC_API_KEY", raising=False)
+    settings_module.get_settings.cache_clear()
+
+    resp = _request(
+        app, "POST", "/api/chat",
+        json={"query": "q", "scope": [], "provider": "anthropic"},
+    )
+    assert resp.status_code == 503
+    detail = resp.json()["detail"].lower()
+    assert "radar_anthropic_api_key" in detail
+
+
+def test_chat_post_rejects_unknown_provider(app):
+    resp = _request(
+        app, "POST", "/api/chat",
+        json={"query": "q", "scope": [], "provider": "grok"},
+    )
+    # ``Literal`` rejects unknown providers at the schema layer (422).
+    assert resp.status_code == 422
+
+
+def test_chat_providers_endpoint_reports_configured_state(app, monkeypatch):
+    # Anthropic has a key; OpenAI does not.
+    monkeypatch.setenv("RADAR_ANTHROPIC_API_KEY", "sk-test-key")
+    monkeypatch.delenv("RADAR_OPENAI_API_KEY", raising=False)
+    settings_module.get_settings.cache_clear()
+
+    resp = _request(app, "GET", "/api/chat/providers")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["default"] == "ollama"
+    by_id = {p["id"]: p for p in body["available"]}
+    assert set(by_id) == {"ollama", "anthropic", "openai"}
+    assert by_id["ollama"]["configured"] is True
+    assert by_id["anthropic"]["configured"] is True
+    assert by_id["openai"]["configured"] is False
+    # Response shape contains only id/model/configured — no key data.
+    for entry in body["available"]:
+        assert set(entry) == {"id", "model", "configured"}

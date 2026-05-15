@@ -32,6 +32,14 @@ phase1b = [
     "chromadb>=0.5",
     "ollama>=0.3",
 ]
+# Third-party LLM providers for /api/chat (Anthropic Claude, OpenAI).
+# Kept optional so the demo install stays slim — pydantic-ai-slim with
+# the [anthropic,openai] extras pulls only those two SDKs, not Gemini /
+# Groq / Mistral / etc. Operators who want third-party RAG chat install
+# with: `pip install -e '.[llm-providers]'`.
+llm-providers = [
+    "pydantic-ai-slim[anthropic,openai]>=0.0.40",
+]
 dev = [
     "pytest>=8.0",
 ]

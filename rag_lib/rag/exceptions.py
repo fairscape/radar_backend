@@ -1,18 +1,38 @@
 """RAG-layer exceptions.
 
 Kept in their own module so callers (router + service) can import them
-without pulling in chromadb / httpx transitively.
+without pulling in chromadb / httpx / pydantic-ai transitively.
 """
 
 from __future__ import annotations
 
 
-class OllamaUnreachable(RuntimeError):
-    """Raised when the configured Ollama endpoint can't be reached.
+class LLMUnreachable(RuntimeError):
+    """Raised when the active LLM provider can't be reached.
 
     The router maps this to a 503 with an actionable message that names
-    ``RADAR_OLLAMA_URL`` and the configured model so the operator can
-    fix the failure mode (service down, wrong host, model not pulled).
+    the relevant env var for the active provider (``RADAR_OLLAMA_URL``
+    for Ollama, ``RADAR_ANTHROPIC_API_KEY`` for Anthropic, etc.) so the
+    operator can diagnose service-down / wrong-host / missing-key cases
+    from the error alone.
+    """
+
+
+# Back-compat alias. The Phase 9 chat path raised ``OllamaUnreachable``
+# directly; callers and tests still import that name. Keeping it as an
+# alias means the rename is a single-file change instead of a fan-out.
+OllamaUnreachable = LLMUnreachable
+
+
+class LLMNotConfigured(RuntimeError):
+    """Raised when the requested provider is selected but unusable.
+
+    Two cases:
+      * No API key in the environment for a third-party provider.
+      * The ``llm-providers`` extras group isn't installed, so the
+        provider's client library (``pydantic_ai``) can't be imported.
+
+    The router maps this to a 503 with a hint pointing at the fix.
     """
 
 
