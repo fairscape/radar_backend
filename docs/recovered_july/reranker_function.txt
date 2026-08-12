@@ -1,0 +1,278 @@
+======================================================================
+  RADAR Reranker 功能总结
+  基于代码实际实现，生成日期: 2026-07-22
+======================================================================
+
+1. 定位与作用
+----------------------------------------------------------------------
+
+Reranker 是 Selector（SPECTER2 cosine similarity 排序）之后、数据库
+持久化之前的 **二次排序阶段**。
+
+完整打分流水线：
+
+  OpenAlex 候选论文
+      ↓
+  Selector 打分排序 (SPECTER2 cosine similarity)
+      ↓  输出: [(cosine_score, paper, breakdown), ...]
+  Reranker 二次打分
+      ↓  输出: [(blended_score, paper, breakdown), ...]
+  持久化到 profile_candidates 表
+
+代码位置：
+  - Protocol 定义:  radar_backend/rag_lib/reranker.py
+  - MedCPT 实现:    radar_backend/rag_lib/rerankers/medcpt.py
+  - Noop 实现:      radar_backend/rag_lib/rerankers/noop.py
+  - Registry:       radar_backend/rag_lib/rerankers/__init__.py
+  - Gather 调用点:  radar_backend/rag_lib/scheduler/jobs.py (L310-333)
+  - 对比 API:       radar_backend/rag_lib/api/routers/profiles.py (L594-676)
+
+
+2. 模型
+----------------------------------------------------------------------
+
+使用 ncbi/MedCPT-Cross-Encoder — 一个在 PubMed 搜索日志上训练的
+BERT cross-encoder 模型（AutoModelForSequenceClassification）。
+
+模型懒加载：首次调用时加载并缓存于进程级单例，后续复用。
+推理设备：当前配置为 cuda:1（GPU 加速）。
+
+
+3. 两种查询模式（query_mode）
+----------------------------------------------------------------------
+
+┌──────────┬─────────────────────────────────┬────────────────────────────┐
+│ 模式     │ query 来源                       │ article 来源               │
+├──────────┼─────────────────────────────────┼────────────────────────────┤
+│ "topic"  │ Profile 中用户选定的 topic       │ 候选论文的 title. abstract  │
+│          │ display names                   │                            │
+├──────────┼─────────────────────────────────┼────────────────────────────┤
+│ "article"│ Seed 论文的完整内容              │ 候选论文的完整内容           │
+│ (当前)   │ (build_embedding_input 构建:     │ (同样格式)                  │
+│          │  title + abstract + body)       │                            │
+└──────────┴─────────────────────────────────┴────────────────────────────┘
+
+当前 .env 配置: RADAR_RERANKER_QUERY_MODE=article
+
+"article" 模式下 query 与 SPECTER2 嵌入的输入格式一致，保持了
+Selector 和 Reranker 之间的信息对齐。
+
+两种模式的 fallback：若无 topic/内容可用，则退回 seed 论文标题。
+
+
+4. 打分计算过程（medcpt.py rerank() 方法）
+----------------------------------------------------------------------
+
+Step 1 — 构建配对
+  对每个候选论文 x 每个 query 生成 (query, article) 文本对。
+  排列顺序为候选优先：candidate_i * n_queries + query_j。
+
+Step 2 — Cross-encoder 批量推理
+  按 batch_size=64 分批：
+    tokenizer(pairs, truncation=True, padding=True, max_length=512)
+    logits = model(**encoded).logits.squeeze(dim=1)
+  收集所有配对的 logit 分数。
+
+  ** Logit 的含义 **
+  ncbi/MedCPT-Cross-Encoder 是一个 AutoModelForSequenceClassification
+  模型，本质是 BERT + 线性分类头。它将 [CLS] query [SEP] article [SEP]
+  拼接输入，经过 BERT 全程 token 级 attention 编码后，由线性头将
+  [CLS] 表示映射为一个标量。这个标量就是 logit——模型对该 (query,
+  article) 配对相关性的原始预测值，未经 softmax/sigmoid，范围为
+  (-inf, +inf)，值越大表示越相关。
+
+  ** 与 Cosine Similarity 的区别 **
+
+  ┌─────────────────┬──────────────────────┬──────────────────────┐
+  │                 │ Cosine (Bi-encoder)  │ Logit (Cross-encoder)│
+  ├─────────────────┼──────────────────────┼──────────────────────┤
+  │ 编码方式        │ 各自独立编码，再比较  │ 拼接后联合编码        │
+  │ 文本交互        │ 无（只在向量空间比较）│ 有（token 级 attention│
+  │                 │                      │ 全程交互）           │
+  │ 精度            │ 较粗                 │ 更细（能捕捉细粒度    │
+  │                 │                      │ 语义关系）           │
+  │ 速度            │ 快（候选向量可预计算）│ 慢（每对都要过模型）  │
+  │ 训练信号        │ SPECTER2: 论文引用   │ MedCPT: PubMed       │
+  │                 │ 关系                 │ 搜索点击日志          │
+  │ 分数范围        │ [-1, 1]              │ (-inf, +inf)         │
+  └─────────────────┴──────────────────────┴──────────────────────┘
+
+  两者都在衡量"相关性"，但 cross-encoder 能看到两段文本的词级交互，
+  理论上判断更准确，代价是计算量大得多。这也是系统将它们设计成两级
+  流水线的原因：先用快速的 cosine 粗筛，再用慢但更准的 cross-encoder
+  精排。
+
+Step 3 — 聚合（每个候选论文）
+  每个候选有 N 个 query 对应的 logit，按 aggregation 参数聚合：
+    - "mean": 取所有 query logit 的均值（当前默认）
+    - "max":  取最大值
+  同时记录最佳匹配 query 的 index。
+
+Step 4 — 归一化
+  两个分数的原始量纲完全不同：
+    - Cosine similarity 范围 [-1, 1]，实际值通常在 0.3 ~ 0.8
+    - Cross-encoder logit 范围 (-inf, +inf)，实际值可能是 -5.2 或 12.7
+
+  如果不归一化直接加权相加，logit 的绝对值远大于 cosine，会完全
+  压制 Selector 的贡献，alpha/beta 权重就失去意义。因此必须先将
+  两者映射到相同的 [0, 1] 区间：
+
+    Cosine:  固定线性映射     sel_norm = (cosine + 1) / 2
+    Logit:   批次内 min-max   norm = (raw - min) / (max - min)
+
+  Cosine 用固定公式是因为它的范围已知 [-1, 1]。
+  Logit 用 min-max 是因为它的范围不固定，只能在当前批次内做相对归一化。
+
+  ** 归一化不影响单方排序 **
+  Min-max 是单调变换：原来 raw_a > raw_b，归一化后 norm_a > norm_b。
+  因此：
+    - 若 alpha=0, beta=1（纯 reranker），排名完全由 logit 决定，
+      归一化不改变排序结果。
+    - 若 alpha=1, beta=0（纯 selector），排名就是 cosine 原序。
+  归一化唯一的作用是让两个分数在混合时可比，它本身不改变任何一方
+  内部的排序。
+
+Step 5 — 与 Selector 分数混合
+  最终混合:
+    blended = alpha x sel_norm + beta x reranker_norm
+
+  当前配置: alpha=0.4, beta=0.6
+  即 Reranker 权重占 60%，Selector 权重占 40%。
+
+Step 6 — 排序与 percentile
+  按 blended 降序排列，重新计算 percentile，输出结果。
+
+
+5. 每个候选论文的 breakdown 字段
+----------------------------------------------------------------------
+
+Reranker 在原有 Selector breakdown dict 上追加以下字段：
+
+  score_pct_selector     — Selector 阶段的原始 percentile
+  score_reranker_raw     — cross-encoder 聚合后的原始 logit 值
+  score_reranker_norm    — min-max 归一化后的 [0, 1] 分数
+  score_selector_norm    — Selector cosine 归一化后的 [0, 1] 分数
+  score_blended          — 最终混合分数（用于排序的依据）
+  reranker_queries_used  — 使用了多少个 query
+  reranker_best_query    — 与该候选最匹配的 query（截断到 120 字符）
+
+
+6. Reranker 输出与数据库持久化
+----------------------------------------------------------------------
+
+rerank() 方法返回 list[tuple[float, Paper, dict]]，即：
+  [(blended_score, Paper对象, breakdown字典), ...]
+按 blended_score 降序排列。
+
+** 持久化到数据库 **
+
+Migration 0013_reranker.sql 在 profile_candidates 表新增三列：
+
+  score_reranker_raw   — 原始 logit
+  score_reranker_norm  — 归一化分数
+  score_blended        — 最终混合分数
+
+在 profiles 表新增一列：
+
+  reranker_config_json — 持久化的 reranker 配置（per-profile）
+
+dedup_and_insert_candidates() 将 breakdown 中的分数写入对应列：
+  score          ← blended_score（tuple 的第一个元素）
+  score_raw      ← breakdown["score_raw"]（Selector 原始 cosine）
+  score_pct      ← breakdown["score_pct"]（reranker 后的 percentile）
+  score_reranker_raw  ← breakdown["score_reranker_raw"]
+  score_reranker_norm ← breakdown["score_reranker_norm"]
+  score_blended       ← breakdown["score_blended"]
+
+** Radar 前端排序依据 **
+
+unshown_for_profile() 查询（candidates.py:164-177）用于 Radar 日常
+推送，排序为：
+
+  ORDER BY pc.score DESC
+
+而 score 列写入的就是 blended_score。因此 Radar 前端展示的排序
+实际上由 reranker 的 blended 分数决定，reranker 的结果直接控制
+了用户看到论文的先后顺序。
+
+前端展示分数时用 score_pct（radar.py:260-262），而 reranker 在
+attach_percentile() 后已将 score_pct 覆写为基于 blended 排序的
+percentile，所以用户看到的百分位数也是 reranker 后的。
+
+
+7. 调用链路
+----------------------------------------------------------------------
+
+a) 定时 Gather（主要路径）:
+   scheduler/jobs.py -> gather_for_profile()
+     -> _build_reranker(profile_row, settings)
+       -> 优先读 profile_row["reranker_config_json"]
+       -> 否则按 settings 全局默认构建 MedCPTReranker
+       -> 若 RADAR_RERANKER_ENABLED=false 则返回 NoopReranker
+     -> reranker.rerank(ranked, profile, conn=conn)
+     -> 持久化到 profile_candidates（含 reranker 分数列）
+
+b) Wizard Dry-run（预览路径）:
+   api/services/wizard.py -> compute_dry_run_for_profile()
+     -> 同样调用 _build_reranker() + rerank()
+     -> 用于 Profile 创建前的预览
+
+c) 前端对比 API:
+   GET /api/profiles/{key}/reranker-comparison
+     -> 从 DB 读已有候选
+     -> 按 score_raw 排出 rank_before（Selector 原序）
+     -> 按 score_blended 排出 rank_after（Reranker 后序）
+     -> 计算排名变化、平均变化、最大提升/下降
+     -> 前端用 RerankerBumpChart.tsx 可视化 bump chart
+
+
+8. 前端展示
+----------------------------------------------------------------------
+
+ProfilesView.tsx:
+  - "RERANKER" 按钮加载对比数据
+  - RerankerBumpChart.tsx 展示 SVG bump chart：
+    - 左列: Selector 排名
+    - 右列: Reranker 后排名
+    - 连线颜色: 绿色(提升) / 红色(下降) / 灰色(不变)
+    - 统计: reranked count, avg change, max promoted, max demoted
+    - 显示使用的 queries
+
+注意：前端只能查看对比结果，不能配置 reranker 参数。
+
+
+9. NoopReranker
+----------------------------------------------------------------------
+
+当 RADAR_RERANKER_ENABLED=false 时使用。
+直接原样返回 Selector 的结果，不做任何处理，cost=0。
+
+
+10. 当前 .env 实际配置
+----------------------------------------------------------------------
+
+  RADAR_RERANKER_ENABLED    = true
+  RADAR_RERANKER_DEVICE     = cuda:1
+  RADAR_RERANKER_ALPHA      = 0.4     (Selector 权重)
+  RADAR_RERANKER_BETA       = 0.6     (Reranker 权重)
+  RADAR_RERANKER_QUERY_MODE = article (用 seed 论文内容作 query)
+
+以下为默认值（未在 .env 中显式设置）：
+  RADAR_DEFAULT_RERANKER          = medcpt
+  RADAR_RERANKER_MODEL_ID         = ncbi/MedCPT-Cross-Encoder
+  RADAR_RERANKER_BATCH_SIZE       = 64
+  RADAR_RERANKER_MAX_QUERIES      = 30
+  RADAR_RERANKER_AGGREGATION      = mean
+  RADAR_RERANKER_MIN_UMLS_CONFIDENCE = 0.7
+
+
+11. 一句话总结
+----------------------------------------------------------------------
+
+当前 Reranker 使用 article 模式：以每篇 seed 论文的完整内容
+（title + abstract + body）作为 query，与每篇候选论文的完整内容
+配对，通过 MedCPT cross-encoder 在 GPU 上批量推理得到相关度
+logit，在候选批次内 min-max 归一化后，以 6:4 权重混合 Reranker
+与 Selector 分数，生成最终排名。
+
+======================================================================

@@ -1,0 +1,152 @@
+========================================================================
+RADAR Reranker Revision — Progress Log
+========================================================================
+Last updated: 2026-07-18
+
+
+========================================================================
+1. Completed Work
+========================================================================
+
+1.1 MedCPT Reranker Dual-Mode Implementation (DONE)
+-----------------------------------------------------
+Implemented article/topic query mode for MedCPT cross-encoder reranker.
+
+Modified files:
+  - radar_backend/rag_lib/rerankers/medcpt.py
+    * Added query_mode parameter ("topic" or "article")
+    * Added _seed_content_queries() method using build_embedding_input()
+    * Updated article construction to use build_embedding_input() in article mode
+    * Added truncation for reranker_best_query (120 chars)
+    * Updated config(), from_config(), diagnostics()
+    * Rewrote __main__ test block to compare both modes side by side
+
+  - radar_backend/rag_lib/api/settings.py
+    * Added RADAR_RERANKER_QUERY_MODE: str = "topic" (default)
+    * Changed RADAR_DEFAULT_MAILTO to "gong20125@gmail.com"
+
+  - radar_backend/rag_lib/scheduler/jobs.py
+    * Pass query_mode=settings.RADAR_RERANKER_QUERY_MODE to _build_reranker()
+
+  - radar_backend/rag_lib/api/services/wizard.py
+    * Pass query_mode=settings.RADAR_RERANKER_QUERY_MODE to _build_reranker()
+
+  - radar_backend/.env
+    * Added RADAR_RERANKER_QUERY_MODE=article
+
+1.2 UMLS Topic Case-Insensitive Deduplication (DONE)
+-----------------------------------------------------
+Fixed duplicate topics caused by case differences (e.g., "Medical Research
+and Treatments" vs "Medical research and treatments").
+
+Modified file:
+  - radar_backend/rag_lib/umls/topic_mapper.py
+    * Added existing_names_lower set to check against existing topics
+    * Added seen_names_lower set to deduplicate among new UMLS topics
+
+1.3 Frontend Loading Fix (DONE)
+--------------------------------
+Frontend was stuck on "Loading today's radar..." due to two issues:
+
+  a) .env.development had VITE_API_BASE_URL=http://localhost:8000 which
+     broke remote browser access (localhost resolved to user's machine).
+     Fixed by setting VITE_API_BASE_URL= (empty) to use vite proxy.
+
+  b) All profiles belonged to user_id=2 but frontend without X-User-Email
+     header falls back to demo user (id=1). Fixed by reassigning all
+     profiles to user_id=1.
+
+Modified files:
+  - radar_frontend/.env.development — VITE_API_BASE_URL= (empty)
+  - radar_frontend/.env — VITE_API_BASE_URL= (empty)
+  - radar_frontend/src/api/client.ts — default API_BASE_URL changed to ''
+  - radar_frontend/vite.config.ts — added proxy: { '/api': 'http://localhost:8000' }
+
+1.4 Four-Profile Evaluation (DONE)
+------------------------------------
+Created 4 test profiles and exported CSV comparisons.
+Full analysis in: reranker_analysis_summary.txt
+
+Results:
+  | Profile                | ID | Candidates | Article Mode Effect        |
+  |------------------------|----|------------|----------------------------|
+  | type_1_diabetes_test   | 37 |  59        | GOOD — promotes relevant   |
+  | type_2_diabetes_test   | 36 | 127        | MODERATE — selector bias   |
+  | obesity_test           | 38 | 313        | BAD — OpenAlex mismatch    |
+  | infectious_disease_test| 39 | 481        | GOOD — cross-domain signal |
+
+Exported CSV files (sorted by reranker_rank/blended_score):
+  - type_1_diabetes_test_comparison.csv
+  - type_2_diabetes_test_comparison.csv
+  - obesity_test_comparison.csv
+  - infectious_disease_test_comparison.csv
+
+
+========================================================================
+2. Known Issues
+========================================================================
+
+2.1 Obesity Profile — OpenAlex Mismatch (OPEN)
+------------------------------------------------
+Seed paper "Recognizing Obesity and Comorbidities in Sparse Data" was
+matched by OpenAlex to a completely wrong paper:
+  Title stored: "0957 + 561 A, B: twin quasistellar objects or gravitational lens?"
+  OpenAlex ID: W2036247675
+  Body text: correct (obesity NLP content)
+  Abstract: nearly empty (13 chars)
+
+This causes the reranker to promote astrophysics papers to the top.
+
+Fix: Delete this seed paper and re-upload the PDF, or manually correct
+the title/abstract in the database. Then re-run gather for the profile.
+
+2.2 SPECTER2 AutoAdapterModel Import Error (INTERMITTENT)
+----------------------------------------------------------
+On first load, SPECTER2 embedding sometimes fails with:
+  ImportError: cannot import name 'AutoAdapterModel' from 'adapters'
+Retries usually succeed. This affects PDF upload (vault/upload returns 400
+on first attempt, 200 on retry).
+
+2.3 Disk Usage Warning
+------------------------
+Home directory at 93% (97.7G / 105G quota). Delete unnecessary files
+when possible.
+
+
+========================================================================
+3. Current Configuration
+========================================================================
+
+Backend .env (key settings):
+  RADAR_DB_PATH=/bigtemp2/nkw3mr/radar_deployment/data/radar.db
+  RADAR_RERANKER_ENABLED=true
+  RADAR_RERANKER_DEVICE=cuda:1
+  RADAR_RERANKER_ALPHA=0.4
+  RADAR_RERANKER_BETA=0.6
+  RADAR_RERANKER_QUERY_MODE=article
+  RADAR_UMLS_ENABLED=true
+  RADAR_DEFAULT_EMBEDDING_MODEL=specter2
+  RADAR_CHAT_EMBEDDING_MODEL=mxbai-embed-large
+
+Database: /bigtemp2/nkw3mr/radar_deployment/data/radar.db
+All profiles assigned to user_id=1.
+
+Current profiles in DB (4 test profiles):
+  id=36  slug=type-2-diabetes       name=type_2_diabetes
+  id=37  slug=type-1-diabetes-test  name=type_1_diabetes_test
+  id=38  slug=obesity-test          name=obesity_test
+  id=39  slug=infectious-disease-test name=infectious_disease_test
+  (plus ~17 other existing profiles)
+
+
+========================================================================
+4. Next Steps
+========================================================================
+
+- Fix obesity_test seed paper OpenAlex mismatch, re-run gather, re-export CSV
+- Consider adding upload-time validation (title vs body_text semantic
+  similarity check) to catch future OpenAlex mismatches
+- Evaluate whether alpha/beta weights need per-profile tuning for
+  cross-domain profiles
+- Consider hybrid topic+article query mode for edge cases
+- Clean up disk space (93% usage)

@@ -1,0 +1,172 @@
+========================================================================
+MedCPT Reranker Article Mode — 4-Profile Evaluation Summary
+========================================================================
+
+Date: 2026-07-18
+Mode: article (RADAR_RERANKER_QUERY_MODE=article)
+Config: alpha=0.4 (selector weight), beta=0.6 (reranker weight)
+Blending: blended = alpha * sel_norm + beta * reranker_norm
+
+
+------------------------------------------------------------------------
+1. type_1_diabetes_test  (Profile ID: 37, 59 candidates)
+------------------------------------------------------------------------
+Seed papers: 3 papers focused on blood glucose monitoring, CGM, and
+             Type 1 diabetes machine learning prediction.
+
+Result: GOOD — Reranker effectively promotes relevant papers.
+
+Key promotions (moved UP in ranking):
+  +28: "Immune therapies in type 1 diabetes deserve immune biomarkers"
+  +23: "Applications of Stem Cell-Derived Islets and Emerging Experimental..."
+  +24: "GLP-1 receptor agonists in type 1 diabetes: a new frontier..."
+  +27: "Developmental outcomes in children with type 1 diabetes..."
+  +14: "Structurally Tightened Robust MPC for Closed-Loop Artificial Pancreas"
+
+Key demotions (moved DOWN):
+  -37: "Multicenter Comparison of Computerized Insulin Sensitivity Coefficient"
+  -34: "Application of two-phase statistical process control..."
+  -16: "Proteomic signatures of loss of glycemic control in youth-onset type 2"
+        (Type 2 paper correctly demoted from a Type 1 profile)
+
+Assessment: Article mode successfully identifies Type 1-specific papers
+and demotes generic diabetes or Type 2 papers. Top 5 are all directly
+relevant (blood glucose prediction, CGM monitoring, open-source diabetes
+management). The reranker corrects the selector's tendency to rank
+generic diabetes papers highly.
+
+
+------------------------------------------------------------------------
+2. type_2_diabetes_test  (Profile ID: 36, 127 candidates)
+------------------------------------------------------------------------
+Seed papers: Papers on Type 2 diabetes and machine learning.
+
+Result: MODERATE — Selector itself has strong ML bias; reranker provides
+some correction.
+
+Key observations:
+- The selector (SPECTER2) already ranks generic ML/AI papers very highly
+  (top 20 dominated by non-medical ML papers).
+- The reranker promotes some medically-relevant papers:
+  +27: "The hardest part of medical AI is clinical, not just statistical"
+  +17: "Recent Advances in Artificial Intelligence for Health Care"
+  +12: "Artificial Intelligence in Clinical Genetics"
+  + 8: "Towards Early and Accurate Disease Detection Through Multimodal..."
+
+- But also promotes some unrelated ML papers:
+  +67: "Detection of Network Irregularities Using Machine Learning"
+  +86: "Enhancing bias detection in text classification models"
+
+- Some relevant medical papers were demoted:
+ -101: "Assessment of Dietary Practices of In-Patient Type 2 Diabetics"
+
+Assessment: The core issue is the selector's ML bias, not the reranker.
+Article mode partially corrects by promoting medical AI papers over pure
+ML papers, but cannot fully overcome the selector's skewed baseline.
+The blended scoring is a net improvement over selector-only ranking.
+
+
+------------------------------------------------------------------------
+3. obesity_test  (Profile ID: 38, 313 candidates)
+------------------------------------------------------------------------
+Seed papers (4):
+  1. "Recognizing Obesity and Comorbidities in Sparse Data"
+     *** OpenAlex MISMATCH: title stored as "0957 + 561 A, B: twin
+     quasistellar objects or gravitational lens?" (astrophysics paper).
+     Body text is correct (obesity NLP content), but title/abstract
+     are from a completely unrelated astrophysics paper. ***
+  2. "Does Physical Activity Predict Obesity" (correct)
+  3. "Predicting Obesity in Adults Using Machine Learning" (correct)
+  4. "Using NLP of Clinical Notes for Phenotyping Smoking and Obesity" (correct)
+
+Result: BAD — Corrupted by OpenAlex mismatch in Seed 1.
+
+Symptoms:
+- Top 25 dominated by astrophysics/cosmology papers:
+  Rank 1: "Justifying our universe with humans"
+  Rank 2: "Predictive Modeling of Exoplanet Orbital Eccentricity"
+  Rank 3: "Today's visible structure emerged from an unusual quantum fluctuation"
+  Rank 4: "Fundamental Gravity in Its Own Reality"
+
+- Genuine obesity papers massively demoted:
+ -269: "Development and Psychometric Validation of a Multidimensional Clinical..."
+ -282: "The burden of disease in Italy" (epidemiology)
+ -289: "Assessment of Dietary Practices of In-Patient Type 2 Diabetics"
+
+Root cause: build_embedding_input() uses the stored title
+"0957 + 561 A, B: twin quasistellar objects or gravitational lens?"
+as the query header. MedCPT cross-encoder matches this against
+astrophysics candidate papers, producing high scores for unrelated
+content.
+
+Fix needed: Delete and re-upload the mismatched seed paper, or
+manually correct the title/abstract in the database.
+
+
+------------------------------------------------------------------------
+4. infectious_disease_test  (Profile ID: 39, 481 candidates)
+------------------------------------------------------------------------
+Seed papers (5):
+  1. "Does infectious disease influence the efficacy of marine protected areas?"
+  2. "Infectious Diseases Affect Marine Fisheries and Aquaculture Economics"
+  3. "Automated Classification of Online Sources for Infectious Disease..."
+  4. "Implications of climatic and demographic change for seasonal influenza..."
+  5. "Utilizing NLP and LLMs in the diagnosis..." (no abstract, body only)
+
+Profile intent: Interdisciplinary — ML x fisheries x infectious disease.
+(2/5 seeds are marine infectious disease; 3/5 are ML + infectious disease)
+
+Result: GOOD for the intended cross-disciplinary scope.
+
+Reranker correctly promotes cross-domain papers:
+  +60: "How the U.S. Gulf shrimp sector shaped public health" (fisheries)
+  +40: "AI and ML in Pest and Disease Management" (disease + ML)
+  +38: "The Economic Geography of Global Disease Burden" (disease geography)
+ +174: "Spatiotemporal patterns of macroalgal diversity" (marine ecology)
+ +140: "Immunology of pregnancy and sepsis" (disease mechanism)
+
+Reranker correctly demotes narrow infectious disease papers:
+ -373: "Molecular evidence of neuroinvasive Sindbis virus" (pure clinical)
+ -411: "Clinical presentation of SARS-CoV-2, influenza" (pure clinical)
+ -406: "Detection of Newcastle Disease Virus" (veterinary, non-marine)
+ -411: "Impact of Helminth Infection on Physiological..." (pure parasitology)
+
+These demotions are appropriate because the profile targets the
+intersection of fisheries, ML, and infectious disease — not pure
+clinical infectious disease.
+
+Remaining noise: Some clearly irrelevant papers still promoted
+(Concussion, oil palm metabolomics, moral judgements), reflecting
+MedCPT's limited precision on non-medical/cross-domain content.
+
+
+========================================================================
+Overall Conclusions
+========================================================================
+
+1. Article mode works well when seed papers are thematically coherent
+   and correctly matched (type_1_diabetes: clear improvement).
+
+2. Article mode captures cross-disciplinary signals that topic mode
+   cannot (infectious_disease: promotes fisheries + disease intersection
+   papers that topic-name queries would miss).
+
+3. Article mode is vulnerable to data quality issues:
+   - OpenAlex mismatch (obesity: astrophysics title on obesity paper)
+     causes catastrophic failure.
+   - Seed papers with very long body_text can dominate query direction
+     when seed paper themes are not fully aligned.
+
+4. The selector's inherent ML bias (type_2_diabetes) is partially but
+   not fully corrected by the reranker.
+
+5. MedCPT cross-encoder has limited precision on non-medical content,
+   producing noise in cross-domain profiles.
+
+Recommendations:
+- Fix the obesity seed paper OpenAlex mismatch before re-evaluating.
+- Consider input validation during upload to flag title/body_text
+  semantic mismatch (e.g., cosine similarity check between title
+  embedding and body_text embedding).
+- For cross-domain profiles, the alpha/beta weights may need
+  per-profile tuning, or a hybrid topic+article query mode.
