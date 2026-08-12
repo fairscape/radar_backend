@@ -35,15 +35,20 @@ env/
 .vscode/
 *.swp
 
-# Radar data — local researcher state, never commit
+# Radar data — local researcher state, never commit.
+# Anchored and slash-less so the patterns match whether these are real
+# directories or symlinks into scratch storage (a trailing slash only
+# matches a directory, and git sees a symlink as a file).
 *.db
 *.sqlite
 *.sqlite3
-data/
-vault/
-chroma/
-ollama/
-rag_vault/
+/data
+/vault
+/chroma
+/logs
+/ollama
+/rag_vault
+/backups
 
 # Model caches
 .cache/
