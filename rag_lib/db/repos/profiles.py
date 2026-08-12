@@ -99,8 +99,8 @@ def create_draft(
         """
         INSERT INTO profiles (
           user_id, name, slug, embedding_model, topic_filters_json,
-          n_seed, is_draft
-        ) VALUES (?, ?, ?, ?, '{}', 0, 1)
+          n_seed, is_draft, threshold
+        ) VALUES (?, ?, ?, ?, '{}', 0, 1, 0.7)
         """,
         (user_id, name, slug, embedding_model),
     )

@@ -71,6 +71,30 @@ async def lifespan(app: FastAPI):
     )
 
     try:
+        from ..embedders import get_embedder
+        emb_model = settings.RADAR_DEFAULT_EMBEDDING_MODEL
+        if emb_model and emb_model != "placeholder-v1":
+            log.info("api.preload_embedder", model=emb_model)
+            get_embedder(emb_model)("warmup")
+            log.info("api.preload_embedder.done", model=emb_model)
+    except Exception as exc:
+        log.warning("api.preload_embedder.failed", error=str(exc)[:200])
+
+    if settings.RADAR_UMLS_ENABLED:
+        try:
+            log.info("api.preload_umls")
+            from ..umls.extractor import extract_umls_concepts
+            extract_umls_concepts(
+                "warmup",
+                min_confidence=settings.RADAR_UMLS_MIN_CONFIDENCE,
+                spacy_model=settings.RADAR_UMLS_SPACY_MODEL,
+                cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+            )
+            log.info("api.preload_umls.done")
+        except Exception as exc:
+            log.warning("api.preload_umls.failed", error=str(exc)[:200])
+
+    try:
         yield
     finally:
         stop_scheduler(app.state.scheduler)

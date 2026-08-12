@@ -129,12 +129,19 @@ def _load_specter2():
             "Install with: pip install -e '.[dev,phase1b]'"
         ) from e
 
+    import torch  # type: ignore
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     tokenizer = AutoTokenizer.from_pretrained(SPECTER2_MODEL_ID)
-    model = AutoAdapterModel.from_pretrained(SPECTER2_MODEL_ID)
+    model = AutoAdapterModel.from_pretrained(
+        SPECTER2_MODEL_ID, low_cpu_mem_usage=False,
+    )
     model.load_adapter(SPECTER2_ADAPTER, source="hf", load_as="proximity",
                        set_active=True)
     model.eval()
-    _specter2_model = (tokenizer, model)
+    model.to(device)
+    _specter2_model = (tokenizer, model, device)
     return _specter2_model
 
 
@@ -143,7 +150,7 @@ def specter2_embed(text: str) -> list[float]:
     768-dim unit vector (the adapter head pools on [CLS])."""
     import torch  # type: ignore — lazy
 
-    tokenizer, model = _load_specter2()
+    tokenizer, model, device = _load_specter2()
     inputs = tokenizer(
         text,
         padding=True,
@@ -151,6 +158,7 @@ def specter2_embed(text: str) -> list[float]:
         return_tensors="pt",
         max_length=512,
     )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         out = model(**inputs)
     # SPECTER2's proximity adapter emits [CLS]-pooled embeddings.

@@ -85,6 +85,34 @@ class Settings(BaseSettings):
     # so the API rejects unauthenticated traffic with 401.
     RADAR_REQUIRE_AUTH: bool = False
 
+    # UMLS concept extraction (Phase B+). Disabled by default; enable after
+    # installing the [umls] extras and the SciSpacy model.
+    RADAR_UMLS_ENABLED: bool = True
+    RADAR_UMLS_SPACY_MODEL: str = "en_core_sci_lg"
+    RADAR_UMLS_MIN_CONFIDENCE: float = 0.7
+    RADAR_UMLS_MAX_CONCEPTS: int = 30
+    RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 4
+    RADAR_UMLS_MIN_TOPIC_SIMILARITY: float = 0.40
+    RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"
+    RADAR_UMLS_CACHE_DIR: Path = Path("data/umls_cache")
+
+    # MedCPT cross-encoder reranker. Disabled by default; enable after
+    # installing the [reranker] extras (transformers + torch).
+    RADAR_RERANKER_ENABLED: bool = False
+    RADAR_DEFAULT_RERANKER: str = "medcpt"
+    RADAR_RERANKER_ALPHA: float = 0.4
+    RADAR_RERANKER_BETA: float = 0.6
+    RADAR_RERANKER_DEVICE: str = "cpu"
+    RADAR_RERANKER_BATCH_SIZE: int = 64
+    RADAR_RERANKER_MAX_QUERIES: int = 30
+    RADAR_RERANKER_MIN_UMLS_CONFIDENCE: float = 0.7
+    RADAR_RERANKER_AGGREGATION: str = "mean"
+    RADAR_RERANKER_MODEL_ID: str = "ncbi/MedCPT-Cross-Encoder"
+    # Query mode for the cross-encoder reranker.
+    # "topic"   — use profile topic display names as queries (original)
+    # "article" — use seed paper content (build_embedding_input) as queries
+    RADAR_RERANKER_QUERY_MODE: str = "topic"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     @field_validator("RADAR_LLM_PROVIDER", mode="before")

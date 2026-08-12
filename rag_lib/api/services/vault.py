@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,25 @@ from ...openalex_client import OpenAlexClient
 from ...paper import Paper
 from ...rag import indexer as rag_indexer
 from ...vault import compute_file_hash, ingest_pdf
+
+
+# How much text to hand the UMLS extractor. ``extract_umls_concepts``
+# wants the abstract; body_text is only a fallback for papers that have
+# none. A full PDF body runs 50k-200k chars, which takes minutes through
+# en_core_sci_lg + the UMLS linker and can trip spaCy's 1,000,000-char
+# ``nlp.max_length`` guard — that raises ValueError E088, which
+# ``_try_extract_umls`` swallows, so long documents would silently end up
+# with no UMLS data at all. It also hurts precision: references, methods
+# boilerplate and figure captions contribute concepts that have nothing
+# to do with the paper's subject.
+_UMLS_TEXT_LIMIT = 20_000
+
+
+def _umls_input_text(abstract: str | None, body_text: str | None) -> str:
+    """Pick the text to run UMLS extraction over: abstract first."""
+    if abstract and abstract.strip():
+        return abstract
+    return (body_text or "")[:_UMLS_TEXT_LIMIT]
 
 
 def _vault_dir_for_user(settings: Any, user_id: int) -> Path:
@@ -99,28 +119,51 @@ def upload(
     profile_slug: str | None = None,
 ) -> dict:
     """Idempotent upload. Returns the VaultDoc shape for the resulting paper."""
+    import time as _time
+    t0 = _time.monotonic()
+
     file_hash = compute_file_hash(data)
 
     existing = papers_repo.get_by_user_hash(conn, user_id, file_hash)
     if existing is not None:
         if profile_slug:
             _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"])
+        if not existing["umls_concepts_json"]:
+            _oa_id = existing["openalex_id"]
+            _text = _umls_input_text(existing["abstract"], existing["body_text"])
+            def _bg():
+                from ...db import connect as _connect
+                try:
+                    c = _connect(settings.RADAR_DB_PATH)
+                    try:
+                        _try_extract_umls(c, settings, _oa_id, _text)
+                    finally:
+                        c.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_bg, daemon=True).start()
+        log.info(
+            "vault.upload.dedup_hit",
+            openalex_id=existing["openalex_id"],
+            elapsed_ms=round((_time.monotonic() - t0) * 1000, 1),
+        )
         return _row_to_vault_doc(conn, user_id, existing, settings=settings)
 
-    # Persist the bytes content-addressed; keep the original filename
-    # on papers.local_path for display.
     pdf_dir = _vault_dir_for_user(settings, user_id)
     pdf_path = pdf_dir / f"{file_hash}.pdf"
     pdf_path.write_bytes(data)
 
+    t1 = _time.monotonic()
     record = ingest_pdf(pdf_path)
+    log.info("vault.upload.ingest_pdf", elapsed_ms=round((_time.monotonic() - t1) * 1000, 1))
 
-    # Best-effort OpenAlex enrichment. On any failure we keep going with a
-    # synthetic openalex_id so the upload still lands as a valid paper row.
+    t2 = _time.monotonic()
     mailto = settings.RADAR_DEFAULT_MAILTO
     openalex_id, paper_dict = _enrich_via_openalex(
         record, mailto=mailto, filename=filename, file_hash=file_hash,
     )
+    log.info("vault.upload.openalex", elapsed_ms=round((_time.monotonic() - t2) * 1000, 1))
+
     paper_dict.update({
         "file_hash": file_hash,
         "uploaded_by_user_id": user_id,
@@ -130,6 +173,7 @@ def upload(
     })
     papers_repo.upsert(conn, paper_dict)
 
+    t3 = _time.monotonic()
     embedding_model = settings.RADAR_DEFAULT_EMBEDDING_MODEL
     paper = Paper(
         doi=paper_dict.get("doi"),
@@ -143,68 +187,49 @@ def upload(
     text = build_embedding_input(paper)
     embedder = get_embedder(embedding_model)
     embeddings_repo.upsert(conn, openalex_id, embedding_model, embedder(text))
+    log.info("vault.upload.embed", model=embedding_model, elapsed_ms=round((_time.monotonic() - t3) * 1000, 1))
 
     if profile_slug:
         _attach_to_profile(conn, user_id, profile_slug, openalex_id)
 
-    # Push chunks into the user's Chroma collection so /api/chat can
-    # retrieve them. Best-effort: a missing chromadb extra (or a Chroma
-    # outage) shouldn't fail the upload — chat will surface its own 503
-    # later if Chroma stays unavailable.
-    row = papers_repo.get_by_openalex_id(conn, openalex_id)
-    profile_slugs = vault_repo.tags_for_paper(conn, user_id, openalex_id)
-    try:
-        collection = rag_indexer.index_user_collection(settings, user_id)
-        rag_indexer.index_paper(
-            collection,
-            row,
-            embedder,
-            profile_slugs=profile_slugs,
-        )
-    except ImportError:
-        collection = None
-    except Exception:
-        # Defensive: a Chroma write error shouldn't unwind the upload
-        # transaction. The paper is in SQLite; the operator can re-run
-        # an indexing pass later.
-        collection = None
-
-    # Parallel chat-retrieval index. Best-effort: ollama may be down or
-    # the embedder model not pulled — log and skip. SPECTER2 indexing
-    # above is unaffected, so the upload still succeeds.
-    chat_model = (settings.RADAR_CHAT_EMBEDDING_MODEL or "").strip()
-    if chat_model:
+    def _bg_umls():
+        from ...db import connect as _connect
         try:
-            chat_embedder = get_embedder(chat_model)
-            chat_collection = rag_indexer.index_user_chat_collection(
-                settings, user_id
-            )
-            # Smaller windows: mxbai-embed-large / nomic-embed-text /
-            # bge-large all cap at 512 tokens. PDF-extracted text often
-            # tokenizes to 1.5–3 tokens per word (URLs, formulas, fused
-            # words), so a 500-word window can blow past the limit and
-            # ollama returns 500. ~300 words keeps us safely under 512
-            # BPE tokens for typical English text.
-            rag_indexer.index_paper(
-                chat_collection,
-                row,
-                chat_embedder,
-                profile_slugs=profile_slugs,
-                target_tokens=300,
-                overlap=40,
-            )
+            c = _connect(settings.RADAR_DB_PATH)
+            try:
+                _try_extract_umls(
+                    c, settings, openalex_id,
+                    _umls_input_text(
+                        paper_dict.get("abstract"), record.body_text
+                    ),
+                )
+            finally:
+                c.close()
         except Exception as exc:
-            log.warning(
-                "vault.upload.chat_index_skipped",
-                openalex_id=openalex_id,
-                chat_embedder=chat_model,
-                reason=type(exc).__name__,
-                detail=str(exc)[:200],
-            )
+            log.warning("vault.upload.bg_umls_failed", error=str(exc)[:200])
+    threading.Thread(target=_bg_umls, daemon=True).start()
 
-    return _row_to_vault_doc(
-        conn, user_id, row, settings=settings, collection=collection,
+    row = papers_repo.get_by_openalex_id(conn, openalex_id)
+
+    # Chroma indexing deferred — runs outside the request so the upload
+    # returns fast.  Disabled for now: the background thread holds a
+    # separate SQLite connection and the per-chunk Ollama calls take
+    # seconds each, which starves every other request of the DB write
+    # lock.  Re-enable once Chroma uses its own DB or the indexer is
+    # batched.
+    # _defer_heavy_indexing(
+    #     settings=settings,
+    #     user_id=user_id,
+    #     openalex_id=openalex_id,
+    #     body_text=record.body_text or paper_dict.get("abstract") or "",
+    # )
+
+    log.info(
+        "vault.upload.done",
+        openalex_id=openalex_id,
+        total_ms=round((_time.monotonic() - t0) * 1000, 1),
     )
+    return _row_to_vault_doc(conn, user_id, row, settings=settings)
 
 
 def list_docs(
@@ -261,6 +286,70 @@ def tag_counts(conn: sqlite3.Connection, user_id: int) -> dict[str, int]:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _defer_heavy_indexing(
+    *,
+    settings: Any,
+    user_id: int,
+    openalex_id: str,
+    body_text: str,
+) -> None:
+    """Run UMLS extraction and Chroma indexing in a background thread.
+
+    These are best-effort enrichment steps that take 10-60s each.
+    Deferring them keeps the upload response fast (~2-5s instead of
+    30-300s).
+    """
+    def _work() -> None:
+        from ...db import connect
+        try:
+            conn = connect(settings.RADAR_DB_PATH)
+            try:
+                row = papers_repo.get_by_openalex_id(conn, openalex_id)
+                if row is None:
+                    return
+                profile_slugs = vault_repo.tags_for_paper(conn, user_id, openalex_id)
+
+                try:
+                    embedder = get_embedder(settings.RADAR_DEFAULT_EMBEDDING_MODEL)
+                    collection = rag_indexer.index_user_collection(settings, user_id)
+                    rag_indexer.index_paper(
+                        collection, row, embedder, profile_slugs=profile_slugs,
+                    )
+                except Exception:
+                    pass
+
+                chat_model = (settings.RADAR_CHAT_EMBEDDING_MODEL or "").strip()
+                if chat_model:
+                    try:
+                        chat_embedder = get_embedder(chat_model)
+                        chat_collection = rag_indexer.index_user_chat_collection(
+                            settings, user_id,
+                        )
+                        rag_indexer.index_paper(
+                            chat_collection, row, chat_embedder,
+                            profile_slugs=profile_slugs,
+                            target_tokens=300, overlap=40,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "vault.deferred.chat_index_skipped",
+                            openalex_id=openalex_id,
+                            reason=type(exc).__name__,
+                        )
+            finally:
+                conn.close()
+        except Exception as exc:
+            log.warning(
+                "vault.deferred.failed",
+                openalex_id=openalex_id,
+                reason=type(exc).__name__,
+                detail=str(exc)[:200],
+            )
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
 
 
 def _try_open_user_collection(settings: Any, user_id: int) -> Any | None:
@@ -362,3 +451,74 @@ def _authors_from_work(work: dict) -> list[str]:
         if name:
             out.append(name)
     return out
+
+
+def _try_extract_umls(
+    conn: sqlite3.Connection,
+    settings: Any,
+    openalex_id: str,
+    text: str,
+) -> None:
+    """Best-effort UMLS extraction + topic mapping for a paper.
+
+    Extracts UMLS concepts from the paper text, maps them to OpenAlex
+    topics, and stores both as JSON on the paper row. Failures are logged
+    and silently swallowed — UMLS enrichment is optional.
+    """
+    try:
+        if not settings.RADAR_UMLS_ENABLED:
+            return
+        if not text or not text.strip():
+            return
+
+        from ...umls.extractor import extract_umls_concepts
+        from ...umls.topic_mapper import map_concepts_to_topics
+
+        # cache_dir has to be passed here too, not just in the app.py
+        # warmup: _get_nlp() only honours it on the *first* load, so if
+        # the warmup was skipped or failed this call becomes the first
+        # one and would otherwise download the ~1GB UMLS KB into
+        # ~/.scispacy instead of RADAR_UMLS_CACHE_DIR.
+        concepts = extract_umls_concepts(
+            text,
+            min_confidence=settings.RADAR_UMLS_MIN_CONFIDENCE,
+            spacy_model=settings.RADAR_UMLS_SPACY_MODEL,
+            cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+            max_concepts=settings.RADAR_UMLS_MAX_CONCEPTS,
+        )
+
+        if not concepts:
+            return
+
+        concepts_json = json.dumps([c.to_dict() for c in concepts])
+
+        # Map concepts to OpenAlex topics via the topic embedding index
+        cache_dir = str(settings.RADAR_UMLS_CACHE_DIR)
+        mapped = map_concepts_to_topics(
+            concepts,
+            min_similarity=settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY,
+            embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
+            cache_dir=cache_dir,
+        )
+        mapped_json = json.dumps([m.to_dict() for m in mapped]) if mapped else None
+
+        conn.execute(
+            "UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? "
+            "WHERE openalex_id = ?",
+            (concepts_json, mapped_json, openalex_id),
+        )
+        conn.commit()
+
+        log.info(
+            "vault.umls_extracted",
+            openalex_id=openalex_id,
+            n_concepts=len(concepts),
+            n_mapped=len(mapped),
+        )
+    except Exception as exc:
+        log.warning(
+            "vault.umls_extraction_skipped",
+            openalex_id=openalex_id,
+            reason=type(exc).__name__,
+            detail=str(exc)[:200],
+        )
