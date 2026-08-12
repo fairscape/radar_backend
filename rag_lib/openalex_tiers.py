@@ -64,8 +64,32 @@ def distinct_paper_prevalence(profile: Profile) -> dict[str, float]:
     return {tid: len(papers) / n for tid, papers in topic_to_papers.items()}
 
 
+def is_enabled(entry: dict) -> bool:
+    """Whether a topic_filters entry is switched on.
+
+    Absent ``on`` means on: entries written before the flag existed, and
+    every level other than ``topics`` (only topics are user-toggleable),
+    must keep participating.
+    """
+    return bool(entry.get("on", True))
+
+
+def enabled_topic_ids(topic_filters: dict | None) -> list[str]:
+    """Full OpenAlex ids of the topics the user has left switched on.
+
+    Order follows ``topic_filters`` — the aggregator emits topics by
+    descending seed count, so callers that take a prefix get the most
+    prevalent ones first.
+    """
+    return [
+        t["id"]
+        for t in (topic_filters or {}).get("topics") or []
+        if t.get("id") and is_enabled(t)
+    ]
+
+
 def _top_ids(profile_filters: dict, level: str, n: int) -> list[str]:
-    items = profile_filters.get(level) or []
+    items = [it for it in (profile_filters.get(level) or []) if is_enabled(it)]
     return [bare_id(it["id"]) for it in items[:n] if it.get("id")]
 
 

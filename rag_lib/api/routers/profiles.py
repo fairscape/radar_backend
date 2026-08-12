@@ -32,10 +32,14 @@ from ..schemas import (
     Profile,
     ProfileDetail,
     ProfileThresholdUpdate,
+    RerankerCandidate,
+    RerankerComparisonResponse,
     RefitResponse,
     Schedule,
     ScheduleUpdate,
     Topic,
+    TopicYield,
+    TopicYieldResponse,
     WizardOption,
     WizardOptions,
 )
@@ -200,7 +204,8 @@ def draft_topics(
             id=tid,
             name=entry.get("display_name") or "",
             count=int(entry.get("count") or 0),
-            on=True,
+            on=bool(entry.get("on", True)),
+            source=entry.get("source"),
         ))
     return out
 
@@ -516,7 +521,8 @@ def recompute_topics(
             id=tid,
             name=entry.get("display_name") or "",
             count=int(entry.get("count") or 0),
-            on=True,
+            on=bool(entry.get("on", True)),
+            source=entry.get("source"),
         ))
     return out
 
@@ -774,3 +780,175 @@ def update_schedule(
         enabled=bool(row["enabled"]),
         updated_at=row["updated_at"],
     )
+
+
+def _reranker_queries_for(db: sqlite3.Connection, profile_row) -> list[str]:
+    """The queries the configured reranker would actually issue.
+
+    Must be derived from the reranker itself, not assumed. This used to
+    hard-code topic display names, which is only correct for
+    ``query_mode="topic"`` — under the ``article`` mode the real queries
+    are seed-paper content, so the panel was listing queries that were
+    never sent. Showing fabricated inputs is worse than showing none:
+    it invites tuning the topic list to fix a ranking the topic list
+    never influenced.
+    """
+    if profile_row is None:
+        return []
+    try:
+        from ...scheduler.jobs import _build_reranker, _load_profile
+
+        settings = get_settings()
+        reranker = _build_reranker(profile_row, settings)
+        loader = getattr(reranker, "_load_queries", None)
+        if loader is None:  # NoopReranker issues nothing
+            return []
+        return list(loader(_load_profile(db, profile_row)))
+    except Exception:
+        # Diagnostics must never take the endpoint down.
+        return []
+
+
+@router.get("/{key}/reranker-comparison", response_model=RerankerComparisonResponse)
+def reranker_comparison(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    limit: int = Query(default=50, ge=1, le=500),
+) -> RerankerComparisonResponse:
+    """Compare candidate rankings before vs after MedCPT reranking."""
+    from rag_lib.db.repos import candidates as candidates_repo, profiles as profiles_repo
+
+    profile_id = _resolve_profile_id(db, int(user["id"]), key)
+
+    profile_row = profiles_repo.get(db, profile_id)
+    _queries_used = _reranker_queries_for(db, profile_row)
+
+    # Load candidates that have reranker scores.
+    # Use score_raw (original selector cosine) for "before" ranking,
+    # score_blended (alpha*sel_norm + beta*rr_norm) for "after" ranking.
+    # NOTE: pc.score is overwritten with the blended value by insert_dedup,
+    # so we must use score_raw for the true selector score.
+    rows = db.execute(
+        """
+        SELECT pc.openalex_id, pc.score_raw, pc.score_blended,
+               p.title
+        FROM profile_candidates pc
+        JOIN papers p USING (openalex_id)
+        WHERE pc.profile_id = ?
+          AND pc.score_blended IS NOT NULL
+          AND pc.score_raw IS NOT NULL
+        ORDER BY pc.score_blended DESC
+        LIMIT ?
+        """,
+        (profile_id, limit),
+    ).fetchall()
+
+    if not rows:
+        return RerankerComparisonResponse(ok=True, key=key, n=0, queries_used=_queries_used)
+
+    # Build before (selector) and after (blended) rankings
+    by_selector = sorted(rows, key=lambda r: r["score_raw"], reverse=True)
+    by_blended = sorted(rows, key=lambda r: r["score_blended"], reverse=True)
+
+    selector_rank = {r["openalex_id"]: i + 1 for i, r in enumerate(by_selector)}
+    blended_rank = {r["openalex_id"]: i + 1 for i, r in enumerate(by_blended)}
+
+    candidates: list[RerankerCandidate] = []
+    deltas: list[int] = []
+    for r in rows:
+        oid = r["openalex_id"]
+        rb = selector_rank[oid]
+        ra = blended_rank[oid]
+        delta = rb - ra  # positive = promoted
+        deltas.append(delta)
+        candidates.append(RerankerCandidate(
+            openalex_id=oid,
+            title=r["title"] or "",
+            score_selector=float(r["score_raw"]),
+            score_blended=float(r["score_blended"]),
+            rank_before=rb,
+            rank_after=ra,
+        ))
+
+    avg_change = sum(abs(d) for d in deltas) / len(deltas) if deltas else 0.0
+    max_up = max(deltas, default=0)
+    max_down = abs(min(deltas, default=0))
+
+    return RerankerComparisonResponse(
+        ok=True,
+        key=key,
+        n=len(candidates),
+        candidates=candidates,
+        avg_rank_change=round(avg_change, 2),
+        max_rank_up=max_up,
+        max_rank_down=max_down,
+        queries_used=_queries_used,
+    )
+
+
+@router.get("/{key}/topic-yield", response_model=TopicYieldResponse)
+def topic_yield(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    days: int = Query(default=30, ge=1, le=365),
+) -> TopicYieldResponse:
+    """What each topic's gather quota has actually brought in.
+
+    Pairs the profile's topic list with per-topic candidate tallies so
+    the Step 3 toggles can be judged on output rather than on the topic
+    name. Topics that have never sourced a candidate are still listed
+    (all-zero) — "this topic yields nothing" is exactly the case the
+    user needs to see.
+    """
+    from datetime import timedelta
+
+    from rag_lib.db.repos import candidates as candidates_repo
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    tallies = {
+        row["topic_id"]: row
+        for row in candidates_repo.topic_yield_for_profile(
+            db, profile_id, since=since,
+        )
+    }
+
+    filters = profiles_repo.topic_filters(db, profile_id) or {}
+    out: list[TopicYield] = []
+    for entry in filters.get("topics") or []:
+        tid = entry.get("id")
+        if not tid:
+            continue
+        row = tallies.pop(tid, None)
+        out.append(TopicYield(
+            topic_id=tid,
+            display_name=entry.get("display_name") or "",
+            on=bool(entry.get("on", True)),
+            n_candidates=int(row["n_candidates"]) if row else 0,
+            n_shown=int(row["n_shown"] or 0) if row else 0,
+            n_saved=int(row["n_saved"] or 0) if row else 0,
+            n_dismissed=int(row["n_dismissed"] or 0) if row else 0,
+            last_fetched_at=row["last_fetched_at"] if row else None,
+        ))
+
+    # Topics that sourced candidates but have since been dropped from
+    # topic_filters (re-aggregation after the seed set changed). Their
+    # papers are still in the radar, so the yield stays visible.
+    for tid, row in tallies.items():
+        out.append(TopicYield(
+            topic_id=tid,
+            display_name="(no longer in profile)",
+            on=False,
+            n_candidates=int(row["n_candidates"]),
+            n_shown=int(row["n_shown"] or 0),
+            n_saved=int(row["n_saved"] or 0),
+            n_dismissed=int(row["n_dismissed"] or 0),
+            last_fetched_at=row["last_fetched_at"],
+        ))
+
+    out.sort(key=lambda t: (-t.n_candidates, t.display_name))
+    return TopicYieldResponse(ok=True, key=key, days=days, topics=out)

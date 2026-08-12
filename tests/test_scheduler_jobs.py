@@ -17,6 +17,7 @@ The runner (``build_scheduler`` + ``start``) must:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from types import SimpleNamespace
 from typing import Any
@@ -357,3 +358,159 @@ def test_runner_skips_invalid_cron(db_path, settings, profile_id):
         assert scheduler.get_job(f"gather:{profile_id}") is None
     finally:
         stop(scheduler)
+
+
+def test_gather_short_circuits_when_all_topics_disabled(
+    monkeypatch, db_path, settings, profile_id
+):
+    """Switching every topic off means "gather nothing".
+
+    The run must close cleanly (not as an error) without querying
+    OpenAlex, and leave a message the profile page can surface.
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE profiles SET topic_filters_json = ? WHERE id = ?",
+            (json.dumps({"topics": [
+                {"id": "T1", "display_name": "Topic", "count": 1, "on": False}
+            ]}), profile_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    called = []
+
+    class _ExplodingGatherer:
+        def fetch(self, *a, **kw):
+            called.append(1)
+            raise AssertionError("gatherer must not run")
+
+        def cost(self):
+            return {"wall_seconds": 0.0, "api_calls": 0}
+
+    monkeypatch.setattr(
+        scheduler_jobs, "OpenAlexGatherer", lambda **kw: _ExplodingGatherer()
+    )
+
+    run_id = scheduler_jobs.gather_for_profile(
+        user_id=1, profile_id=profile_id, settings=settings, days=7,
+    )
+
+    assert called == []
+    conn = connect(db_path)
+    try:
+        row = gather_runs_repo.get(conn, run_id)
+        assert row["error"] is None, "disabled topics is not an error"
+        assert row["finished_at"] is not None
+        assert row["n_fetched"] == 0
+        assert row["tier_used"] == "no-enabled-topics"
+        assert "switched off" in (row["last_message"] or "")
+        n = conn.execute(
+            "SELECT COUNT(*) c FROM profile_candidates WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()["c"]
+        assert n == 0, "nothing should have been persisted"
+    finally:
+        conn.close()
+
+
+def test_gather_runs_normally_when_some_topics_enabled(
+    monkeypatch, db_path, settings, profile_id
+):
+    """One topic still on -> the pipeline proceeds as usual."""
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE profiles SET topic_filters_json = ? WHERE id = ?",
+            (json.dumps({"topics": [
+                {"id": "T1", "display_name": "A", "count": 1, "on": False},
+                {"id": "T2", "display_name": "B", "count": 1, "on": True},
+            ]}), profile_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _patch_dependencies(monkeypatch, [_candidate_paper("W100")])
+    run_id = scheduler_jobs.gather_for_profile(
+        user_id=1, profile_id=profile_id, settings=settings, days=7,
+    )
+    conn = connect(db_path)
+    try:
+        row = gather_runs_repo.get(conn, run_id)
+        assert row["error"] is None
+        assert row["n_fetched"] == 1
+    finally:
+        conn.close()
+
+
+def test_gather_persists_source_topic_attribution(
+    monkeypatch, db_path, settings, profile_id
+):
+    """The gatherer's per-topic attribution has to reach the DB.
+
+    This is the wiring the UI depends on to report what each topic
+    toggle actually pulled in, and it spans three modules
+    (gatherer -> jobs -> db_store), so it needs an end-to-end assertion.
+    """
+    candidates = [_candidate_paper("W100"), _candidate_paper("W101")]
+
+    class _AttributingGatherer(_StubGatherer):
+        last_tier_used = "per-topic-quota"
+        last_source_topics = {"W100": "T-alpha", "W101": "T-beta"}
+
+    monkeypatch.setattr(
+        scheduler_jobs, "OpenAlexGatherer",
+        lambda **kw: _AttributingGatherer(candidates),
+    )
+
+    scheduler_jobs.gather_for_profile(
+        user_id=1, profile_id=profile_id, settings=settings, days=7,
+    )
+
+    conn = connect(db_path)
+    try:
+        rows = dict(conn.execute(
+            "SELECT openalex_id, sourced_by_topic_id FROM profile_candidates "
+            "WHERE profile_id=?", (profile_id,),
+        ).fetchall())
+        assert rows == {"W100": "T-alpha", "W101": "T-beta"}
+    finally:
+        conn.close()
+
+
+def test_source_topic_attribution_is_not_rewritten_on_resurface(
+    monkeypatch, db_path, settings, profile_id
+):
+    """First topic to surface a paper keeps the credit.
+
+    A later gather where a different topic's quota happens to claim it
+    first must not rewrite the history the UI reports on.
+    """
+    candidates = [_candidate_paper("W100")]
+
+    def _run(topic: str):
+        class _G(_StubGatherer):
+            last_tier_used = "per-topic-quota"
+            last_source_topics = {"W100": topic}
+        monkeypatch.setattr(
+            scheduler_jobs, "OpenAlexGatherer", lambda **kw: _G(candidates)
+        )
+        scheduler_jobs.gather_for_profile(
+            user_id=1, profile_id=profile_id, settings=settings, days=7,
+        )
+
+    _run("T-first")
+    _run("T-second")
+
+    conn = connect(db_path)
+    try:
+        got = conn.execute(
+            "SELECT sourced_by_topic_id FROM profile_candidates "
+            "WHERE profile_id=? AND openalex_id='W100'", (profile_id,),
+        ).fetchone()[0]
+        assert got == "T-first"
+    finally:
+        conn.close()

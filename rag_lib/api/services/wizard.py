@@ -203,11 +203,30 @@ def aggregate_draft_topics(
     Works on drafts AND committed profiles, so the profile detail page
     can re-run topic aggregation after the user uploads more seeds.
     Persists the full aggregated dict back to ``topic_filters_json``.
+
+    When UMLS is enabled, also merges UMLS-mapped topics (stored on
+    ``papers.umls_mapped_topics_json`` at upload time) into the filters
+    to improve coarse-filter recall.
+
+    Any on/off choices the user already made survive: re-aggregation
+    rebuilds the list from scratch, so without this the "RECOMPUTE"
+    button would silently switch every pruned topic back on.
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
+    prior_on = _prior_topic_states(conn, profile_id)
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
+
+    # Best-effort UMLS topic merge: read the per-paper mapped topics
+    # that vault.upload() stored and merge novel ones into the filters.
+    topic_filters = _try_merge_umls_topics(conn, profile_id, topic_filters)
+
+    # Carry forward prior on/off state; topics we've never seen start on.
+    for t in topic_filters.get("topics") or []:
+        if t.get("id"):
+            t["on"] = prior_on.get(t["id"], True)
+
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(topic_filters), profile_id),
@@ -586,14 +605,38 @@ def _topic_ids(topic_filters: dict | None) -> list[str]:
     return [t.get("id") for t in (topic_filters.get("topics") or []) if t.get("id")]
 
 
+def _prior_topic_states(
+    conn: sqlite3.Connection, profile_id: int
+) -> dict[str, bool]:
+    """Existing ``{topic_id: on}`` for a profile, empty if never aggregated."""
+    try:
+        existing = profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:
+        return {}
+    return {
+        t["id"]: bool(t.get("on", True))
+        for t in (existing.get("topics") or [])
+        if t.get("id")
+    }
+
+
 def _prune_topic_filters(
     full: dict, selected_ids: set[str]
 ) -> dict:
-    """Drop topic entries not in ``selected_ids``; keep other levels intact."""
+    """Mark topics outside ``selected_ids`` as off; keep other levels intact.
+
+    Deselection used to *delete* the entry, which threw away the one bit
+    we need later: a topic missing from the list could equally mean "the
+    user switched it off" or "it didn't exist last time we aggregated".
+    Re-aggregating (``aggregate_draft_topics``) therefore resurrected
+    everything the user had pruned. Flagging instead of deleting keeps
+    the distinction, and the gatherer reads the flag via
+    ``openalex_tiers.is_enabled``.
+    """
     out = dict(full or {})
     out["topics"] = [
-        t for t in (full.get("topics") or [])
-        if t.get("id") in selected_ids
+        {**t, "on": t.get("id") in selected_ids}
+        for t in (full.get("topics") or [])
     ]
     return out
 
@@ -706,3 +749,65 @@ def _days_ago(days: int) -> str:
     import datetime
     d = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
     return d.strftime("%Y-%m-%d")
+
+
+def _try_merge_umls_topics(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    topic_filters: dict,
+) -> dict:
+    """Best-effort merge of UMLS-mapped topics into topic_filters.
+
+    Reads ``umls_mapped_topics_json`` from each seed paper and calls
+    ``merge_umls_topics()`` to append novel topics. Returns the
+    original ``topic_filters`` unchanged on any failure.
+    """
+    try:
+        from ..settings import get_settings
+        settings = get_settings()
+        if not settings.RADAR_UMLS_ENABLED:
+            return topic_filters
+
+        from ...umls.topic_mapper import MappedTopic, merge_umls_topics
+
+        seed_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
+        if not seed_ids:
+            return topic_filters
+
+        umls_per_paper: list[list[MappedTopic]] = []
+        for oa_id in seed_ids:
+            row = papers_repo.get_by_openalex_id(conn, oa_id)
+            if row is None:
+                continue
+            raw = row["umls_mapped_topics_json"]
+            if not raw:
+                continue
+            entries = json.loads(raw)
+            umls_per_paper.append([
+                MappedTopic(
+                    topic_id=e["topic_id"],
+                    display_name=e["display_name"],
+                    similarity=e["similarity"],
+                    source_cui=e["source_cui"],
+                    source_name=e["source_name"],
+                )
+                for e in entries
+            ])
+
+        if not umls_per_paper:
+            return topic_filters
+
+        return merge_umls_topics(
+            topic_filters,
+            umls_per_paper,
+            max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
+            cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+        )
+    except Exception as exc:
+        log.warning(
+            "wizard.umls_merge_skipped",
+            profile_id=profile_id,
+            reason=type(exc).__name__,
+            detail=str(exc)[:200],
+        )
+        return topic_filters

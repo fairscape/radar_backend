@@ -35,7 +35,9 @@ from ..openalex_tiers import (
     DEFAULT_MUST_HAVE_PREVALENCE,
     DEFAULT_TOP_SUBFIELDS_N,
     DEFAULT_TOP_TOPICS_N,
+    bare_id,
     build_filter_string,
+    enabled_topic_ids,
     tier_specs,
 )
 from ..paper import Paper
@@ -46,6 +48,15 @@ log = structlog.get_logger("rag_lib.gatherers.openalex")
 
 
 DEFAULT_MIN_RESULTS = 50
+
+# Per-topic quota gathering. Each enabled topic gets its own OpenAlex
+# query and contributes at most this many papers, so a single prolific
+# topic can no longer fill the whole batch and starve the rest.
+DEFAULT_PER_TOPIC_QUOTA = 10
+# Topics overlap, so a topic's first N hits are often already claimed by
+# an earlier topic. Over-fetch this multiple of the quota to leave the
+# round-robin enough unclaimed material to reach the quota.
+DEFAULT_PER_TOPIC_OVERSAMPLE = 3
 
 
 class OpenAlexGatherer:
@@ -62,6 +73,8 @@ class OpenAlexGatherer:
         top_topics_n: int = DEFAULT_TOP_TOPICS_N,
         top_subfields_n: int = DEFAULT_TOP_SUBFIELDS_N,
         min_results: int = DEFAULT_MIN_RESULTS,
+        per_topic_quota: int = DEFAULT_PER_TOPIC_QUOTA,
+        per_topic_oversample: int = DEFAULT_PER_TOPIC_OVERSAMPLE,
     ):
         # mailto is required for the polite pool at fetch time. We accept
         # None at construction so the non-invoking compliance tests can
@@ -74,11 +87,17 @@ class OpenAlexGatherer:
         self.top_topics_n = top_topics_n
         self.top_subfields_n = top_subfields_n
         self.min_results = min_results
+        self.per_topic_quota = per_topic_quota
+        self.per_topic_oversample = per_topic_oversample
         self._last_cost: dict = {"wall_seconds": 0.0, "api_calls": 0}
         # Populated by fetch() so the scheduler can persist tier_used and
         # the wizard can show "filter that actually ran".
         self.last_tier_used: str | None = None
         self.last_filter_str: str | None = None
+        # openalex_id -> the topic whose quota claimed it. Persisted to
+        # profile_candidates.sourced_by_topic_id so the UI can report what
+        # each topic toggle is actually pulling in.
+        self.last_source_topics: dict[str, str] = {}
 
     # ------------------------------------------------------------------
 
@@ -89,10 +108,172 @@ class OpenAlexGatherer:
         *,
         limit: int | None = None,
     ) -> list[Paper]:
+        """Gather candidates, giving every enabled topic its own quota.
+
+        Three cases, in order:
+
+        * some topics enabled -> one query per topic, round-robin merge.
+        * topics exist but all switched off -> the user said "none of
+          these", so gather nothing. Falling through to the tier walk
+          here would quietly ignore that: tier 1 builds its filter from
+          seed-paper metadata rather than ``topic_filters``, so it would
+          keep returning papers for topics the user just disabled.
+        * no topics at all (never aggregated, e.g. a CLI profile) ->
+          legacy tier walk.
+        """
         client = self._resolve_client()
         t0 = time.time()
         calls_before = client.api_calls
 
+        self.last_source_topics = {}
+        self.last_tier_used = None
+        self.last_filter_str = None
+
+        topics = (profile.topic_filters or {}).get("topics") or []
+        topic_ids = enabled_topic_ids(profile.topic_filters)
+
+        if topic_ids:
+            papers = self._fetch_per_topic(
+                client, profile, topic_ids, since, limit=limit,
+            )
+            self._last_cost = {
+                "wall_seconds": time.time() - t0,
+                "api_calls": int(client.api_calls - calls_before),
+            }
+            return papers
+
+        if topics:
+            log.info(
+                "openalex_gatherer.all_topics_disabled",
+                profile=profile.name, n_topics=len(topics),
+            )
+            self.last_tier_used = "no-enabled-topics"
+            self._last_cost = {
+                "wall_seconds": time.time() - t0,
+                "api_calls": int(client.api_calls - calls_before),
+            }
+            return []
+
+        log.info(
+            "openalex_gatherer.no_topics",
+            profile=profile.name,
+            reason="topic_filters never aggregated; falling back to tier walk",
+        )
+        return self._fetch_tiered(
+            client, profile, since, limit=limit, t0=t0, calls_before=calls_before,
+        )
+
+    # ------------------------------------------------------------------
+
+    def _fetch_per_topic(
+        self,
+        client: OpenAlexClient,
+        profile: Profile,
+        topic_ids: list[str],
+        since: str,
+        *,
+        limit: int | None = None,
+    ) -> list[Paper]:
+        """One query per enabled topic, then a fair round-robin merge.
+
+        Papers routinely carry several OpenAlex topics, so the per-topic
+        result sets overlap heavily. Draining them in order would let
+        whichever topic runs first bank all the shared papers and leave
+        later topics with nothing — the allocation would encode list
+        order rather than relevance. Instead each topic is over-fetched,
+        then we deal papers out one topic at a time until every topic has
+        filled its quota or run dry, which makes each topic's
+        contribution independent of where it sits in the list.
+        """
+        per_topic = self.per_topic_quota
+        pools: dict[str, list[Paper]] = {}
+        filters: list[str] = []
+
+        for tid in topic_ids:
+            parts = [("topics.id", [bare_id(tid)], "or")]
+            filter_str = build_filter_string(parts, since, extras=self.extras)
+            filters.append(filter_str)
+            works = client.paginate_filter(
+                filter_str, limit=per_topic * self.per_topic_oversample,
+            )
+            pools[tid] = [
+                client.paper_from_work(w, source="openalex_gatherer")
+                for w in works
+            ]
+            log.info(
+                "openalex_gatherer.topic_fetch",
+                profile=profile.name, topic=tid, n=len(pools[tid]),
+            )
+
+        chosen: list[Paper] = []
+        seen: set[str] = set()
+        credited = {tid: 0 for tid in topic_ids}
+        cursor = {tid: 0 for tid in topic_ids}
+
+        for _ in range(per_topic):
+            progressed = False
+            for tid in topic_ids:
+                if credited[tid] >= per_topic:
+                    continue
+                pool = pools[tid]
+                while cursor[tid] < len(pool):
+                    p = pool[cursor[tid]]
+                    cursor[tid] += 1
+                    oid = p.openalex_id
+                    if not oid or oid in seen:
+                        continue
+                    seen.add(oid)
+                    chosen.append(p)
+                    self.last_source_topics[oid] = tid
+                    credited[tid] += 1
+                    progressed = True
+                    break
+            if not progressed:
+                break  # every pool exhausted
+
+            if limit is not None and len(chosen) >= limit:
+                break
+
+        if limit is not None and len(chosen) > limit:
+            # A round can overshoot ``limit`` by up to one paper per
+            # topic. Drop the excess, then re-derive the attribution from
+            # what actually survived — otherwise last_source_topics keeps
+            # entries for papers we never returned, and the per-topic
+            # tallies overstate what each topic contributed.
+            chosen = chosen[:limit]
+            kept = {p.openalex_id for p in chosen}
+            self.last_source_topics = {
+                oid: tid for oid, tid in self.last_source_topics.items()
+                if oid in kept
+            }
+            credited = {tid: 0 for tid in topic_ids}
+            for tid in self.last_source_topics.values():
+                credited[tid] += 1
+
+        self.last_tier_used = "per-topic-quota"
+        self.last_filter_str = " | ".join(filters)
+        log.info(
+            "openalex_gatherer.per_topic_result",
+            profile=profile.name,
+            n_topics=len(topic_ids),
+            per_topic=per_topic,
+            total=len(chosen),
+            per_topic_yield={t: credited[t] for t in topic_ids},
+        )
+        return chosen
+
+    # ------------------------------------------------------------------
+
+    def _fetch_tiered(
+        self,
+        client: OpenAlexClient,
+        profile: Profile,
+        since: str,
+        *,
+        limit: int | None,
+        t0: float,
+        calls_before: int,
+    ) -> list[Paper]:
         tiers = tier_specs(
             profile,
             must_have_prevalence=self.must_have_prevalence,

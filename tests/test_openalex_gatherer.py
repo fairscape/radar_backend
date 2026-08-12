@@ -78,9 +78,10 @@ def test_fetch_walks_tiers_and_stops_at_first_meeting_min_results():
                 "primary_topic": {"id": "T11", "display_name": "core"},
             }),
         ],
+        # No topics in topic_filters -> the profile was never
+        # aggregated, so fetch() falls back to the tier walk.
         topic_filters={
-            "topics": [{"id": "T11", "display_name": "core", "count": 2}],
-            "subfields": [], "fields": [], "domains": [],
+            "topics": [], "subfields": [], "fields": [], "domains": [],
         },
     )
     g = OpenAlexGatherer(
@@ -115,8 +116,9 @@ def test_fetch_falls_through_when_tier_under_min_results():
                 "primary_topic": {"id": "T11", "display_name": "core"},
             }),
         ],
+        # No topics in topic_filters -> tier-walk fallback.
         topic_filters={
-            "topics": [{"id": "T11", "display_name": "core", "count": 1}],
+            "topics": [],
             "subfields": [{"id": "SF1", "display_name": "sf", "count": 1}],
             "fields": [], "domains": [],
         },
@@ -159,8 +161,9 @@ def test_fetch_unions_and_dedupes_across_tiers():
                 "primary_topic": {"id": "T11", "display_name": "core"},
             }),
         ],
+        # No topics in topic_filters -> tier-walk fallback.
         topic_filters={
-            "topics": [{"id": "T11", "display_name": "core", "count": 1}],
+            "topics": [],
             "subfields": [{"id": "SF1", "display_name": "sf", "count": 1}],
             "fields": [], "domains": [],
         },
@@ -192,3 +195,143 @@ def test_fetch_requires_mailto_if_no_client_injected():
     g = OpenAlexGatherer()  # no mailto, no client
     with pytest.raises(ValueError, match="mailto"):
         g.fetch(_profile_with_filters(), since="2026-01-01")
+
+
+# ---------------------------------------------------------------------------
+# Per-topic quota gathering
+# ---------------------------------------------------------------------------
+
+
+def _quota_profile(*topic_specs) -> Profile:
+    """Profile whose topic_filters carry (id, on) pairs."""
+    return Profile(
+        name="p",
+        topic_filters={
+            "topics": [
+                {"id": tid, "display_name": tid, "count": 1, "on": on}
+                for tid, on in topic_specs
+            ],
+            "subfields": [], "fields": [], "domains": [],
+        },
+    )
+
+
+def test_per_topic_quota_queries_each_enabled_topic_once():
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi="10.x/1", openalex_id="WA1", title="A1")],
+        [canned_openalex_work(doi="10.x/2", openalex_id="WB1", title="B1")],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+
+    assert len(client.paginate_calls) == 2
+    assert "topics.id:T1" in client.paginate_calls[0]["filter_str"]
+    assert "topics.id:T2" in client.paginate_calls[1]["filter_str"]
+    assert g.last_tier_used == "per-topic-quota"
+    assert {p.openalex_id for p in papers} == {"WA1", "WB1"}
+
+
+def test_per_topic_quota_skips_disabled_topics():
+    """A topic the user switched off must not be queried at all."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi="10.x/1", openalex_id="WA1", title="A1")],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    g.fetch(_quota_profile(("T1", True), ("T2", False)), since="2026-01-01")
+
+    assert len(client.paginate_calls) == 1
+    assert "topics.id:T1" in client.paginate_calls[0]["filter_str"]
+
+
+def test_all_topics_disabled_gathers_nothing():
+    """Switching every topic off means "none of these", not "use the
+    seed metadata instead" — the tier walk must not run."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi="10.x/1", openalex_id="WA1", title="A1")],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(_quota_profile(("T1", False), ("T2", False)), since="2026-01-01")
+
+    assert papers == []
+    assert client.paginate_calls == []
+    assert g.last_tier_used == "no-enabled-topics"
+
+
+def test_quota_caps_each_topic_contribution():
+    """A prolific topic can't spend more than its quota."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
+         for i in range(20)],
+        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
+         for i in range(20)],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=3)
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+
+    ids = [p.openalex_id for p in papers]
+    assert len(ids) == 6
+    assert sum(1 for i in ids if i.startswith("WA")) == 3
+    assert sum(1 for i in ids if i.startswith("WB")) == 3
+
+
+def test_shared_papers_do_not_starve_later_topics():
+    """The whole point of the round-robin.
+
+    Both topics return the same first two papers. Draining T1 fully
+    first would let it bank both and leave T2 with only its unique
+    third paper. Round-robin deals them out alternately, so each topic
+    still lands its quota.
+    """
+    shared = [
+        canned_openalex_work(doi="10.s/1", openalex_id="WS1", title="S1"),
+        canned_openalex_work(doi="10.s/2", openalex_id="WS2", title="S2"),
+    ]
+    client = FakeOpenAlexClient(tier_results=[
+        shared + [canned_openalex_work(doi="10.a/9", openalex_id="WA9", title="A9")],
+        shared + [canned_openalex_work(doi="10.b/9", openalex_id="WB9", title="B9")],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=2)
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+
+    ids = [p.openalex_id for p in papers]
+    assert len(ids) == len(set(ids)), "deduplication failed"
+    # T1 takes WS1, T2 takes WS2 (WS1 already claimed), then one each more.
+    assert g.last_source_topics["WS1"] == "T1"
+    assert g.last_source_topics["WS2"] == "T2"
+    assert len([t for t in g.last_source_topics.values() if t == "T1"]) == 2
+    assert len([t for t in g.last_source_topics.values() if t == "T2"]) == 2
+
+
+def test_source_topics_recorded_for_every_returned_paper():
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi="10.x/1", openalex_id="WA1", title="A1")],
+        [canned_openalex_work(doi="10.x/2", openalex_id="WB1", title="B1")],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+
+    assert set(g.last_source_topics) == {p.openalex_id for p in papers}
+    assert g.last_source_topics["WA1"] == "T1"
+    assert g.last_source_topics["WB1"] == "T2"
+
+
+def test_limit_truncation_keeps_attribution_consistent():
+    """A round can overshoot ``limit``; the surplus must not linger in
+    last_source_topics, or the UI would credit topics for papers that
+    were never returned."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
+         for i in range(10)],
+        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
+         for i in range(10)],
+        [canned_openalex_work(doi=f"10.c/{i}", openalex_id=f"WC{i}", title=f"C{i}")
+         for i in range(10)],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    papers = g.fetch(
+        _quota_profile(("T1", True), ("T2", True), ("T3", True)),
+        since="2026-01-01", limit=5,
+    )
+
+    assert len(papers) == 5
+    assert set(g.last_source_topics) == {p.openalex_id for p in papers}

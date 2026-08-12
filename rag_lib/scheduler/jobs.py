@@ -27,6 +27,7 @@ from ..db.repos import (
 )
 from ..embedders import embed_progress
 from ..gatherers.openalex import OpenAlexGatherer
+from ..openalex_tiers import enabled_topic_ids
 from ..paper import Paper
 from ..persistence.db_store import dedup_and_insert_candidates
 from ..profile import Profile
@@ -211,6 +212,48 @@ def _is_fit_payload(cfg: dict) -> bool:
     )
 
 
+def _build_reranker(profile_row, settings):
+    """Construct a reranker from profile config or global settings.
+
+    Returns a ``NoopReranker`` when the global toggle is off, otherwise
+    checks for a per-profile ``reranker_config_json`` override before
+    falling back to the operator's default settings.
+
+    Settings are read via ``getattr`` with defaults: callers legitimately
+    pass partial config objects (tests, the CLI), and a missing key must
+    degrade to "no reranking" rather than raise — an AttributeError here
+    would surface as a failed gather run for the whole profile.
+    """
+    from ..rerankers import get_reranker, reranker_from_config
+
+    def _opt(name, default):
+        return getattr(settings, name, default)
+
+    if not _opt("RADAR_RERANKER_ENABLED", False):
+        return get_reranker("noop")()
+
+    rr_json = profile_row["reranker_config_json"] if profile_row else None
+    if rr_json:
+        try:
+            cfg = json.loads(rr_json)
+            return reranker_from_config(cfg)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+
+    cls = get_reranker(_opt("RADAR_DEFAULT_RERANKER", "medcpt"))
+    return cls(
+        model_id=_opt("RADAR_RERANKER_MODEL_ID", "ncbi/MedCPT-Cross-Encoder"),
+        alpha=_opt("RADAR_RERANKER_ALPHA", 0.4),
+        beta=_opt("RADAR_RERANKER_BETA", 0.6),
+        device=_opt("RADAR_RERANKER_DEVICE", "cpu"),
+        batch_size=_opt("RADAR_RERANKER_BATCH_SIZE", 64),
+        max_queries=_opt("RADAR_RERANKER_MAX_QUERIES", 30),
+        min_umls_confidence=_opt("RADAR_RERANKER_MIN_UMLS_CONFIDENCE", 0.7),
+        aggregation=_opt("RADAR_RERANKER_AGGREGATION", "mean"),
+        query_mode=_opt("RADAR_RERANKER_QUERY_MODE", "topic"),
+    )
+
+
 def gather_for_profile(
     user_id: int,
     profile_id: int,
@@ -260,6 +303,33 @@ def gather_for_profile(
                 message="Loading profile and seed embeddings",
             )
             profile = _load_profile(conn, profile_row)
+
+            # Every topic switched off is a deliberate "gather nothing",
+            # so stop here rather than running the rest of the pipeline
+            # over an empty candidate list. Bailing out before the
+            # selector is built also skips reconstructing the centroid
+            # and loading the reranker model for a run that can't
+            # produce anything. Not an error — the run closes cleanly
+            # with a message the profile page can show.
+            topics = (profile.topic_filters or {}).get("topics") or []
+            if topics and not enabled_topic_ids(profile.topic_filters):
+                msg = (
+                    f"All {len(topics)} topics are switched off — "
+                    f"enable at least one to gather."
+                )
+                reporter.step("done", message=msg)
+                gather_runs_repo.finish(
+                    conn, run_id,
+                    n_fetched=0, n_new=0, n_redup=0, api_calls=0,
+                    tier_used="no-enabled-topics",
+                )
+                log.info(
+                    "scheduler.gather_skipped",
+                    profile_id=profile_id, run_id=run_id,
+                    reason="no_enabled_topics", n_topics=len(topics),
+                )
+                return run_id
+
             selector = _build_selector(profile_row, profile)
             gatherer = OpenAlexGatherer(mailto=mailto)
 
@@ -275,12 +345,59 @@ def gather_for_profile(
                 ranked = selector.select(
                     candidates, profile, threshold=profile.threshold,
                 )
+            # --- Reranker stage ---
+            reranker = _build_reranker(profile_row, settings)
+            if reranker.name != "noop" and ranked:
+                log.debug(
+                    "scheduler.rerank.before",
+                    profile_id=profile_id,
+                    reranker=reranker.name,
+                    n=len(ranked),
+                    top5=[
+                        {"score": round(s, 4), "title": (p.title or "")[:60]}
+                        for s, p, _ in ranked[:5]
+                    ],
+                )
+                reporter.step(
+                    "reranking",
+                    total=len(ranked),
+                    message=f"Reranking {len(ranked)} candidates with {reranker.name}",
+                )
+                ranked = reranker.rerank(ranked, profile, conn=conn)
+                log.info(
+                    "scheduler.rerank.done",
+                    profile_id=profile_id,
+                    reranker=reranker.name,
+                    n=len(ranked),
+                    diagnostics=reranker.diagnostics(),
+                    cost=reranker.cost(),
+                    top5=[
+                        {
+                            "blended": round(s, 4),
+                            "rr_norm": bd.get("score_reranker_norm"),
+                            "title": (p.title or "")[:60],
+                        }
+                        for s, p, bd in ranked[:5]
+                    ],
+                )
+            else:
+                log.debug(
+                    "scheduler.rerank.skipped",
+                    profile_id=profile_id,
+                    reranker=reranker.name,
+                    n=len(ranked) if ranked else 0,
+                )
+
             # Carry the actual tier the gatherer landed on (e.g.
             # "must-have-AND") through to the audit row + per-candidate
             # rows. Falls back to ``tier`` (the scheduler's calling
             # context — "scheduled" / "manual") when no tier ran (empty
             # topic_filters, gatherer.last_tier_used is None).
-            tier_label = gatherer.last_tier_used or tier
+            # getattr, not attribute access: last_tier_used is an
+            # optional reporting hook, not part of the Gatherer protocol,
+            # so a custom or stub gatherer that omits it must not fail
+            # the run.
+            tier_label = getattr(gatherer, "last_tier_used", None) or tier
             reporter.step(
                 "persisting",
                 total=len(ranked),
@@ -292,6 +409,7 @@ def gather_for_profile(
                 gather_run_id=run_id,
                 ranked=ranked,
                 tier_used=tier_label,
+                source_topics=getattr(gatherer, "last_source_topics", None),
             )
             api_calls = gatherer.cost().get("api_calls", 0)
             gather_runs_repo.finish(

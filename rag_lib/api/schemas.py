@@ -102,6 +102,7 @@ class Topic(_Model):
     name: str
     count: int
     on: bool
+    source: str | None = None
 
 
 class SweepRow(_Model):
@@ -453,3 +454,54 @@ class UserUpdateRequest(_Model):
     """Body of ``PATCH /api/users/me``."""
 
     mailto: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase B+ — reranker comparison
+# ---------------------------------------------------------------------------
+
+
+class TopicYield(_Model):
+    """What one topic's gather quota has actually produced."""
+
+    topic_id: str
+    display_name: str
+    on: bool
+    n_candidates: int = 0
+    n_shown: int = 0
+    n_saved: int = 0
+    n_dismissed: int = 0
+    last_fetched_at: str | None = None
+
+
+class TopicYieldResponse(_Model):
+    """Output of ``GET /api/profiles/{key}/topic-yield``."""
+
+    ok: bool = True
+    key: str
+    days: int
+    topics: list[TopicYield] = Field(default_factory=list)
+
+
+class RerankerCandidate(_Model):
+    """One row in the reranker comparison bump chart."""
+
+    openalex_id: str
+    title: str
+    score_selector: float
+    score_blended: float
+    rank_before: int
+    rank_after: int
+
+
+class RerankerComparisonResponse(_Model):
+    """Output of ``GET /api/profiles/{key}/reranker-comparison``."""
+
+    ok: bool = True
+    key: str
+    n: int
+    candidates: list[RerankerCandidate] = Field(default_factory=list)
+    avg_rank_change: float = 0.0
+    max_rank_up: int = 0
+    max_rank_down: int = 0
+    queries_used: list[str] = Field(default_factory=list)
