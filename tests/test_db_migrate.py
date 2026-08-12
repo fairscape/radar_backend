@@ -36,6 +36,9 @@ EXPECTED_VERSIONS = [
     "0009_oa",
     "0010_gather_run_progress",
     "0011_gather_run_result",
+    "0012_umls",
+    "0013_reranker",
+    "0014_candidate_source_topic",
 ]
 
 

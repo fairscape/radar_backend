@@ -22,30 +22,71 @@ def insert_dedup(
     score_raw: float | None = None,
     score_max_seed: float | None = None,
     score_pct: float | None = None,
+    score_reranker_raw: float | None = None,
+    score_reranker_norm: float | None = None,
+    score_blended: float | None = None,
+    sourced_by_topic_id: str | None = None,
 ) -> int:
     """Insert one candidate. Returns 1 if new, 0 if already present.
 
-    Existing rows are left untouched so prior ``shown_at`` / ``dismissed_at``
-    / ``saved_at`` survive the resurface.
+    On conflict (same profile + paper), scores are refreshed but user
+    triage state (``shown_at`` / ``dismissed_at`` / ``saved_at``) is
+    preserved so prior decisions survive a re-gather.
 
     The ``score_raw`` / ``score_max_seed`` / ``score_pct`` columns
     (migration 0003) carry the selector's full breakdown when available.
+    The ``score_reranker_*`` / ``score_blended`` columns (migration 0013)
+    carry the reranker breakdown when a reranker is active.
     They default to ``NULL`` for callers that only have a single score.
+
+    NOTE: the return value cannot come from ``cursor.rowcount`` — SQLite
+    reports 1 for the ``DO UPDATE`` branch just as it does for a fresh
+    insert, so ``rowcount`` can no longer distinguish new from resurfaced
+    (``INSERT OR IGNORE`` used to return 0 on conflict). We probe the PK
+    first instead; it is an indexed lookup on ``(profile_id, openalex_id)``
+    so the extra read is cheap.
     """
-    cur = conn.execute(
+    existed = conn.execute(
+        "SELECT 1 FROM profile_candidates "
+        "WHERE profile_id = ? AND openalex_id = ?",
+        (profile_id, openalex_id),
+    ).fetchone() is not None
+
+    conn.execute(
         """
-        INSERT OR IGNORE INTO profile_candidates
+        INSERT INTO profile_candidates
           (profile_id, openalex_id, score, tier_used, gather_run_id,
-           score_raw, score_max_seed, score_pct)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           score_raw, score_max_seed, score_pct,
+           score_reranker_raw, score_reranker_norm, score_blended,
+           sourced_by_topic_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (profile_id, openalex_id) DO UPDATE SET
+          score              = excluded.score,
+          score_raw          = excluded.score_raw,
+          score_max_seed     = excluded.score_max_seed,
+          score_pct          = excluded.score_pct,
+          score_reranker_raw = excluded.score_reranker_raw,
+          score_reranker_norm= excluded.score_reranker_norm,
+          score_blended      = excluded.score_blended,
+          tier_used          = excluded.tier_used,
+          gather_run_id      = excluded.gather_run_id,
+          -- Keep the first topic that surfaced this paper; a later
+          -- gather where a different topic happened to claim it first
+          -- shouldn't rewrite the attribution history the UI reports on.
+          sourced_by_topic_id = COALESCE(
+              profile_candidates.sourced_by_topic_id,
+              excluded.sourced_by_topic_id
+          )
         """,
         (
             profile_id, openalex_id, score, tier_used, gather_run_id,
             score_raw, score_max_seed, score_pct,
+            score_reranker_raw, score_reranker_norm, score_blended,
+            sourced_by_topic_id,
         ),
     )
     conn.commit()
-    return cur.rowcount
+    return 0 if existed else 1
 
 
 def mark_shown(
@@ -142,7 +183,12 @@ def mark_dismissed(
 def unshown_for_profile(
     conn: sqlite3.Connection, profile_id: int, limit: int = 50
 ) -> list[sqlite3.Row]:
-    """Top-N un-triaged candidates for a profile, score desc."""
+    """Top-N un-triaged candidates for a profile.
+
+    Uses ``score_blended`` (reranker output) when available, falling
+    back to ``score`` (selector-only) for candidates that were gathered
+    before the reranker was enabled.
+    """
     return conn.execute(
         """
         SELECT pc.*, p.title, p.doi, p.abstract, p.year, p.venue
@@ -152,7 +198,7 @@ def unshown_for_profile(
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
-        ORDER BY pc.score DESC
+        ORDER BY COALESCE(pc.score_blended, pc.score) DESC
         LIMIT ?
         """,
         (profile_id, limit),
@@ -234,25 +280,77 @@ def top_for_profile(
     *,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
-    """Top-N candidates by score (no shown/dismissed filter).
+    """Top-N candidates for the daily radar (no shown/dismissed filter).
 
     Joins papers so the API mapper has title / doi / abstract / venue /
-    year in one row.
+    year in one row, and carries the score breakdown so callers can show
+    *why* a candidate ranks where it does.
+
+    Ordering mirrors ``unshown_for_profile``: ``score_blended`` when a
+    reranker produced one, else ``score``. Plain ``ORDER BY pc.score``
+    happens to agree today only because ``insert_dedup`` overwrites
+    ``score`` with the blended value — an implementation detail, not a
+    contract. Spelling the fallback out keeps this path correct if that
+    ever changes, and keeps the two read paths from silently diverging.
     """
     return conn.execute(
         """
         SELECT
           pc.profile_id, pc.openalex_id, pc.score, pc.tier_used,
           pc.fetched_at, pc.shown_at, pc.dismissed_at, pc.saved_at,
+          pc.score_raw, pc.score_pct, pc.score_blended,
+          pc.score_reranker_raw, pc.score_reranker_norm,
+          pc.sourced_by_topic_id,
           p.title, p.doi, p.abstract, p.year, p.venue,
           p.publication_date, p.topics_json
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
         WHERE pc.profile_id = ?
-        ORDER BY pc.score DESC
+        ORDER BY COALESCE(pc.score_blended, pc.score) DESC
         LIMIT ?
         """,
         (profile_id, limit),
+    ).fetchall()
+
+
+def topic_yield_for_profile(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    *,
+    since: str | None = None,
+) -> list[sqlite3.Row]:
+    """Per-topic tally of what each topic's gather quota brought in.
+
+    This is the evidence behind the Step 3 toggles: without it the user
+    prunes topics by name alone. ``n_saved`` / ``n_dismissed`` are the
+    signal that matters — a topic that keeps yielding papers the user
+    throws away is spending quota a better topic could use.
+
+    ``since`` filters ``fetched_at`` (ISO-8601) to scope the tally to a
+    recent window. Rows predating migration 0014 carry no attribution
+    and are excluded.
+    """
+    where = ["profile_id = ?", "sourced_by_topic_id IS NOT NULL"]
+    params: list = [profile_id]
+    if since:
+        where.append("fetched_at >= ?")
+        params.append(since)
+
+    return conn.execute(
+        f"""
+        SELECT
+          sourced_by_topic_id           AS topic_id,
+          COUNT(*)                      AS n_candidates,
+          SUM(saved_at IS NOT NULL)     AS n_saved,
+          SUM(dismissed_at IS NOT NULL) AS n_dismissed,
+          SUM(shown_at IS NOT NULL)     AS n_shown,
+          MAX(fetched_at)               AS last_fetched_at
+        FROM profile_candidates
+        WHERE {' AND '.join(where)}
+        GROUP BY sourced_by_topic_id
+        ORDER BY n_candidates DESC
+        """,
+        params,
     ).fetchall()
 
 

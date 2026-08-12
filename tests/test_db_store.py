@@ -205,19 +205,21 @@ def test_dedup_preserves_prior_triage(conn):
     n_new, n_redup = dedup_and_insert_candidates(
         conn, profile_id=pid, gather_run_id=None,
         ranked=[
-            (0.95, _paper("W10")),  # higher score on resurface, but ignored
+            (0.95, _paper("W10")),  # higher score on resurface — refreshed
             (0.85, _paper("W11")),
             (0.7, _paper("W12")),
         ],
     )
     assert (n_new, n_redup) == (1, 2)
-    # W10 still saved; score is the original 0.9, not the new 0.95.
+    # Triage survives the resurface, but the score columns are refreshed
+    # to the latest gather's values so reranker output lands on rows that
+    # predate it.
     row = conn.execute(
         "SELECT score, saved_at FROM profile_candidates WHERE profile_id=? AND openalex_id=?",
         (pid, "W10"),
     ).fetchone()
     assert row["saved_at"] is not None
-    assert row["score"] == pytest.approx(0.9)
+    assert row["score"] == pytest.approx(0.95)
 
 
 def test_dedup_skips_papers_without_openalex_id(conn):

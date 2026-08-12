@@ -172,8 +172,38 @@ def test_candidates_insert_dedup(conn):
         "SELECT score FROM profile_candidates WHERE profile_id=? AND openalex_id=?",
         (pid, "W1"),
     ).fetchone()
-    # Existing row preserved (0.9), new score (0.95) ignored.
-    assert row["score"] == pytest.approx(0.9)
+    # Resurface refreshes the score columns (migration 0013): a later
+    # gather's reranker output has to land on rows that were first seen
+    # before the reranker was enabled. The return value still reports
+    # 0 = "not new" so gather_runs.n_new / n_redup stay meaningful.
+    assert row["score"] == pytest.approx(0.95)
+
+
+def test_candidates_insert_dedup_refreshes_reranker_columns(conn):
+    """Resurfacing a candidate writes the new reranker breakdown."""
+    pid = _seed_profile_and_paper(conn)
+    candidates.insert_dedup(conn, profile_id=pid, openalex_id="W1", score=0.9)
+    row = conn.execute(
+        "SELECT score_blended FROM profile_candidates "
+        "WHERE profile_id=? AND openalex_id=?",
+        (pid, "W1"),
+    ).fetchone()
+    assert row["score_blended"] is None
+
+    # Second gather, this time with a reranker active.
+    assert candidates.insert_dedup(
+        conn, profile_id=pid, openalex_id="W1", score=0.62,
+        score_reranker_raw=1.4, score_reranker_norm=0.8, score_blended=0.62,
+    ) == 0
+    row = conn.execute(
+        "SELECT score, score_reranker_raw, score_reranker_norm, score_blended "
+        "FROM profile_candidates WHERE profile_id=? AND openalex_id=?",
+        (pid, "W1"),
+    ).fetchone()
+    assert row["score_reranker_raw"] == pytest.approx(1.4)
+    assert row["score_reranker_norm"] == pytest.approx(0.8)
+    assert row["score_blended"] == pytest.approx(0.62)
+    assert row["score"] == pytest.approx(0.62)
 
 
 def test_candidates_save_dismiss_toggles(conn):

@@ -35,6 +35,49 @@ from ..paper import Paper
 from ..profile import Profile
 
 
+class _BatchConn:
+    """Thin proxy around a sqlite3.Connection that suppresses commit().
+
+    Repo functions call ``conn.commit()`` after every single row write.
+    For bulk inserts (500+ papers) this causes 1000+ individual fsync
+    operations on NFS, stalling the event loop for minutes.  Wrapping
+    the connection in ``_BatchConn`` lets the caller do a single
+    ``conn.commit()`` on the real connection after the batch finishes.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._conn.executemany(*args, **kwargs)
+
+    def commit(self) -> None:
+        pass  # suppressed — caller commits once at the end
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+
+# How many row-writes to accumulate before a real commit. Small enough
+# that the SQLite write lock is never held for more than a fraction of a
+# second (concurrent API writes only get a 5s busy timeout), large enough
+# that we aren't paying an fsync per row on NFS.
+_COMMIT_EVERY = 100
+
+
 def resolve_user_id(conn: sqlite3.Connection, email: str) -> int:
     """Get-or-create a user by email; return its id."""
     return int(users_repo.upsert(conn, email)["id"])
@@ -156,6 +199,7 @@ def dedup_and_insert_candidates(
     gather_run_id: int | None,
     ranked: list[tuple],
     tier_used: str | None = None,
+    source_topics: dict[str, str] | None = None,
 ) -> tuple[int, int]:
     """Persist ranked gather results and dedup against prior candidates.
 
@@ -169,34 +213,83 @@ def dedup_and_insert_candidates(
       1. ``papers.upsert`` (idempotent; later sources don't blank fields).
       2. ``embeddings.upsert`` for every embedding the paper carries
          (skipped when an entry for that model already exists).
-      3. ``candidates.insert_dedup`` — INSERT OR IGNORE so prior
-         ``shown_at``/``saved_at``/``dismissed_at`` survive resurface.
+      3. ``candidates.insert_dedup`` — upsert that refreshes the score
+         columns while leaving ``shown_at``/``saved_at``/``dismissed_at``
+         untouched, so prior triage survives a resurface.
 
     Returns ``(n_new, n_redup)``.
     """
-    store_papers(conn, [_paper_from_entry(e) for e in ranked])
+    # Title-level dedup: OpenAlex occasionally assigns different IDs to
+    # the same paper (e.g. Zenodo versioned DOIs).  Keep only the
+    # highest-scored entry per normalised title within this batch.
+    seen_titles: dict[str, int] = {}   # normalised title -> index in ranked
+    deduped_indices: set[int] = set()
+    for i, entry in enumerate(ranked):
+        _, paper, _ = _unpack_entry(entry)
+        title_key = (paper.title or "").strip().lower()
+        if not title_key:
+            continue
+        if title_key in seen_titles:
+            deduped_indices.add(i)
+        else:
+            seen_titles[title_key] = i
+
+    # Chunked batch-commit. The repo functions commit after every single
+    # row, which is 1000+ fsyncs for 500 papers on NFS. Wrapping the whole
+    # batch in ONE transaction fixes that but breaks the other way: it
+    # holds the SQLite write lock for the entire gather, so concurrent API
+    # writes (uploads, triage, threshold edits) blow past the 5s busy
+    # timeout and fail with "database is locked". Committing every
+    # ``_COMMIT_EVERY`` rows bounds both the fsync count and the lock hold.
+    batch = _BatchConn(conn)
 
     n_new = 0
     n_redup = 0
-    for entry in ranked:
-        score, paper, breakdown = _unpack_entry(entry)
-        if not paper.openalex_id:
-            continue
-        added = candidates_repo.insert_dedup(
-            conn,
-            profile_id=profile_id,
-            openalex_id=paper.openalex_id,
-            score=float(score),
-            tier_used=tier_used,
-            gather_run_id=gather_run_id,
-            score_raw=_breakdown_float(breakdown, "score_raw"),
-            score_max_seed=_breakdown_float(breakdown, "score_max_seed"),
-            score_pct=_breakdown_float(breakdown, "score_pct"),
-        )
-        if added:
-            n_new += 1
-        else:
-            n_redup += 1
+    try:
+        papers = [_paper_from_entry(e) for e in ranked]
+        for start in range(0, len(papers), _COMMIT_EVERY):
+            store_papers(batch, papers[start:start + _COMMIT_EVERY])
+            conn.commit()
+
+        pending = 0
+        for i, entry in enumerate(ranked):
+            if i in deduped_indices:
+                continue
+            score, paper, breakdown = _unpack_entry(entry)
+            if not paper.openalex_id:
+                continue
+            added = candidates_repo.insert_dedup(
+                batch,
+                profile_id=profile_id,
+                openalex_id=paper.openalex_id,
+                score=float(score),
+                tier_used=tier_used,
+                gather_run_id=gather_run_id,
+                score_raw=_breakdown_float(breakdown, "score_raw"),
+                score_max_seed=_breakdown_float(breakdown, "score_max_seed"),
+                score_pct=_breakdown_float(breakdown, "score_pct"),
+                score_reranker_raw=_breakdown_float(breakdown, "score_reranker_raw"),
+                score_reranker_norm=_breakdown_float(breakdown, "score_reranker_norm"),
+                score_blended=_breakdown_float(breakdown, "score_blended"),
+                sourced_by_topic_id=(source_topics or {}).get(paper.openalex_id),
+            )
+            if added:
+                n_new += 1
+            else:
+                n_redup += 1
+            pending += 1
+            if pending >= _COMMIT_EVERY:
+                conn.commit()
+                pending = 0
+        conn.commit()
+    except Exception:
+        # Don't leave a half-open transaction on a connection the caller
+        # keeps using: jobs.py's error handler writes the audit row on
+        # this same connection, and its commit would otherwise persist a
+        # partial batch instead of discarding it.
+        conn.rollback()
+        raise
+
     return n_new, n_redup
 
 
