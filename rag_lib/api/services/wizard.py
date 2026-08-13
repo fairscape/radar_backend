@@ -751,6 +751,35 @@ def _days_ago(days: int) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
+    """Fill in UMLS data for seeds that have none yet.
+
+    Delegates to the same ``_try_extract_umls`` the upload path uses, so
+    there is one implementation of what gets extracted and how it is
+    stored — and one place where a failure is swallowed. Papers that
+    already have concepts are left alone; re-running the linker over
+    them would cost seconds each and change nothing.
+    """
+    from .vault import _try_extract_umls, _umls_input_text
+
+    pending = []
+    for oa_id in seed_ids:
+        row = papers_repo.get_by_openalex_id(conn, oa_id)
+        if row is not None and not row["umls_concepts_json"]:
+            pending.append(row)
+    if not pending:
+        return
+
+    log.info("wizard.umls_extract_on_demand", n=len(pending))
+    for row in pending:
+        _try_extract_umls(
+            conn,
+            settings,
+            row["openalex_id"],
+            _umls_input_text(row["title"], row["abstract"], row["body_text"]),
+        )
+
+
 def _try_merge_umls_topics(
     conn: sqlite3.Connection,
     profile_id: int,
@@ -761,6 +790,23 @@ def _try_merge_umls_topics(
     Reads ``umls_mapped_topics_json`` from each seed paper and calls
     ``merge_umls_topics()`` to append novel topics. Returns the
     original ``topic_filters`` unchanged on any failure.
+
+    A seed whose extraction has not landed yet is computed here rather
+    than skipped. ``upload()`` starts extraction on a daemon thread and
+    returns immediately, but the wizard reaches this point seconds
+    later — the user uploads in step 1 and clicks through to step 3 —
+    so the column was still NULL and step 3 showed only the OpenAlex
+    topics, with nothing to say that half the answer was still being
+    computed. The same gap swallowed papers whose background thread died
+    against the blanket ``except`` in ``_try_extract_umls``, and papers
+    uploaded while the feature was switched off.
+
+    Doing it inline is affordable because the cost here is not the one
+    the upload path pays: the models are loaded once per process (the
+    lifespan warms them at startup), after which extraction is a tenth
+    of a second per paper and the mapping a few seconds of embedding
+    calls. Only this profile's seeds are considered, so the work is
+    bounded by the seed count.
     """
     try:
         from ..settings import get_settings
@@ -773,6 +819,8 @@ def _try_merge_umls_topics(
         seed_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
         if not seed_ids:
             return topic_filters
+
+        _extract_missing_umls(conn, settings, seed_ids)
 
         umls_per_paper: list[list[MappedTopic]] = []
         for oa_id in seed_ids:
