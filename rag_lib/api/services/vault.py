@@ -146,22 +146,6 @@ def upload(
     if existing is not None:
         if profile_slug:
             _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"])
-        if not existing["umls_concepts_json"]:
-            _oa_id = existing["openalex_id"]
-            _text = _umls_input_text(
-                existing["title"], existing["abstract"], existing["body_text"],
-            )
-            def _bg():
-                from ...db import connect as _connect
-                try:
-                    c = _connect(settings.RADAR_DB_PATH)
-                    try:
-                        _try_extract_umls(c, settings, _oa_id, _text)
-                    finally:
-                        c.close()
-                except Exception:
-                    pass
-            threading.Thread(target=_bg, daemon=True).start()
         log.info(
             "vault.upload.dedup_hit",
             openalex_id=existing["openalex_id"],
@@ -212,24 +196,20 @@ def upload(
     if profile_slug:
         _attach_to_profile(conn, user_id, profile_slug, openalex_id)
 
-    def _bg_umls():
-        from ...db import connect as _connect
-        try:
-            c = _connect(settings.RADAR_DB_PATH)
-            try:
-                _try_extract_umls(
-                    c, settings, openalex_id,
-                    _umls_input_text(
-                        paper_dict.get("title") or record.title,
-                        paper_dict.get("abstract"),
-                        record.body_text,
-                    ),
-                )
-            finally:
-                c.close()
-        except Exception as exc:
-            log.warning("vault.upload.bg_umls_failed", error=str(exc)[:200])
-    threading.Thread(target=_bg_umls, daemon=True).start()
+    # UMLS extraction is not started here. It used to run on a daemon
+    # thread so the upload could return early, and the cost of that was
+    # paid by whatever request came next: spaCy and the ollama embedding
+    # calls hold the GIL, the event loop is where request bodies are
+    # read, and a concurrent upload therefore stalled mid-stream. One
+    # took 312 seconds and then failed as "uploaded file is empty",
+    # which is a spectacularly unhelpful way to report contention. The
+    # commented-out Chroma block below was disabled for the same reason.
+    #
+    # Nothing is lost by dropping it: _try_merge_umls_topics computes
+    # whatever a profile's seeds are missing when step 3 asks for the
+    # topics, which is the only place the result is read. That moves a
+    # few seconds onto a deliberate click and takes them off an upload
+    # that has no idea why it is slow.
 
     row = papers_repo.get_by_openalex_id(conn, openalex_id)
 
