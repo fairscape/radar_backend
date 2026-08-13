@@ -216,6 +216,20 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
 
     Uses the ``topics`` level (not subfields/fields/domains); those
     levels are filter knobs the gatherer uses, not user-facing tags.
+
+    ``on`` and ``source`` are read from the entry rather than assumed.
+    They used to be hardcoded to True and dropped respectively, so the
+    profile page reported every topic as gathering and every topic as
+    OpenAlex's — a profile with ten of fourteen switched off displayed as
+    "14 TOPICS", all unlabelled, while the gather correctly used four.
+    Absent ``on`` still means on: entries written before the flag existed
+    must keep participating, which is the same rule
+    ``openalex_tiers.is_enabled`` applies on the gather side.
+
+    The wizard's step-3 endpoint builds the same shape correctly in
+    ``routers/profiles.py``; that divergence is why the discrepancy
+    survived — the topic list looked right in the wizard and wrong only
+    on the profile page.
     """
     if not topic_filters:
         return []
@@ -230,7 +244,8 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
             id=tid,
             name=name,
             count=int(it.get("count") or 0),
-            on=True,
+            on=bool(it.get("on", True)),
+            source=it.get("source"),
         ))
     return out
 
