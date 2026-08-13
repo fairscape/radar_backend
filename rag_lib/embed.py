@@ -57,8 +57,20 @@ def build_embedding_input(
     in the order body -> substances -> keywords -> mesh, and if still
     over budget the abstract is truncated token-wise. Title is never
     truncated.
+
+    Papers with no abstract are the exception. Dropping the body first
+    is right when the abstract is there to carry the paper, but when it
+    is not, the same rule throws away the only substantial text there is
+    and embeds the paper from its title alone — roughly twenty words,
+    against two to five hundred for everything else, and silently. That
+    happens for real: OpenAlex has no abstract for some publishers'
+    records even when the PDF prints one, and the extracted body sitting
+    in ``body_text`` contains it. So when the abstract is missing, a
+    prefix of the body is fitted into the remaining budget instead.
     """
     sections = _build_sections(paper)
+    body = sections["BODY"]
+
     while _tokens(sections, token_count_fn) > max_tokens and _has_droppable(sections):
         for key in ("BODY", "SUBSTANCES", "KEYWORDS", "MESH"):
             if sections.get(key):
@@ -69,6 +81,9 @@ def build_embedding_input(
     if token_count_fn(text) > max_tokens:
         # Last-resort: truncate the abstract by whitespace tokens.
         text = _truncate_abstract(sections, max_tokens, token_count_fn)
+
+    if not sections["ABSTRACT"] and body:
+        text = _fill_with_body(sections, body, max_tokens, token_count_fn)
     return text
 
 
@@ -97,6 +112,36 @@ def _tokens(sections: dict[str, str], fn: Callable[[str], int]) -> int:
 
 def _has_droppable(sections: dict[str, str]) -> bool:
     return any(sections.get(k) for k in ("BODY", "SUBSTANCES", "KEYWORDS", "MESH"))
+
+
+def _fill_with_body(
+    sections: dict[str, str],
+    body: str,
+    max_tokens: int,
+    fn: Callable[[str], int],
+) -> str:
+    """Put back as much of the body as the budget allows.
+
+    Only reached when the paper has no abstract. The prefix is taken
+    from the front of the extracted text, which is where the PDF's own
+    abstract is — so this usually recovers the very thing OpenAlex was
+    missing, along with some front matter.
+    """
+    working = dict(sections)
+    words = body.split()
+    working["BODY"] = ""
+    best = _render(working)
+    lo, hi = 0, len(words)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        working["BODY"] = " ".join(words[:mid])
+        candidate = _render(working)
+        if fn(candidate) <= max_tokens:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def _truncate_abstract(

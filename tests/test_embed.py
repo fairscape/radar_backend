@@ -69,6 +69,53 @@ def test_empty_sections_omitted():
     assert "BODY:" not in out
 
 
+def test_body_carries_the_paper_when_there_is_no_abstract():
+    """Otherwise the paper is embedded from its title alone.
+
+    OpenAlex has no abstract for some publishers' records even when the
+    PDF prints one — one of the papers used to develop this went in at
+    twenty words against two to five hundred for its neighbours, and
+    then sat in the profile centroid with equal weight.
+    """
+    p = _paper(title="a real title", abstract="", body_text="content " * 2000)
+    out = build_embedding_input(p, max_tokens=100)
+    assert "BODY:" in out
+    assert len(out.split()) > 50           # not just the title
+    assert len(out.split()) <= 100         # still inside the budget
+
+
+def test_body_fill_respects_the_budget_exactly():
+    p = _paper(title="t", abstract="", body_text="w " * 5000)
+    for budget in (10, 50, 512):
+        out = build_embedding_input(p, max_tokens=budget)
+        assert len(out.split()) <= budget
+
+
+def test_body_is_still_dropped_first_when_an_abstract_exists():
+    """The fill-in is only for the no-abstract case; the normal drop
+    order is unchanged."""
+    p = _paper(title="t", abstract="real abstract words here", body_text="body " * 2000)
+    out = build_embedding_input(p, max_tokens=20)
+    assert "BODY:" not in out
+    assert "ABSTRACT:" in out
+
+
+def test_no_abstract_and_no_body_is_still_title_only():
+    p = _paper(title="just a title", abstract="", body_text="")
+    assert build_embedding_input(p) == "TITLE: just a title"
+
+
+def test_body_fill_keeps_the_other_sections():
+    p = _paper(
+        title="t", abstract="", mesh=["Diabetes Mellitus"], keywords=["glucose"],
+        body_text="content " * 2000,
+    )
+    out = build_embedding_input(p, max_tokens=200)
+    assert "MESH:" in out
+    assert "KEYWORDS:" in out
+    assert "BODY:" in out
+
+
 def test_abstract_truncation_last_resort():
     """With only title + abstract and a too-tight budget, abstract is
     whitespace-truncated rather than dropped."""
