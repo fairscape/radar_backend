@@ -258,7 +258,14 @@ def test_all_topics_disabled_gathers_nothing():
 
 
 def test_quota_caps_each_topic_contribution():
-    """A prolific topic can't spend more than its quota."""
+    """A prolific topic can't spend more than its quota.
+
+    ``limit`` is what the caller is asking for; both real callers (the
+    scheduler and the wizard dry-run) always pass one. It is spelled out
+    here because the per-topic share is derived from it — with 2 topics
+    and a target of 6, each topic's share is 3, so the quota binds and a
+    20-paper pool still only contributes 3.
+    """
     client = FakeOpenAlexClient(tier_results=[
         [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
          for i in range(20)],
@@ -266,7 +273,9 @@ def test_quota_caps_each_topic_contribution():
          for i in range(20)],
     ])
     g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=3)
-    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+    papers = g.fetch(
+        _quota_profile(("T1", True), ("T2", True)), since="2026-01-01", limit=6,
+    )
 
     ids = [p.openalex_id for p in papers]
     assert len(ids) == 6
@@ -335,3 +344,167 @@ def test_limit_truncation_keeps_attribution_consistent():
 
     assert len(papers) == 5
     assert set(g.last_source_topics) == {p.openalex_id for p in papers}
+
+
+def test_quota_scales_so_the_caller_can_reach_its_limit():
+    """The quota is a floor, not a ceiling.
+
+    This is the wizard dry-run's case: it asks for a large sample over 30
+    days so the threshold sweep has a distribution to fit against. A
+    fixed ``quota x n_topics`` ceiling capped it at 20 papers here no
+    matter how much OpenAlex had, and the user then calibrated a
+    threshold on that truncated sample.
+    """
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
+         for i in range(60)],
+        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
+         for i in range(60)],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    papers = g.fetch(
+        _quota_profile(("T1", True), ("T2", True)), since="2026-01-01", limit=100,
+    )
+
+    ids = [p.openalex_id for p in papers]
+    assert len(ids) == 100
+    # Shares stay equal — scaling the quota must not cost the fairness
+    # property the round-robin exists for.
+    assert sum(1 for i in ids if i.startswith("WA")) == 50
+    assert sum(1 for i in ids if i.startswith("WB")) == 50
+
+
+def test_quota_floor_holds_when_the_derived_share_is_smaller():
+    """With many topics and a small target the derived share rounds down
+    below ``per_topic_quota``; the constant then takes over so a topic
+    whose peers are dry can still fill the request on its own."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
+         for i in range(5)],
+        [],  # T2 has nothing in the window
+        [],  # T3 has nothing in the window
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    papers = g.fetch(
+        _quota_profile(("T1", True), ("T2", True), ("T3", True)),
+        since="2026-01-01", limit=3,
+    )
+
+    # Derived share is ceil(3/3) = 1; the floor of 10 is what lets T1
+    # supply all three. Without it this returns a single paper.
+    assert len(papers) == 3
+    assert all(p.openalex_id.startswith("WA") for p in papers)
+
+
+LONG_TITLE = "Basal Glucose Control in Type 1 Diabetes Using Deep Reinforcement Learning"
+
+
+def test_the_same_paper_under_two_ids_is_taken_once():
+    """OpenAlex carries the preprint, the version of record and the
+    conference copy as separate works. Deduplicating on id alone let all
+    of them through: the same paper appeared twice in the top ten on
+    every trial run."""
+    client = FakeOpenAlexClient(tier_results=[
+        [
+            canned_openalex_work(doi="10.a/1", openalex_id="W_PREPRINT",
+                                 title=LONG_TITLE),
+            canned_openalex_work(doi="10.a/2", openalex_id="W_PUBLISHED",
+                                 title=LONG_TITLE.upper()),
+        ],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(_quota_profile(("T1", True)), since="2026-01-01", limit=10)
+
+    assert len(papers) == 1
+
+
+def test_a_deduplicated_copy_frees_its_quota_slot():
+    """The point of catching it during the fetch rather than at
+    persistence: the slot goes to a different paper instead of being
+    spent on a copy."""
+    client = FakeOpenAlexClient(tier_results=[
+        [
+            canned_openalex_work(doi="10.a/1", openalex_id="W1", title=LONG_TITLE),
+            canned_openalex_work(doi="10.a/2", openalex_id="W2", title=LONG_TITLE),
+            canned_openalex_work(doi="10.a/3", openalex_id="W3",
+                                 title="A Completely Different Paper About Insulin Pumps"),
+        ],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(_quota_profile(("T1", True)), since="2026-01-01", limit=2)
+
+    assert [p.openalex_id for p in papers] == ["W1", "W3"]
+
+
+def test_short_generic_titles_are_not_treated_as_duplicates():
+    """Two unrelated papers really can both be called "Editorial", so a
+    title match only counts once the title is long enough to identify
+    one paper."""
+    client = FakeOpenAlexClient(tier_results=[
+        [
+            canned_openalex_work(doi="10.a/1", openalex_id="W1", title="Editorial"),
+            canned_openalex_work(doi="10.a/2", openalex_id="W2", title="Editorial"),
+        ],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(_quota_profile(("T1", True)), since="2026-01-01", limit=10)
+
+    assert len(papers) == 2
+
+
+def test_duplicate_titles_are_caught_across_topics_too():
+    """Overlapping topics is the normal case, so the copy usually
+    arrives from a different query than the original."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi="10.a/1", openalex_id="W1", title=LONG_TITLE)],
+        [canned_openalex_work(doi="10.b/1", openalex_id="W2", title=LONG_TITLE)],
+    ])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
+    papers = g.fetch(
+        _quota_profile(("T1", True), ("T2", True)), since="2026-01-01", limit=10,
+    )
+
+    assert len(papers) == 1
+    assert list(g.last_source_topics.values()) == ["T1"]
+
+
+def test_tier_walk_deduplicates_by_title_as_well():
+    """The legacy path had the same id-only check."""
+    client = FakeOpenAlexClient(tier_results=[
+        [
+            canned_openalex_work(doi="10.a/1", openalex_id="W1", title=LONG_TITLE),
+            canned_openalex_work(doi="10.a/2", openalex_id="W2", title=LONG_TITLE),
+        ],
+    ])
+    profile = Profile(
+        name="p",
+        papers=[
+            Paper.from_dict({
+                "doi": "10.1/a", "openalex_id": "S1", "title": "A", "abstract": "x",
+                "primary_topic": {"id": "T11", "display_name": "core"},
+            }),
+        ],
+        topic_filters={"topics": [], "subfields": [], "fields": [], "domains": []},
+    )
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, min_results=1)
+    papers = g.fetch(profile, since="2026-01-01")
+
+    assert len(papers) == 1
+
+
+def test_min_results_is_the_target_when_no_limit_is_given():
+    """``min_results`` used to be dead on this path — only the tier walk
+    consulted it, so a caller that passed no ``limit`` got the bare
+    quota regardless of how few papers that came to."""
+    client = FakeOpenAlexClient(tier_results=[
+        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
+         for i in range(30)],
+        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
+         for i in range(30)],
+    ])
+    g = OpenAlexGatherer(
+        mailto="t@example.com", client=client, per_topic_quota=10, min_results=50,
+    )
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+
+    assert len(papers) == 50

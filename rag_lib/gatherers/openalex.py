@@ -49,6 +49,56 @@ log = structlog.get_logger("rag_lib.gatherers.openalex")
 
 DEFAULT_MIN_RESULTS = 50
 
+# A normalized title shorter than this is not evidence of anything. Two
+# unrelated papers really can both be called "Editorial" or "Correction",
+# and short generic titles are exactly where a title-based match stops
+# meaning "same paper".
+_MIN_TITLE_KEY_LEN = 30
+
+
+def _title_key(title: str | None) -> str:
+    """Lowercase alphanumerics of a title, or "" if too short to trust."""
+    key = "".join(c for c in (title or "").lower() if c.isalnum())
+    return key if len(key) >= _MIN_TITLE_KEY_LEN else ""
+
+
+class _Deduper:
+    """Tracks which papers have already been taken, by id and by title.
+
+    Deduplicating on ``openalex_id`` alone is not enough: OpenAlex
+    frequently carries the preprint, the version of record and the
+    conference copy of one paper as separate works. Each then consumes a
+    slot of its topic's quota and each can surface in the ranked output —
+    the same paper appeared twice in the top ten on every trial run.
+
+    Catching it here rather than at persistence keeps the fetch counts
+    honest (the copy never enters the list, so nothing has to be
+    subtracted afterwards), frees the quota slot for a different paper,
+    and makes the wizard's dry-run agree with the gather it is previewing
+    — the dry-run does not persist, so a duplicate filtered downstream
+    would still be visible there.
+    """
+
+    __slots__ = ("_ids", "_titles")
+
+    def __init__(self) -> None:
+        self._ids: set[str] = set()
+        self._titles: set[str] = set()
+
+    def take(self, paper: Paper) -> bool:
+        """Claim ``paper``; False if an equivalent one was already taken."""
+        oid = paper.openalex_id
+        if oid and oid in self._ids:
+            return False
+        key = _title_key(paper.title)
+        if key and key in self._titles:
+            return False
+        if oid:
+            self._ids.add(oid)
+        if key:
+            self._titles.add(key)
+        return True
+
 # Per-topic quota gathering. Each enabled topic gets its own OpenAlex
 # query and contributes at most this many papers, so a single prolific
 # topic can no longer fill the whole batch and starve the rest.
@@ -184,8 +234,25 @@ class OpenAlexGatherer:
         then we deal papers out one topic at a time until every topic has
         filled its quota or run dry, which makes each topic's
         contribution independent of where it sits in the list.
+
+        The quota is a *floor*, not a ceiling. ``per_topic_quota`` says
+        what share a topic is guaranteed no matter how many topics
+        compete; it must not also decide how much the gather returns in
+        total, or the caller's ``limit`` becomes unreachable. A profile
+        with two enabled topics would cap at 20 papers however much
+        OpenAlex has, and the wizard's dry-run — which asks for
+        ``DRY_RUN_FETCH_LIMIT`` papers over 30 days precisely so the
+        threshold sweep has a distribution to work with — would calibrate
+        on ``10 x n_topics`` instead. So the share scales with what the
+        caller asked for, and the constant only takes over when that
+        share would fall below it. Equal shares, hence the fairness
+        property, are preserved either way.
         """
-        per_topic = self.per_topic_quota
+        target = limit if limit is not None else self.min_results
+        per_topic = max(
+            self.per_topic_quota,
+            -(-target // len(topic_ids)),  # ceil division
+        )
         pools: dict[str, list[Paper]] = {}
         filters: list[str] = []
 
@@ -206,7 +273,7 @@ class OpenAlexGatherer:
             )
 
         chosen: list[Paper] = []
-        seen: set[str] = set()
+        seen = _Deduper()
         credited = {tid: 0 for tid in topic_ids}
         cursor = {tid: 0 for tid in topic_ids}
 
@@ -220,9 +287,8 @@ class OpenAlexGatherer:
                     p = pool[cursor[tid]]
                     cursor[tid] += 1
                     oid = p.openalex_id
-                    if not oid or oid in seen:
+                    if not oid or not seen.take(p):
                         continue
-                    seen.add(oid)
                     chosen.append(p)
                     self.last_source_topics[oid] = tid
                     credited[tid] += 1
@@ -282,7 +348,7 @@ class OpenAlexGatherer:
         )
 
         chosen_papers: list[Paper] = []
-        seen_ids: set[str] = set()
+        seen_ids = _Deduper()
         chosen_tier: str | None = None
         chosen_filter: str | None = None
 
@@ -306,11 +372,8 @@ class OpenAlexGatherer:
             ]
             new_count = 0
             for p in papers:
-                oid = p.openalex_id
-                if oid is not None and oid in seen_ids:
+                if not seen_ids.take(p):
                     continue
-                if oid is not None:
-                    seen_ids.add(oid)
                 chosen_papers.append(p)
                 new_count += 1
             chosen_tier, chosen_filter = name, filter_str
