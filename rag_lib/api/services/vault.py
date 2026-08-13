@@ -59,11 +59,29 @@ from ...vault import compute_file_hash, ingest_pdf
 _UMLS_TEXT_LIMIT = 20_000
 
 
-def _umls_input_text(abstract: str | None, body_text: str | None) -> str:
-    """Pick the text to run UMLS extraction over: abstract first."""
+def _umls_input_text(
+    title: str | None,
+    abstract: str | None,
+    body_text: str | None,
+) -> str:
+    """Pick the text to run UMLS extraction over: title, then abstract.
+
+    The title is not decoration here. Abstracts introduce an
+    abbreviation once and use it throughout, and the SciSpacy linker can
+    only expand one when the expansion appears in the same text — so a
+    paper whose abstract says "T2DM" nine times yields no diabetes
+    concept at all. Titles spell the subject out. Prepending it recovered
+    ``C0011860 Diabetes Mellitus, Non-Insulin-Dependent`` at 0.981 on a
+    paper that had extracted nothing but "RF", "Fasting" and "Score".
+
+    That failure is invisible downstream: the concept is simply absent,
+    so no ranking or threshold further along can bring it back.
+    """
+    head = (title or "").strip()
     if abstract and abstract.strip():
-        return abstract
-    return (body_text or "")[:_UMLS_TEXT_LIMIT]
+        return f"{head}\n\n{abstract}" if head else abstract
+    body = (body_text or "")[:_UMLS_TEXT_LIMIT]
+    return f"{head}\n\n{body}" if head and body else (head or body)
 
 
 def _vault_dir_for_user(settings: Any, user_id: int) -> Path:
@@ -130,7 +148,9 @@ def upload(
             _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"])
         if not existing["umls_concepts_json"]:
             _oa_id = existing["openalex_id"]
-            _text = _umls_input_text(existing["abstract"], existing["body_text"])
+            _text = _umls_input_text(
+                existing["title"], existing["abstract"], existing["body_text"],
+            )
             def _bg():
                 from ...db import connect as _connect
                 try:
@@ -200,7 +220,9 @@ def upload(
                 _try_extract_umls(
                     c, settings, openalex_id,
                     _umls_input_text(
-                        paper_dict.get("abstract"), record.body_text
+                        paper_dict.get("title") or record.title,
+                        paper_dict.get("abstract"),
+                        record.body_text,
                     ),
                 )
             finally:
