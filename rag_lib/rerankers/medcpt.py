@@ -5,16 +5,27 @@ PubMed search logs) to rescore candidates.  Two query modes are
 supported, controlled by the ``query_mode`` parameter:
 
 * ``"topic"`` — user-selected topic display names serve as queries;
-  candidate ``title. abstract`` serves as articles.
+  candidate ``title. abstract`` serves as articles. Short phrases are
+  the shape this model was trained on, and it is the default.
+* ``"title"`` — seed paper titles serve as queries. Short like a topic
+  name, but a title names disease, measurement and method together
+  where topic names split them across separate queries that then get
+  averaged. Under evaluation, not yet the default.
 * ``"article"`` — seed paper content (built via
   ``build_embedding_input``, same as the selector's SPECTER2 input)
   serves as queries; candidate content built the same way serves as
-  articles.  This keeps information consistent between selector and
-  reranker.
+  articles.  Intended to keep information consistent between selector
+  and reranker, but it puts a ~300-word document where the model
+  expects a search string. Measured on a type-1 diabetes profile the
+  two stages came out *uncorrelated* (rank correlation -0.04, against
+  +0.62 for topic mode on the same candidates), and the top of the
+  ranking filled with off-domain papers that happen to be long and
+  technical. Kept for comparison; not recommended.
 
-Per-query logits are aggregated (mean or max), min-max normalized to
-[0, 1], then blended with the selector's cosine score to produce the
-final ranking.
+Per-query logits are aggregated (mean or max) and min-max normalized to
+[0, 1], then blended with the selector's score — which is min-max
+normalized over the same batch, so that ``alpha`` and ``beta`` weight
+two comparable quantities.
 
 The model is loaded lazily on first use and cached for the process
 lifetime (same pattern as ``rag_lib.embedders``).
@@ -38,6 +49,19 @@ from ..scoring import attach_percentile
 
 _model_cache: tuple | None = None
 _model_lock = Lock()
+
+
+def _batch_span(values: list[float]) -> tuple[float, float]:
+    """Offset and span for a batch min-max: ``(x - lo) / span`` -> [0, 1].
+
+    A batch where every value is identical has no spread to normalise;
+    returning 1.0 leaves the whole batch at 0.0 rather than dividing by
+    zero, which is the right answer — that stage has expressed no
+    preference and should not move the ranking.
+    """
+    lo, hi = min(values), max(values)
+    span = hi - lo
+    return lo, span if span > 0 else 1.0
 
 
 def _load_model(model_id: str, device: str):
@@ -118,7 +142,10 @@ class MedCPTReranker:
             self._last_cost = {"wall_seconds": time.time() - t0}
             return ranked
 
-        # Build article texts
+        # Build article texts. Only "article" mode gives the candidate
+        # the full treatment; "topic" and "title" pair a short query with
+        # the candidate's title and abstract, which is the shape MedCPT
+        # was trained on.
         articles: list[str] = []
         if self.query_mode == "article":
             for _, paper, _ in ranked:
@@ -141,18 +168,35 @@ class MedCPTReranker:
             raw, best_idx = self._aggregate(cand_logits)
             raw_scores.append((raw, best_idx))
 
-        # Min-max normalization across the batch for better spread
-        raw_vals = [r[0] for r in raw_scores]
-        rr_min = min(raw_vals)
-        rr_max = max(raw_vals)
-        rr_range = rr_max - rr_min if rr_max > rr_min else 1.0
+        # Both stages are min-max normalised over the same batch, and it
+        # matters that they are normalised the *same way*.
+        #
+        # The selector previously used a fixed (cos + 1) / 2. Because the
+        # reranker's min-max fills [0, 1] by construction while real
+        # SPECTER2 cosines within one batch sit in a band about a
+        # twentieth as wide, the two terms entered the sum with spreads
+        # differing by more than an order of magnitude — and what moves a
+        # ranking is weight times spread, not weight. Measured on a
+        # 60-candidate batch: selector spread 0.057 x alpha 0.4 = 0.023
+        # against reranker spread 1.0 x beta 0.6 = 0.600, an effective
+        # 4:96 split from a nominal 40:60, with the blend correlating
+        # 0.997 with the reranker alone and 0.014 with the selector.
+        #
+        # Normalising both the same way makes alpha and beta mean what
+        # they say, and — since the selector's spread varies from batch
+        # to batch — makes the split stable rather than a property of
+        # whatever was fetched that morning.
+        rr_lo, rr_span = _batch_span([r[0] for r in raw_scores])
+        sel_lo, sel_span = _batch_span(
+            [bd.get("score_raw", s) for s, _, bd in ranked]
+        )
 
         result: list[tuple[float, Paper, dict]] = []
         for i, (sel_score, paper, bd) in enumerate(ranked):
             raw, best_idx = raw_scores[i]
-            norm = (raw - rr_min) / rr_range
+            norm = (raw - rr_lo) / rr_span
             sel_raw = bd.get("score_raw", sel_score)
-            sel_norm = (sel_raw + 1.0) / 2.0  # cosine [-1,1] -> [0,1]
+            sel_norm = (sel_raw - sel_lo) / sel_span
             blended = self.alpha * sel_norm + self.beta * norm
 
             bd["score_pct_selector"] = bd.get("score_pct")
@@ -233,9 +277,31 @@ class MedCPTReranker:
           1. Seed paper content via ``build_embedding_input``
              (title + abstract + body, same as selector's SPECTER2 input)
           2. Seed paper titles (fallback)
+
+        When ``query_mode="title"``:
+          Seed paper titles, and nothing else.
+
+        Titles are worth having as a mode of their own rather than only
+        as the fallback. A seed titled "Basal Glucose Control in Type 1
+        Diabetes Using Deep Reinforcement Learning" states the disease,
+        the measurement and the method in one string, so a candidate is
+        scored against the whole of what the user asked for. Topic names
+        cannot express that: they arrive as separate queries — "Diabetes
+        Management and Research", "Artificial Intelligence in Healthcare"
+        — and averaging over them scores a paper that satisfies one the
+        same as a paper that satisfies both. A full abstract can express
+        it but is several times longer than anything on the query side of
+        this model's training data, and it crowds the candidate out of
+        the 512-token budget the pair shares.
+
+        Not the default: on the one profile measured so far it moved a
+        single paper, which is not evidence of much. Selectable so that
+        it can be evaluated properly.
         """
         if self.query_mode == "article":
             queries = self._seed_content_queries(profile)
+        elif self.query_mode == "title":
+            return self._title_queries(profile)
         else:
             queries = self._topic_queries(profile)
         if queries:
