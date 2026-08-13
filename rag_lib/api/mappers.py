@@ -163,8 +163,25 @@ def candidate_row_to_card(
     profile_slug: str,
     active_topic_ids: Iterable[str],
 ) -> Card:
-    """Build a ``Card`` from a ``profile_candidates JOIN papers`` row."""
-    score = float(row["score"])
+    """Build a ``Card`` from a ``profile_candidates JOIN papers`` row.
+
+    The card's figure and its colour both come from the rank percentile.
+    They used to come from ``score``, and BUCKET_HIGH / BUCKET_MEDIUM —
+    0.95 and 0.925, meaning top 5% and top 7.5% — only read that way
+    against a percentile. ``score`` is a similarity whose range depends
+    on how the stages are normalised: raw cosines cluster around
+    0.81-0.96, and a blend of two min-maxed stages measured 0.008-0.909.
+    Neither reaches 0.925, so every card came out "low" — 874 of 875
+    across three live profiles, with the top-ranked paper shown in grey.
+
+    Ordering is unaffected. The query orders by ``score_blended`` and
+    this only labels the rows it returns; the percentile is derived from
+    that same ranking, so it is monotonic in it.
+
+    Rows written before ``score_pct`` existed fall back to ``score``.
+    """
+    pct = row["score_pct"]
+    score = float(pct if pct is not None else row["score"])
     topics_payload = _decode_topics(row["topics_json"])
     abstract = row["abstract"] or ""
     pub_date = row["publication_date"] or ""

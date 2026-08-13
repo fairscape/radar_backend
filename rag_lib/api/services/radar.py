@@ -22,7 +22,7 @@ from rag_lib.db.repos import (
 )
 from rag_lib.feedback.log import selector_config_hash
 
-from ..mappers import _bucket_for, candidate_row_to_card
+from ..mappers import candidate_row_to_card
 from ..schemas import (
     Bucket,
     Card,
@@ -93,10 +93,10 @@ def daily(
     """Build the ``DailyRadarResponse`` for the user / profile / bucket.
 
     ``profile_slug=None`` or ``"all"`` returns cards across every profile
-    the user owns. Cards are bucketed via ``score`` against the
-    ``BUCKET_*`` constants and filtered server-side. Each returned
-    card's ``shown_at`` is updated so the next gather run can dedup
-    correctly.
+    the user owns. Bucketing happens once, in ``candidate_row_to_card``;
+    the filter here reads the card's own value so the two cannot drift.
+    Each returned card's ``shown_at`` is updated so the next gather run
+    can dedup correctly.
     """
     t0 = time.perf_counter()
 
@@ -129,30 +129,13 @@ def daily(
         active = _active_topic_ids(topic_filters)
         rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap)
         for crow in rows:
-            # Bucket on the percentile, the same value the card displays.
-            # BUCKET_HIGH and BUCKET_MEDIUM are 0.95 and 0.925 — top 5%
-            # and top 7.5% — which only means anything against a rank
-            # percentile. Applied to ``score`` they were being compared
-            # against a similarity whose range depends on how the stages
-            # are normalised: raw cosines sit around 0.81-0.96 and a
-            # blend of two min-maxed stages measured 0.008-0.909, so
-            # neither reaches 0.925 and every card came out "low". Across
-            # three live profiles that was 874 of 875. The number printed
-            # on the card already comes from score_pct, so the colour and
-            # the figure were on different scales.
-            #
-            # Ordering is unaffected: the query orders by score_blended
-            # and this only labels the rows it returns. It does decide
-            # what ?bucket= filters to, which is why "high" matched
-            # nothing.
-            pct = crow["score_pct"]
-            score = float(pct if pct is not None else crow["score"])
-            card_bucket = _bucket_for(score)
-            if bucket is not None and card_bucket != bucket:
-                continue
             card = candidate_row_to_card(
                 crow, profile_slug=slug, active_topic_ids=active,
             )
+            # Filter on the card's own bucket rather than recomputing it.
+            # Two copies of this rule had already drifted apart once.
+            if bucket is not None and card.bucket != bucket:
+                continue
             cards.append(card)
             if crow["saved_at"]:
                 states[card.id] = "saved"
