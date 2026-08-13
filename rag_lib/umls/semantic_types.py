@@ -22,6 +22,34 @@ _DATA_PATH = Path(__file__).parent / "data" / "semantic_types.json"
 # Lazy-loaded cache
 _DATA: dict | None = None
 
+# Semantic types that say a paper *is* research rather than what it is
+# research *about*. Every paper is a Research Activity, so the type
+# carries no signal for distinguishing one paper's subject from
+# another's — but the concepts it admits ("Clinical Research", "research
+# study") map onto OpenAlex's own generic topic names ("Various Academic
+# Research Studies", "Ethics in Clinical Research") at a *higher* cosine
+# than a specific concept matches a specific topic. Generic matches
+# generic and scores well.
+#
+# That matters because the mapped topics are a candidate list capped at
+# RADAR_UMLS_MAX_TOPIC_ADDITIONS. On a type-2 diabetes profile these
+# three types took six of the ten places, leaving one diabetes topic in
+# and pushing out the three whose subfield is literally "Endocrinology,
+# Diabetes and Metabolism". Excluding them is a recall fix, not a
+# precision one: the slots they were occupying go to concepts that
+# describe the subject.
+#
+# T070 is here for a different reason — it is where the linker puts
+# "Rain", which it extracts from biomedical abstracts and maps to
+# precipitation and atmospheric-aerosol topics.
+_UNINFORMATIVE_TUIS = frozenset({
+    "T062",  # Research Activity
+    "T041",  # Mental Process
+    "T070",  # Natural Phenomenon or Process
+})
+
+_RELEVANT: frozenset[str] | None = None
+
 
 def _load() -> dict:
     global _DATA
@@ -31,13 +59,26 @@ def _load() -> dict:
     return _DATA
 
 
+def _relevant() -> frozenset[str]:
+    """Cached relevant-TUI set.
+
+    Cached because ``is_relevant`` runs once per candidate type per
+    entity per document inside the extraction loop, and rebuilding the
+    set each time was the whole cost of the filter.
+    """
+    global _RELEVANT
+    if _RELEVANT is None:
+        _RELEVANT = frozenset(_load()["relevant_tuis"]) - _UNINFORMATIVE_TUIS
+    return _RELEVANT
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def is_relevant(tui: str) -> bool:
     """Check whether a TUI belongs to one of the relevant groups."""
-    return tui in set(_load()["relevant_tuis"])
+    return tui in _relevant()
 
 
 def get_type_name(tui: str) -> str | None:
@@ -53,8 +94,12 @@ def get_type_group(tui: str) -> str | None:
 
 
 def relevant_tuis() -> set[str]:
-    """Return the set of all TUIs belonging to relevant groups."""
-    return set(_load()["relevant_tuis"])
+    """Return the set of all TUIs belonging to relevant groups.
+
+    Excludes :data:`_UNINFORMATIVE_TUIS`; the underlying data file is
+    generated from the NLM release and is left as published.
+    """
+    return set(_relevant())
 
 
 def all_types() -> dict[str, str]:

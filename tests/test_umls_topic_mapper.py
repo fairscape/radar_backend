@@ -129,8 +129,24 @@ def test_word_overlap_misses_synonyms_without_the_index():
     assert len(_umls_ids(out)) == 2
 
 
-def test_cosine_dedup_rejects_synonyms_among_candidates(monkeypatch):
-    """With the index, the same pair collapses to one."""
+def test_candidates_are_not_deduplicated_against_each_other_by_cosine(monkeypatch):
+    """Deliberate: both survive, even at cosine 0.95.
+
+    This used to collapse to one. The cosine test is still applied
+    against topics the profile already has, but no longer between
+    candidates, because no threshold separates the two cases it has to
+    tell apart. It was calibrated on synonym pairs (0.806-0.854) versus
+    unrelated pairs (0.512-0.687); sibling topics inside one field were
+    not in that set and measure 0.719-0.815, overlapping the synonyms.
+    Keeping the test cost a type-2 diabetes profile both "Diabetes,
+    Cardiovascular Risks and Lipoproteins" (0.761 against the accepted
+    "Diabetes and associated disorders") and "Diabetes Treatment and
+    Management" (0.815) — distinct topics that retrieve distinct papers.
+
+    The candidates are a list the user prunes in the wizard, so a
+    redundant neighbour costs one toggle while a discarded one can never
+    be chosen at all.
+    """
     renal_a = "https://openalex.org/T900"
     renal_b = "https://openalex.org/T901"
     index = _FakeIndex({
@@ -146,8 +162,49 @@ def test_cosine_dedup_rejects_synonyms_among_candidates(monkeypatch):
     out = merge_umls_topics(
         _base("Base"), per_paper, max_additions=4, cache_dir="/nonexistent",
     )
-    # Higher-similarity one wins; its synonym is dropped.
-    assert _umls_ids(out) == ["Renal Diseases and Glomerulopathies"]
+    assert _umls_ids(out) == [
+        "Renal Diseases and Glomerulopathies",
+        "Renal and Vascular Pathologies",
+    ]
+
+
+def test_a_candidate_matching_an_existing_topic_is_still_dropped(monkeypatch):
+    """The other direction of the same test is unchanged — it has a
+    reason the candidate-vs-candidate one lacked: the profile already
+    carries that topic, so adding it again is pure duplication."""
+    base_id = "https://openalex.org/T800"
+    cand = "https://openalex.org/T900"
+    index = _FakeIndex({
+        base_id: [1.0, 0.0, 0.0],
+        cand: [0.95, 0.31, 0.0],
+    })
+    monkeypatch.setattr(topic_mapper, "get_topic_index", lambda _d: index)
+
+    base = {
+        "topics": [{"id": base_id, "display_name": "Renal Diseases and Glomerulopathies"}],
+        "subfields": [], "fields": [], "domains": [],
+    }
+    per_paper = [[_mt(cand, "Renal and Vascular Pathologies", 0.9)]]
+    out = merge_umls_topics(
+        base, per_paper, max_additions=4, cache_dir="/nonexistent",
+    )
+    assert _umls_ids(out) == []
+
+
+def test_identically_named_candidates_still_collapse():
+    """OpenAlex carries "Medical research and treatments" and "Medical
+    Research and Treatments" under different ids; one is enough. Checked
+    before the cut, so the collision does not consume a slot."""
+    per_paper = [[
+        _mt("https://openalex.org/T900", "Medical research and treatments", 0.9),
+        _mt("https://openalex.org/T901", "Medical Research and Treatments", 0.88),
+        _mt("https://openalex.org/T902", "Diabetes Treatment and Management", 0.7),
+    ]]
+    out = merge_umls_topics(_base("Base"), per_paper, max_additions=2)
+    assert _umls_ids(out) == [
+        "Medical research and treatments",
+        "Diabetes Treatment and Management",
+    ]
 
 
 def test_cosine_dedup_rejects_candidate_close_to_existing_topic(monkeypatch):

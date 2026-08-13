@@ -259,12 +259,28 @@ def merge_umls_topics(
         reverse=True,
     )
 
-    # Second pass: drop candidates that are near-duplicates of a topic
-    # already in the profile, or of one we've already accepted. The
-    # exact-match checks above only catch identical ids/names; this
-    # catches synonyms like "Renal Diseases and Glomerulopathies" vs
-    # "Renal and Vascular Pathologies".
+    # Second pass: drop candidates that duplicate a topic the profile
+    # already has. The exact-match checks above only catch identical
+    # ids/names; the embedding test also catches synonyms such as "Renal
+    # Diseases and Glomerulopathies" vs "Renal and Vascular Pathologies".
+    #
+    # Candidates are NOT compared to each other by embedding, only by
+    # name. The cosine threshold was calibrated against synonym pairs
+    # (0.806-0.854) and unrelated pairs (0.512-0.687), and 0.75 sits in
+    # that gap — but sibling topics within one field were not in the
+    # calibration set and measure 0.719-0.815, straddling the threshold
+    # and overlapping the synonym band. On a type-2 diabetes profile,
+    # accepting "Diabetes and associated disorders" therefore discarded
+    # "Diabetes, Cardiovascular Risks and Lipoproteins" (0.761) and
+    # "Diabetes Treatment and Management" (0.815) as duplicates of it —
+    # three distinct OpenAlex topics, two of them in the Endocrinology
+    # and Diabetes subfield, that retrieve different papers. No single
+    # threshold separates siblings from synonyms, so the test is not
+    # applied here at all: these are candidates the user prunes in the
+    # wizard, and an extra near-neighbour costs one toggle while a
+    # discarded one can never be chosen.
     accepted: list[str] = []
+    accepted_names: set[str] = set()
     for tid in ranked_ids:
         name = topic_info[tid].display_name
         if any(
@@ -272,32 +288,26 @@ def merge_umls_topics(
             for eid, ename in existing
         ):
             continue
-        if any(
-            _is_near_duplicate(
-                index, tid, name, aid, topic_info[aid].display_name
-            )
-            for aid in accepted
-        ):
+        # Identical names are still duplicates — OpenAlex carries pairs
+        # like "Medical research and treatments" / "Medical Research and
+        # Treatments" under different ids. Checked here rather than after
+        # the cut, so a collision costs a slot no longer.
+        if name.lower() in accepted_names:
             continue
         accepted.append(tid)
+        accepted_names.add(name.lower())
         if len(accepted) >= max_additions:
             break
 
-    # Build new topic entries, dedup by case-insensitive display name
-    new_entries = []
-    seen_names_lower: set[str] = set()
-    for tid in accepted:
-        name = topic_info[tid].display_name
-        name_lower = name.lower()
-        if name_lower in seen_names_lower:
-            continue
-        seen_names_lower.add(name_lower)
-        new_entries.append({
+    new_entries = [
+        {
             "id": tid,
-            "display_name": name,
+            "display_name": topic_info[tid].display_name,
             "count": topic_counter[tid],
             "source": "umls",
-        })
+        }
+        for tid in accepted
+    ]
 
     # Merge
     merged = copy.deepcopy(base_filters)

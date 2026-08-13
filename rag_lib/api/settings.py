@@ -91,7 +91,16 @@ class Settings(BaseSettings):
     RADAR_UMLS_SPACY_MODEL: str = "en_core_sci_lg"
     RADAR_UMLS_MIN_CONFIDENCE: float = 0.7
     RADAR_UMLS_MAX_CONCEPTS: int = 30
-    RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 4
+    # UMLS topics are a *candidate list* the user prunes in wizard step 3,
+    # not a curated set, so the cost of an extra wrong one is a toggle
+    # while the cost of a missing right one is that it can never be
+    # chosen. Four was too tight to serve that: on a type-2 diabetes
+    # profile the four highest-similarity matches were all generic
+    # ("Various Academic Research Studies", "Ethics in Clinical
+    # Research" — generic concepts match generic topic names, so they
+    # score above a specific one) and every diabetes topic fell outside
+    # the cut.
+    RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 10
     RADAR_UMLS_MIN_TOPIC_SIMILARITY: float = 0.40
     RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"
     RADAR_UMLS_CACHE_DIR: Path = Path("data/umls_cache")
