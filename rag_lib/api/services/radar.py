@@ -129,7 +129,24 @@ def daily(
         active = _active_topic_ids(topic_filters)
         rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap)
         for crow in rows:
-            score = float(crow["score"])
+            # Bucket on the percentile, the same value the card displays.
+            # BUCKET_HIGH and BUCKET_MEDIUM are 0.95 and 0.925 — top 5%
+            # and top 7.5% — which only means anything against a rank
+            # percentile. Applied to ``score`` they were being compared
+            # against a similarity whose range depends on how the stages
+            # are normalised: raw cosines sit around 0.81-0.96 and a
+            # blend of two min-maxed stages measured 0.008-0.909, so
+            # neither reaches 0.925 and every card came out "low". Across
+            # three live profiles that was 874 of 875. The number printed
+            # on the card already comes from score_pct, so the colour and
+            # the figure were on different scales.
+            #
+            # Ordering is unaffected: the query orders by score_blended
+            # and this only labels the rows it returns. It does decide
+            # what ?bucket= filters to, which is why "high" matched
+            # nothing.
+            pct = crow["score_pct"]
+            score = float(pct if pct is not None else crow["score"])
             card_bucket = _bucket_for(score)
             if bucket is not None and card_bucket != bucket:
                 continue
