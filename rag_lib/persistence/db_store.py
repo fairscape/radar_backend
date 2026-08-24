@@ -31,7 +31,7 @@ from ..db.repos import (
     schedules as schedules_repo,
     users as users_repo,
 )
-from ..paper import Paper
+from ..paper import Paper, title_key
 from ..profile import Profile
 
 
@@ -222,17 +222,22 @@ def dedup_and_insert_candidates(
     # Title-level dedup: OpenAlex occasionally assigns different IDs to
     # the same paper (e.g. Zenodo versioned DOIs).  Keep only the
     # highest-scored entry per normalised title within this batch.
+    #
+    # Uses the same key as the gatherer's ``_Deduper``. This used to
+    # normalise with ``strip().lower()`` alone, which differs in both
+    # directions: it kept copies that differ only in punctuation, and it
+    # collapsed unrelated papers sharing a short generic title.
     seen_titles: dict[str, int] = {}   # normalised title -> index in ranked
     deduped_indices: set[int] = set()
     for i, entry in enumerate(ranked):
         _, paper, _ = _unpack_entry(entry)
-        title_key = (paper.title or "").strip().lower()
-        if not title_key:
+        key = title_key(paper.title)
+        if not key:
             continue
-        if title_key in seen_titles:
+        if key in seen_titles:
             deduped_indices.add(i)
         else:
-            seen_titles[title_key] = i
+            seen_titles[key] = i
 
     # Chunked batch-commit. The repo functions commit after every single
     # row, which is 1000+ fsyncs for 500 papers on NFS. Wrapping the whole

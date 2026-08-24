@@ -162,3 +162,26 @@ class Paper:
     def embedding_for(self, model: str) -> list[float] | None:
         """Return the embedding for a given model, or None if not stored."""
         return self.embeddings.get(model)
+
+
+# A normalized title shorter than this is not evidence of anything. Two
+# unrelated papers really can both be called "Editorial" or "Correction",
+# and short generic titles are exactly where a title-based match stops
+# meaning "same paper".
+MIN_TITLE_KEY_LEN = 30
+
+
+def title_key(title: str | None) -> str:
+    """Dedup key for a title: lowercase alphanumerics, or "" if untrustworthy.
+
+    OpenAlex regularly carries the preprint, the version of record and the
+    conference copy of one paper as three works with three ids, so id
+    equality does not answer "same paper" and titles have to.
+
+    Punctuation is dropped because that is where the copies differ —
+    hyphenation, a trailing period, a bracketed "[Preprint]". Comparing
+    ``strip().lower()`` alone, as the persistence layer used to, let those
+    pairs through while collapsing every paper titled "Editorial" into one.
+    """
+    key = "".join(c for c in (title or "").lower() if c.isalnum())
+    return key if len(key) >= MIN_TITLE_KEY_LEN else ""

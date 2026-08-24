@@ -40,7 +40,7 @@ from ..openalex_tiers import (
     enabled_topic_ids,
     tier_specs,
 )
-from ..paper import Paper
+from ..paper import Paper, title_key
 from ..profile import Profile
 
 
@@ -48,18 +48,6 @@ log = structlog.get_logger("rag_lib.gatherers.openalex")
 
 
 DEFAULT_MIN_RESULTS = 50
-
-# A normalized title shorter than this is not evidence of anything. Two
-# unrelated papers really can both be called "Editorial" or "Correction",
-# and short generic titles are exactly where a title-based match stops
-# meaning "same paper".
-_MIN_TITLE_KEY_LEN = 30
-
-
-def _title_key(title: str | None) -> str:
-    """Lowercase alphanumerics of a title, or "" if too short to trust."""
-    key = "".join(c for c in (title or "").lower() if c.isalnum())
-    return key if len(key) >= _MIN_TITLE_KEY_LEN else ""
 
 
 class _Deduper:
@@ -90,7 +78,7 @@ class _Deduper:
         oid = paper.openalex_id
         if oid and oid in self._ids:
             return False
-        key = _title_key(paper.title)
+        key = title_key(paper.title)
         if key and key in self._titles:
             return False
         if oid:
@@ -98,6 +86,7 @@ class _Deduper:
         if key:
             self._titles.add(key)
         return True
+
 
 # Per-topic quota gathering. Each enabled topic gets its own OpenAlex
 # query and contributes at most this many papers, so a single prolific
