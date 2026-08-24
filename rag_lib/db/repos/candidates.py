@@ -233,7 +233,10 @@ def scores_for_profile(
 
 
 def mark_shown_bulk(
-    conn: sqlite3.Connection, profile_id: int, openalex_ids: list[str]
+    conn: sqlite3.Connection,
+    profile_id: int,
+    openalex_ids: list[str],
+    commit: bool = True,
 ) -> int:
     """Stamp ``shown_at = now()`` for every ``openalex_id`` in the batch.
 
@@ -241,6 +244,10 @@ def mark_shown_bulk(
     by ``GET /api/radar/daily`` so re-listing a card refreshes its
     last-shown timestamp instead of silently no-oping. Returns the
     number of rows touched.
+
+    Pass ``commit=False`` to fold several profiles' stamps into one
+    transaction; the caller then commits once. The daily radar does that
+    — sixteen separate commits meant sixteen write locks per request.
     """
     if not openalex_ids:
         return 0
@@ -253,7 +260,8 @@ def mark_shown_bulk(
         """,
         (profile_id, *openalex_ids),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount
 
 

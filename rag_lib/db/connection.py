@@ -29,8 +29,17 @@ def connect(path: Path | str) -> sqlite3.Connection:
         str(p),
         detect_types=sqlite3.PARSE_DECLTYPES,
         check_same_thread=False,
+        timeout=30.0,
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    # journal_mode persists in the file header, so setting it is a one-time
+    # job -- but `PRAGMA journal_mode = WAL` grabs an exclusive lock even
+    # when the mode is already WAL. Doing that on every connection meant a
+    # single in-flight write stalled every other request, readers included,
+    # for the full busy timeout. Read the mode first (lock-free) and only
+    # write it when the database is genuinely not in WAL yet.
+    if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+        conn.execute("PRAGMA journal_mode = WAL")
     return conn

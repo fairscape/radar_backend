@@ -21,6 +21,7 @@ from rag_lib.db.repos import (
     profiles as profiles_repo,
 )
 from rag_lib.feedback.log import selector_config_hash
+from rag_lib.openalex_tiers import enabled_topic_ids
 
 from ..mappers import candidate_row_to_card
 from ..schemas import (
@@ -41,10 +42,16 @@ def _today_label() -> str:
 
 
 def _active_topic_ids(topic_filters: dict | None) -> list[str]:
-    if not topic_filters:
-        return []
-    items = topic_filters.get("topics") or []
-    return [it["id"] for it in items if it.get("id")]
+    """Topics the card should highlight a match against.
+
+    "Active" has to mean the same thing here as it does at gather time,
+    so this defers to ``enabled_topic_ids``. It used to return every
+    topic in the blob: a card was credited with matching a topic the
+    user had switched off, and ``topicMatch`` — the fraction of the
+    card's topics inside the active set — was inflated by topics that
+    could not have contributed a single result.
+    """
+    return enabled_topic_ids(topic_filters)
 
 
 def _last_run_metrics(
@@ -128,6 +135,7 @@ def daily(
         topic_filters = profiles_repo.topic_filters(conn, pid)
         active = _active_topic_ids(topic_filters)
         rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap)
+        shown_ids: list[str] = []
         for crow in rows:
             card = candidate_row_to_card(
                 crow, profile_slug=slug, active_topic_ids=active,
@@ -137,15 +145,18 @@ def daily(
             if bucket is not None and card.bucket != bucket:
                 continue
             cards.append(card)
+            shown_ids.append(card.id)
             if crow["saved_at"]:
                 states[card.id] = "saved"
             elif crow["dismissed_at"]:
                 states[card.id] = "dismissed"
 
         # Stamp shown_at for the cards we're returning from this profile.
-        shown_ids = [c.id for c in cards if c.profile == slug]
+        # Held open deliberately: one commit for all profiles, below.
         if shown_ids:
-            candidates_repo.mark_shown_bulk(conn, pid, shown_ids)
+            candidates_repo.mark_shown_bulk(conn, pid, shown_ids, commit=False)
+
+    conn.commit()
 
     cards.sort(key=lambda c: c.score, reverse=True)
     cards = cards[:_DAILY_LIMIT]
