@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import time
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,7 @@ from ...db.repos import (
     schedules as schedules_repo,
 )
 from ...gatherers.openalex import OpenAlexGatherer
+from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
 from ...profile import Profile
 from ...selectors import get_selector
@@ -600,9 +602,13 @@ def _load_profile(
 
 
 def _topic_ids(topic_filters: dict | None) -> list[str]:
-    if not topic_filters:
-        return []
-    return [t.get("id") for t in (topic_filters.get("topics") or []) if t.get("id")]
+    """Topics the dry-run preview should highlight a match against.
+
+    The dry-run's gather goes through ``enabled_topic_ids``, so the
+    preview has to use the same set or it credits a result to a topic
+    that took no part in fetching it.
+    """
+    return enabled_topic_ids(topic_filters)
 
 
 def _prior_topic_states(
@@ -751,6 +757,13 @@ def _days_ago(days: int) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+# How long the step-3 backfill may spend running the linker. Extraction
+# is ~0.1s per paper warm and the mapping a few embedding calls, so this
+# covers tens of papers; it exists for the case where every seed is
+# pending at once.
+_UMLS_BACKFILL_BUDGET_S = 30.0
+
+
 def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
     """Fill in UMLS data for seeds that have none yet.
 
@@ -759,6 +772,13 @@ def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
     stored — and one place where a failure is swallowed. Papers that
     already have concepts are left alone; re-running the linker over
     them would cost seconds each and change nothing.
+
+    Stops starting new extractions once ``_UMLS_BACKFILL_BUDGET_S`` has
+    elapsed. A paper it does not reach keeps its NULL column and is
+    picked up the next time step 3 is opened, which is a better failure
+    than a request that never returns. The budget is checked before each
+    paper, so one pathologically slow paper can overrun it — the point is
+    to bound the count, not to interrupt work in progress.
     """
     from .vault import _try_extract_umls, _umls_input_text
 
@@ -771,13 +791,22 @@ def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
         return
 
     log.info("wizard.umls_extract_on_demand", n=len(pending))
+    deadline = time.monotonic() + _UMLS_BACKFILL_BUDGET_S
+    done = 0
     for row in pending:
+        if time.monotonic() >= deadline:
+            log.warning(
+                "wizard.umls_extract_budget_exhausted",
+                done=done, remaining=len(pending) - done,
+            )
+            break
         _try_extract_umls(
             conn,
             settings,
             row["openalex_id"],
             _umls_input_text(row["title"], row["abstract"], row["body_text"]),
         )
+        done += 1
 
 
 def _try_merge_umls_topics(
@@ -792,21 +821,21 @@ def _try_merge_umls_topics(
     original ``topic_filters`` unchanged on any failure.
 
     A seed whose extraction has not landed yet is computed here rather
-    than skipped. ``upload()`` starts extraction on a daemon thread and
-    returns immediately, but the wizard reaches this point seconds
-    later — the user uploads in step 1 and clicks through to step 3 —
-    so the column was still NULL and step 3 showed only the OpenAlex
-    topics, with nothing to say that half the answer was still being
-    computed. The same gap swallowed papers whose background thread died
-    against the blanket ``except`` in ``_try_extract_umls``, and papers
-    uploaded while the feature was switched off.
+    than skipped. This began as a race: ``upload()`` ran extraction on a
+    daemon thread and returned immediately, while the wizard reached this
+    point seconds later — the user uploads in step 1 and clicks through
+    to step 3 — so the column was still NULL and step 3 showed only the
+    OpenAlex topics. Upload is synchronous now, so the race is gone and
+    the usual case is nothing pending. What is left is the genuine
+    backfill: papers whose extraction failed into the blanket ``except``
+    in ``_try_extract_umls``, and papers uploaded while the feature was
+    switched off.
 
-    Doing it inline is affordable because the cost here is not the one
-    the upload path pays: the models are loaded once per process (the
-    lifespan warms them at startup), after which extraction is a tenth
-    of a second per paper and the mapping a few seconds of embedding
-    calls. Only this profile's seeds are considered, so the work is
-    bounded by the seed count.
+    Per paper the cost is a tenth of a second once the models are warm,
+    but nothing bounded how many papers that covered, and this runs
+    inside a request. ``_extract_missing_umls`` therefore works to a wall
+    clock rather than to the seed count; whatever it does not reach stays
+    pending for the next call.
     """
     try:
         from ..settings import get_settings
@@ -845,12 +874,35 @@ def _try_merge_umls_topics(
         if not umls_per_paper:
             return topic_filters
 
-        return merge_umls_topics(
+        # [umls-probe] 临时诊断 — 确认后整块删除。阶段 3：这是用户在
+        # step 3 真正看到的那一层。打印 base、候选数，以及合并后 UMLS
+        # 实际补进去了哪几个。
+        _base_names = [t.get("display_name") or ""
+                       for t in (topic_filters.get("topics") or [])]
+        _n_cand = len({m.topic_id for p in umls_per_paper for m in p})
+        print(f"\n[umls] 阶段3 profile_id={profile_id}", flush=True)
+        print(f"[umls]   {len(umls_per_paper)} 篇种子, 去重后 {_n_cand} 个候选 topic, "
+              f"max_additions={settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}", flush=True)
+        print(f"[umls]   OpenAlex base ({len(_base_names)}): {_base_names}", flush=True)
+
+        _merged = merge_umls_topics(
             topic_filters,
             umls_per_paper,
             max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
             cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
         )
+
+        # [umls-probe] 排序键是 (similarity, count)，相似度优先。把 count 一起
+        # 打出来，是因为这两个信号在种子少的时候会给出很不一样的顺序。
+        _added = [t for t in (_merged.get("topics") or []) if t.get("source") == "umls"]
+        print(f"[umls]   补进去 {len(_added)} 个:", flush=True)
+        for _t in _added:
+            print(f"[umls]     n={_t.get('count', 0)}  {_t.get('display_name', '')[:56]}",
+                  flush=True)
+        if _n_cand > len(_added):
+            print(f"[umls]   另外 {_n_cand - len(_added)} 个候选没进去"
+                  f"（被判为已有 topic 的近重复，或超出 max_additions）", flush=True)
+        return _merged
     except Exception as exc:
         log.warning(
             "wizard.umls_merge_skipped",

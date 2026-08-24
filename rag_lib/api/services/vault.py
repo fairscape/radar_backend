@@ -504,6 +504,25 @@ def _try_extract_umls(
         )
         mapped_json = json.dumps([m.to_dict() for m in mapped]) if mapped else None
 
+        # [umls-probe] 临时诊断 — 确认后整块删除。阶段 2：概念名 -> topic。
+        # 这里没有任何上限，min_similarity 是唯一的闸门，所以出来多少条本身
+        # 就是在说这个闸门有没有起作用。
+        print(f"[umls] 阶段2 {openalex_id}", flush=True)
+        print(f"[umls]   {len(concepts)} 个概念 -> {len(mapped)} 个 topic "
+              f"(min_similarity={settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY}, "
+              f"embedder={settings.RADAR_UMLS_EMBEDDING_MODEL})", flush=True)
+        if mapped:
+            _sims = [m.similarity for m in mapped]
+            print(f"[umls]   相似度范围 {min(_sims):.3f} - {max(_sims):.3f}"
+                  f"   -> min_similarity "
+                  f"{'一个都没滤掉' if min(_sims) > settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY else '过滤了一些'}",
+                  flush=True)
+            for _m in mapped[:15]:
+                print(f"[umls]   {_m.similarity:.4f}  {_m.display_name[:44]:46s}"
+                      f"<- {_m.source_name[:30]}", flush=True)
+            if len(mapped) > 15:
+                print(f"[umls]   ...另外 {len(mapped) - 15} 个", flush=True)
+
         conn.execute(
             "UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? "
             "WHERE openalex_id = ?",

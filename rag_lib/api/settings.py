@@ -85,8 +85,12 @@ class Settings(BaseSettings):
     # so the API rejects unauthenticated traffic with 401.
     RADAR_REQUIRE_AUTH: bool = False
 
-    # UMLS concept extraction (Phase B+). Disabled by default; enable after
-    # installing the [umls] extras and the SciSpacy model.
+    # UMLS concept extraction (Phase B+). On by default — it is part of the
+    # upload path now, not an opt-in extra; the comment here said "disabled
+    # by default" long after that stopped being true. Without the [umls]
+    # extras and the SciSpacy model, each upload logs
+    # ``vault.umls_extraction_skipped`` and stores no concepts; set this to
+    # False to skip the attempt instead of failing it once per paper.
     RADAR_UMLS_ENABLED: bool = True
     RADAR_UMLS_SPACY_MODEL: str = "en_core_sci_lg"
     RADAR_UMLS_MIN_CONFIDENCE: float = 0.7
