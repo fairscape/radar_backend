@@ -829,7 +829,14 @@ def reranker_comparison(
     # score_blended (alpha*sel_norm + beta*rr_norm) for "after" ranking.
     # NOTE: pc.score is overwritten with the blended value by insert_dedup,
     # so we must use score_raw for the true selector score.
-    rows = db.execute(
+    # Both rankings are computed over every scored candidate, then the
+    # top ``limit`` by blended score are returned. Ranking inside the
+    # sample instead would have measured the reranker against itself: the
+    # sample is chosen by blended score, so a paper lifted from selector
+    # rank 400 into the top ten reports a "before" of at most ``limit``,
+    # and every paper the reranker pushed out of the top ``limit`` is
+    # absent — the one direction ``max_rank_down`` is supposed to show.
+    all_rows = db.execute(
         """
         SELECT pc.openalex_id, pc.score_raw, pc.score_blended,
                p.title
@@ -838,30 +845,34 @@ def reranker_comparison(
         WHERE pc.profile_id = ?
           AND pc.score_blended IS NOT NULL
           AND pc.score_raw IS NOT NULL
-        ORDER BY pc.score_blended DESC
-        LIMIT ?
         """,
-        (profile_id, limit),
+        (profile_id,),
     ).fetchall()
 
-    if not rows:
+    if not all_rows:
         return RerankerComparisonResponse(ok=True, key=key, n=0, queries_used=_queries_used)
 
-    # Build before (selector) and after (blended) rankings
-    by_selector = sorted(rows, key=lambda r: r["score_raw"], reverse=True)
-    by_blended = sorted(rows, key=lambda r: r["score_blended"], reverse=True)
+    by_selector = sorted(all_rows, key=lambda r: r["score_raw"], reverse=True)
+    by_blended = sorted(all_rows, key=lambda r: r["score_blended"], reverse=True)
 
     selector_rank = {r["openalex_id"]: i + 1 for i, r in enumerate(by_selector)}
     blended_rank = {r["openalex_id"]: i + 1 for i, r in enumerate(by_blended)}
 
+    rows = by_blended[:limit]
+
+    # Summary stats span every candidate, not just the ones listed. A
+    # demotion out of the top ``limit`` is exactly what max_rank_down is
+    # for, and it is never visible in the listed rows.
+    deltas = [
+        selector_rank[r["openalex_id"]] - blended_rank[r["openalex_id"]]
+        for r in all_rows
+    ]
+
     candidates: list[RerankerCandidate] = []
-    deltas: list[int] = []
     for r in rows:
         oid = r["openalex_id"]
         rb = selector_rank[oid]
         ra = blended_rank[oid]
-        delta = rb - ra  # positive = promoted
-        deltas.append(delta)
         candidates.append(RerankerCandidate(
             openalex_id=oid,
             title=r["title"] or "",

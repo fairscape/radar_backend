@@ -163,7 +163,7 @@ def main():
         max_queries=30,
     )
 
-    queries = reranker._load_queries(profile, conn)
+    queries = reranker._load_queries(profile)
     print(f"[4] UMLS queries ({len(queries)}):")
     for i, q in enumerate(queries):
         print(f"    {i+1:2d}. {q}")

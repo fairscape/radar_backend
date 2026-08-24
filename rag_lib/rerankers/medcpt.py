@@ -47,7 +47,11 @@ from ..scoring import attach_percentile
 # Lazy model singleton
 # ---------------------------------------------------------------------------
 
-_model_cache: tuple | None = None
+# (model_id, device) -> (tokenizer, model, device). Keyed, because a
+# single slot ignoring the arguments hands the caller whatever was loaded
+# first: the sweep scripts vary device between runs in one process and
+# would have been told they were on cuda while running on the cpu model.
+_model_cache: dict[tuple[str, str], tuple] = {}
 _model_lock = Lock()
 
 
@@ -65,12 +69,14 @@ def _batch_span(values: list[float]) -> tuple[float, float]:
 
 
 def _load_model(model_id: str, device: str):
-    global _model_cache
-    if _model_cache is not None:
-        return _model_cache
+    key = (model_id, device)
+    cached = _model_cache.get(key)
+    if cached is not None:
+        return cached
     with _model_lock:
-        if _model_cache is not None:
-            return _model_cache
+        cached = _model_cache.get(key)
+        if cached is not None:
+            return cached
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
         import torch  # noqa: F811
 
@@ -79,8 +85,8 @@ def _load_model(model_id: str, device: str):
         model.eval()
         if device != "cpu":
             model = model.to(device)
-        _model_cache = (tokenizer, model, device)
-        return _model_cache
+        _model_cache[key] = (tokenizer, model, device)
+        return _model_cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +135,12 @@ class MedCPTReranker:
     ) -> list[tuple[float, Paper, dict]]:
         t0 = time.time()
 
+        # [rerank-probe] 临时诊断 — 确认后整块删除（本文件共四处：三处输入 + 一处输出）
+        if ranked:
+            _raws = [r[2].get("score_raw", r[0]) for r in ranked]
+            print(f"\n[rerank] 收到 {len(ranked)} 个候选（selector 已按 θ 过滤过）, "
+                  f"score_raw {min(_raws):.4f} - {max(_raws):.4f}", flush=True)
+
         if not ranked:
             self._last_cost = {"wall_seconds": 0.0}
             return ranked
@@ -156,6 +168,18 @@ class MedCPTReranker:
                 if paper.abstract:
                     text = f"{text}. {paper.abstract}" if text else paper.abstract
                 articles.append(text)
+
+        # [rerank-probe] 临时诊断 — 确认输入后整块删除
+        print(f"[rerank] --- query 侧: {len(queries)} 条, mode={self.query_mode} ---",
+              flush=True)
+        for _i, _q in enumerate(queries):
+            print(f"[rerank]   Q{_i}: {len(_q):6d} chars | {_q[:220]!r}", flush=True)
+        print(f"[rerank] --- article 侧: {len(articles)} 条（前 3 条）---", flush=True)
+        for _i, _a in enumerate(articles[:3]):
+            print(f"[rerank]   A{_i}: {len(_a):6d} chars | {_a[:220]!r}", flush=True)
+        _no_abs = sum(1 for _, _p, _ in ranked if not (_p.abstract or "").strip())
+        print(f"[rerank]   其中 {_no_abs}/{len(ranked)} 篇候选没有 abstract"
+              f"（这些只能靠标题打分）", flush=True)
 
         # Score all (query, article) pairs
         all_logits = self._batch_score(queries, articles)
@@ -213,6 +237,52 @@ class MedCPTReranker:
 
         result.sort(key=lambda r: r[0], reverse=True)
         attach_percentile(result)
+
+        # [rerank-probe] 临时诊断 — 确认后整块删除。输出侧：两个分量各自的
+        # 跨度、混合权重的实际效果、以及相对 selector 原序的位移。
+        _before = {id(p): i + 1 for i, (_, p, _) in enumerate(ranked)}
+        _after = sorted(result, key=lambda r: -r[0])
+        _rr = [r[0] for r in raw_scores]
+        _sn = [bd.get("score_selector_norm", 0.0) for _, _, bd in result]
+        _rn = [bd.get("score_reranker_norm", 0.0) for _, _, bd in result]
+        print("[rerank] " + "=" * 70, flush=True)
+        print(f"[rerank] logit 原始范围 {min(_rr):.3f} - {max(_rr):.3f}"
+              f"  (aggregation={self.aggregation}, 每候选 {n_q} 个 query)", flush=True)
+        print(f"[rerank] 归一化前跨度: selector {sel_span:.4f} / reranker {rr_span:.4f}"
+              f"   -> 归一化后两边都是 [0,1]", flush=True)
+        print(f"[rerank] 权重 alpha={self.alpha} (selector) beta={self.beta} (reranker)"
+              f"   -> 有效影响 = 权重 x 跨度 = "
+              f"{self.alpha:.2f} vs {self.beta:.2f}", flush=True)
+        print(f"[rerank] 归一化后实际分布: sel_norm "
+              f"{min(_sn):.3f}-{max(_sn):.3f}  rr_norm {min(_rn):.3f}-{max(_rn):.3f}",
+              flush=True)
+        _moved = 0
+        _shift = []
+        for _i, (_s, _p, _bd) in enumerate(_after, 1):
+            _b = _before.get(id(_p))
+            if _b is not None and _b != _i:
+                _moved += 1
+                _shift.append(abs(_b - _i))
+        if _shift:
+            print(f"[rerank] 名次变动 {_moved}/{len(result)}, "
+                  f"平均位移 {sum(_shift) / len(_shift):.1f}, 最大 {max(_shift)}",
+                  flush=True)
+        print(f"[rerank] 前 10 名 (rank  原名次  blended = "
+              f"{self.alpha}*sel + {self.beta}*rr):", flush=True)
+        for _i, (_s, _p, _bd) in enumerate(_after[:10], 1):
+            print(f"[rerank]   {_i:3d}  <-#{_before.get(id(_p), 0):<4d} "
+                  f"{_s:.4f} = {self.alpha}*{_bd.get('score_selector_norm', 0):.3f}"
+                  f" + {self.beta}*{_bd.get('score_reranker_norm', 0):.3f}"
+                  f"  (logit {_bd.get('score_reranker_raw', 0):+.2f}, "
+                  f"cos {_bd.get('score_raw', 0):.4f})  {(_p.title or '')[:44]}",
+                  flush=True)
+        print(f"[rerank] selector 原前 5 名现在排第几:", flush=True)
+        _now = {id(p): i + 1 for i, (_, p, _) in enumerate(_after)}
+        for _, _p, _bd in ranked[:5]:
+            print(f"[rerank]   #{_before[id(_p)]:<4d} -> #{_now.get(id(_p), 0):<4d} "
+                  f"rr_norm={_bd.get('score_reranker_norm', 0):.3f}  "
+                  f"{(_p.title or '')[:52]}", flush=True)
+        print("[rerank] " + "=" * 70, flush=True)
 
         self._last_diagnostics = {
             "status": "ok",
@@ -370,6 +440,22 @@ class MedCPTReranker:
                     return_tensors="pt",
                     max_length=512,
                 )
+                # [rerank-probe] 临时诊断 — 确认输入后整块删除。必须放在
+                # 下面那行搬到 GPU 之前，encoded 这时还是 BatchEncoding。
+                if start == 0:
+                    _q, _a = batch[0]
+                    _nq = len(tokenizer(_q)["input_ids"])
+                    _na = len(tokenizer(_a)["input_ids"])
+                    _kept = len(encoded["input_ids"][0])
+                    print("[rerank] " + "=" * 70, flush=True)
+                    print(f"[rerank] {len(queries)} queries x {len(articles)} articles "
+                          f"= {len(pairs)} pairs, batch_size={self.batch_size}", flush=True)
+                    print(f"[rerank] pair0 截断前: query {_nq} tok + article {_na} tok "
+                          f"= {_nq + _na}；配对预算 512，实际保留 {_kept}", flush=True)
+                    print(f"[rerank] pair0 模型实际看到的（[SEP] 分隔 query / article）:",
+                          flush=True)
+                    print(tokenizer.decode(encoded["input_ids"][0]), flush=True)
+                    print("[rerank] " + "=" * 70, flush=True)
                 if device != "cpu":
                     encoded = {k: v.to(device) for k, v in encoded.items()}
                 logits = model(**encoded).logits.squeeze(dim=1)
@@ -402,3 +488,246 @@ def _sigmoid(x: float) -> float:
         return 1.0 / (1.0 + math.exp(-x))
     ex = math.exp(x)
     return ex / (1.0 + ex)
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc check: rerun the ranking stack over a profile's stored candidates
+# ---------------------------------------------------------------------------
+#
+#     python -m rag_lib.rerankers.medcpt [profile-slug]
+#
+# Answers "would these candidates come out in the same order again". The
+# centroid is refit from the seeds, every candidate is rescored against it,
+# the threshold is applied, and the cross-encoder runs — the whole ranking
+# stack, not just this class.
+#
+# Read from the database: the candidate list, the papers' text, and the
+# stored SPECTER2 vectors. Vectors are an input to ranking, not a ranking
+# decision; recomputing them would be measuring the embedder instead, and
+# it costs an hour. Nothing that encodes an ordering — score_raw,
+# score_blended, score_pct, the stored centroid — is fed into the rerun.
+# Those are only ever compared against.
+#
+# Two things are expected NOT to reproduce bit-for-bit, and the tolerances
+# say so: the cross-encoder runs on the GPU, where float accumulation order
+# is not guaranteed, and the blend is a min-max over the batch, so it is
+# only meaningful when the rerun batch equals the batch that was persisted.
+# Ranks are the honest check; scores are reported to show the size of any
+# drift.
+#
+# Imports live inside the function: this package sits below the scheduler
+# and the API, and nothing about reranking should depend on either.
+
+_SCORE_TOL = 1e-4
+
+
+def _main() -> int:
+    import json
+    import sys
+    import time
+
+    import numpy as np
+
+    from ..api.settings import get_settings
+    from ..db import connect, decode_vector
+    from ..db.repos import embeddings as embeddings_repo, papers as papers_repo
+    from ..paper import Paper
+    from ..scheduler.jobs import _build_reranker, _load_profile
+    from ..selectors import get_selector
+
+    slug = sys.argv[1] if len(sys.argv) > 1 else "type-1-diabetes"
+    settings = get_settings()
+    conn = connect(settings.RADAR_DB_PATH)
+
+    prow = conn.execute(
+        "SELECT * FROM profiles WHERE slug = ?", (slug,),
+    ).fetchone()
+    if prow is None:
+        print(f"no profile {slug!r}")
+        return 1
+    profile_id = int(prow["id"])
+
+    stored_rows = conn.execute(
+        """
+        SELECT pc.openalex_id, pc.score, pc.score_raw, pc.score_pct,
+               pc.score_blended, pc.score_reranker_norm,
+               p.title, p.abstract, p.year, p.venue, p.doi,
+               p.topics_json, p.source
+          FROM profile_candidates pc
+          JOIN papers p USING (openalex_id)
+         WHERE pc.profile_id = ?
+           AND pc.score_blended IS NOT NULL
+         ORDER BY pc.score_blended DESC
+        """,
+        (profile_id,),
+    ).fetchall()
+    if not stored_rows:
+        print(f"no reranked candidates for {slug!r} — run a gather first")
+        return 1
+
+    profile = _load_profile(conn, prow)
+    model = profile.embedding_model
+
+    print(f"profile      : {slug}  ({len(profile.papers)} seeds, "
+          f"{len(stored_rows)} stored candidates)")
+    print(f"embed model  : {model}")
+    print(f"threshold    : {profile.threshold}")
+
+    # --- selector: refit the centroid rather than loading the stored one ---
+    sel_cfg = json.loads(prow["selector_config_json"] or "{}")
+    sel_type = sel_cfg.get("type") or "centroid"
+    selector = get_selector(sel_type)(embedding_model=model)
+    selector.fit(profile)
+    print(f"selector     : {sel_type} (refit from {len(profile.papers)} seeds)")
+
+    stored_centroid = (
+        decode_vector(prow["centroid"]) if prow["centroid"] else None
+    )
+    fresh_centroid = getattr(selector, "_centroid", None)
+    if stored_centroid is not None and fresh_centroid is not None:
+        a = np.asarray(fresh_centroid, dtype=float)
+        b = np.asarray(stored_centroid, dtype=float)
+        cos = float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
+        print(f"centroid     : refit vs stored cosine = {cos:.6f}"
+              f"{'  MATCH' if cos > 1 - 1e-6 else '  DIFFERS'}")
+
+    # --- rebuild the candidate Papers, carrying their stored vectors ---
+    candidates: list[Paper] = []
+    missing_vec = 0
+    for row in stored_rows:
+        topics = papers_repo.decode_topics(row)
+        paper = Paper.from_dict({
+            "openalex_id": row["openalex_id"],
+            "doi": row["doi"],
+            "title": row["title"],
+            "abstract": row["abstract"],
+            "year": row["year"],
+            "venue": row["venue"],
+            "primary_topic": topics.get("primary_topic"),
+            "topics": topics.get("topics") or [],
+            "source": row["source"] or "unknown",
+        })
+        vec = embeddings_repo.get(conn, row["openalex_id"], model)
+        if vec is None:
+            missing_vec += 1
+        else:
+            paper.embeddings[model] = vec.tolist()
+        candidates.append(paper)
+    if missing_vec:
+        print(f"  warning: {missing_vec} candidates have no stored vector "
+              f"and will be re-embedded")
+
+    # --- rerun the two stages ---
+    t0 = time.monotonic()
+    ranked = selector.select(candidates, profile, threshold=profile.threshold)
+    sel_secs = time.monotonic() - t0
+    print(f"\nselect       : {len(ranked)}/{len(candidates)} passed threshold"
+          f"   ({sel_secs:.1f}s)")
+    if len(ranked) != len(candidates):
+        print("  note: everything stored had already passed, so a drop here "
+              "means the refit centroid moved")
+    if not ranked:
+        conn.close()
+        return 1
+
+    reranker = _build_reranker(prow, settings)
+    print(f"reranker     : {reranker.name}"
+          f"  alpha={getattr(reranker, 'alpha', '?')}"
+          f"  beta={getattr(reranker, 'beta', '?')}"
+          f"  query_mode={getattr(reranker, 'query_mode', '?')}")
+    if reranker.name == "noop":
+        print("  RADAR_RERANKER_ENABLED is off — nothing to verify")
+        conn.close()
+        return 1
+
+    t0 = time.monotonic()
+    ranked = reranker.rerank(ranked, profile, conn=conn)
+    rr_secs = time.monotonic() - t0
+    print(f"rerank       : {len(ranked)} candidates   ({rr_secs:.1f}s)")
+    print(f"  diagnostics: {reranker.diagnostics()}")
+
+    # --- compare ---
+    # Two different "before"s, and conflating them makes the output
+    # meaningless. ``stored_rank`` is the blended order already in the
+    # database — the thing the rerun has to reproduce, so when it does,
+    # it equals the new rank for every row and carries no information.
+    # ``selector_rank`` is the order this run produced *before* the
+    # cross-encoder touched it, which is what shows the reranker working.
+    stored_rank = {r["openalex_id"]: i + 1 for i, r in enumerate(stored_rows)}
+    stored_by_id = {r["openalex_id"]: r for r in stored_rows}
+    selector_rank = {
+        p.openalex_id: i + 1
+        for i, (_, p, _) in enumerate(
+            sorted(ranked, key=lambda e: e[2].get("score_raw", e[0]), reverse=True)
+        )
+    }
+
+    same_rank = 0
+    raw_drift: list[float] = []
+    blend_drift: list[float] = []
+    moved: list[tuple[int, int, float, float, str]] = []
+
+    for i, (score, paper, bd) in enumerate(ranked):
+        oid = paper.openalex_id
+        srow = stored_by_id.get(oid)
+        if srow is None:
+            continue
+        rank_now, rank_was = i + 1, stored_rank[oid]
+        if rank_now == rank_was:
+            same_rank += 1
+        else:
+            moved.append((rank_was, rank_now, float(srow["score_blended"]),
+                          float(score), paper.title or ""))
+        if srow["score_raw"] is not None:
+            raw_drift.append(abs(bd.get("score_raw", score) - srow["score_raw"]))
+        blend_drift.append(abs(score - float(srow["score_blended"])))
+
+    n = len(ranked)
+    print("\n" + "=" * 78)
+    print(f"{same_rank}/{n} candidates landed on their stored rank")
+    if raw_drift:
+        print(f"selector score drift : max {max(raw_drift):.2e}  "
+              f"mean {sum(raw_drift)/len(raw_drift):.2e}"
+              f"   ({sum(d > _SCORE_TOL for d in raw_drift)} over {_SCORE_TOL:g})")
+    if blend_drift:
+        print(f"blended score drift  : max {max(blend_drift):.2e}  "
+              f"mean {sum(blend_drift)/len(blend_drift):.2e}"
+              f"   ({sum(d > _SCORE_TOL for d in blend_drift)} over {_SCORE_TOL:g})")
+
+    if moved:
+        print(f"\n{len(moved)} moved (worst 15 by distance):")
+        moved.sort(key=lambda m: abs(m[0] - m[1]), reverse=True)
+        for was, now, sb, nb, title in moved[:15]:
+            print(f"  {was:>4} -> {now:<4}  {sb:.4f} -> {nb:.4f}   {title[:44]}")
+
+    # sel# is this run's own selector order; rank is after the blend.
+    # A row where the two differ is the reranker overriding the selector.
+    print("\ntop 10 after reranking       (sel# = where the selector had it)")
+    print(f"  {'rank':>4} {'sel#':>5}  {'blended':>7}  {'rr':>6}  {'sel':>6}  title")
+    for i, (score, paper, bd) in enumerate(ranked[:10]):
+        srank = selector_rank.get(paper.openalex_id, 0)
+        move = srank - (i + 1)
+        arrow = f"{move:+d}" if move else "  ="
+        print(f"  {i+1:>4} {srank:>5}  {score:>7.4f}  "
+              f"{bd.get('score_reranker_norm', 0):>6.4f}  "
+              f"{bd.get('score_raw', 0):>6.4f}  {arrow:>4}  "
+              f"{(paper.title or '')[:38]}")
+
+    # And what the selector would have shown on its own, for contrast.
+    by_sel = sorted(ranked, key=lambda e: e[2].get("score_raw", e[0]), reverse=True)
+    print("\ntop 10 the selector alone would have given:")
+    for i, (score, paper, bd) in enumerate(by_sel[:10]):
+        now = next(
+            (j + 1 for j, (_, q, _) in enumerate(ranked)
+             if q.openalex_id == paper.openalex_id), 0,
+        )
+        print(f"  {i+1:>4} -> {now:<4}  sel={bd.get('score_raw', 0):.4f}  "
+              f"rr={bd.get('score_reranker_norm', 0):.4f}  "
+              f"{(paper.title or '')[:38]}")
+
+    conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
