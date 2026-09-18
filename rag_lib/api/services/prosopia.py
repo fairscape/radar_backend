@@ -15,10 +15,10 @@ kind of thing to coherence, topic aggregation, and the selector fit.
 The work splits in two, and the split is the reason this reads the way
 it does:
 
-  :func:`prepare_import` is cheap and synchronous — two HTTP reads
-  against Prosopia and one INSERT. It runs inside the request so a slug
-  nobody has published is a 404 on the POST rather than an error the
-  caller only discovers by polling a run row.
+  :func:`prepare_import` is cheap and synchronous — one SDK read of the
+  profile and one INSERT. It runs inside the request so a slug nobody
+  has published is a 404 on the POST rather than an error the caller
+  only discovers by polling a run row.
 
   :func:`run_import` is the expensive half — an OpenAlex round trip per
   batch and an embedding per paper, which for the reference profile is
@@ -58,6 +58,7 @@ from ...prosopia_client import (
     ProfileNotFound,
     ProsopiaClient,
     ProsopiaError,
+    read_summary,
 )
 from ...prosopia_seeds import RUNGS, prefetch_works, resolve_seed
 from . import wizard as wizard_service
@@ -88,9 +89,9 @@ _TICK_EVERY = 5
 class ImportPlan:
     """Everything the background job needs, resolved inside the request.
 
-    The Prosopia client rides along because the job still needs it for
-    the summary artifacts of papers that fail to resolve — and because
-    re-fetching the profile in the job would mean a slug could 404 twice,
+    The SDK profile rides along because the job still needs its lazy
+    ``summaries`` mapping for the papers that fail to resolve — and
+    because re-fetching it in the job would mean a slug could 404 twice,
     once where the caller can see it and once where they cannot.
     """
 
@@ -100,9 +101,8 @@ class ImportPlan:
     profile_id: int
     user_id: int
     embedding_model: str
-    entries: list[dict] = field(default_factory=list)
-    summary_paths: dict[str, str] = field(default_factory=dict)
-    client: Any = None
+    records: list[Any] = field(default_factory=list)
+    profile: Any = None
 
 
 def normalize_ref(raw: str) -> str:
@@ -169,9 +169,8 @@ def prepare_import(
         profile_id=int(draft_row["id"]),
         user_id=user_id,
         embedding_model=model,
-        entries=list(profile.entries),
-        summary_paths=profile.summary_paths(),
-        client=client,
+        records=list(profile.papers),
+        profile=profile,
     )
 
 
@@ -190,33 +189,32 @@ def run_import(
     failed import. ``reporter`` is the scheduler's ``_ProgressReporter``
     (or any duck with ``step`` / ``tick``); pass ``None`` to run silent.
     """
-    entries = plan.entries
+    records = plan.records
     embedder = get_embedder(plan.embedding_model)
     oa = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
 
     # Batched identifier resolution up front: one request per 50 DOIs
     # rather than one per paper. A failure here is *not* fatal — the
     # ladder degrades to per-paper lookups, which is slower but correct.
-    _step(reporter, "fetching", total=len(entries),
-          message=f"Resolving {len(entries)} works through OpenAlex")
-    cache = prefetch_works(entries, oa)
+    _step(reporter, "fetching", total=len(records),
+          message=f"Resolving {len(records)} works through OpenAlex")
+    cache = prefetch_works(records, oa)
 
     resolved_by = {rung: 0 for rung in RUNGS}
     unresolved: list[str] = []
     drafted = 0
 
-    _step(reporter, "embedding", total=len(entries),
-          message=f"Embedding {len(entries)} seeds")
-    for entry in entries:
-        resolution = resolve_seed(entry, oa, slug=plan.slug, cache=cache)
+    _step(reporter, "embedding", total=len(records),
+          message=f"Embedding {len(records)} seeds")
+    for record in records:
+        resolution = resolve_seed(record, oa, slug=plan.slug, cache=cache)
         if not resolution.resolved:
             # Only now is the summary artifact worth a round trip: it is
             # the embedding input for a paper we could not otherwise
-            # describe. Fetching all 82 up front would be 82 requests to
-            # improve three papers.
+            # describe. ``summaries`` is lazy, so touching it here costs
+            # one request per unresolved paper rather than 82 up front.
             resolution.paper["body_text"] = _fallback_body(
-                plan.client, plan.slug, entry,
-                plan.summary_paths.get(resolution.paper_id),
+                plan.profile, record, resolution.paper_id,
             )
             unresolved.append(resolution.paper_id)
 
@@ -233,16 +231,15 @@ def run_import(
         profiles_repo.attach_seed(conn, plan.profile_id, resolution.openalex_id)
         drafted += 1
         if reporter is not None and (
-            drafted % _TICK_EVERY == 0 or drafted == len(entries)
+            drafted % _TICK_EVERY == 0 or drafted == len(records)
         ):
-            _tick(reporter, drafted, f"Imported {drafted} / {len(entries)} seeds")
+            _tick(reporter, drafted, f"Imported {drafted} / {len(records)} seeds")
 
     log.info(
         "prosopia.import.done",
         slug=plan.slug, draft_slug=plan.draft_slug, drafted=drafted,
         resolved_by=resolved_by, n_unresolved=len(unresolved),
         openalex_calls=getattr(oa, "api_calls", None),
-        prosopia_calls=getattr(plan.client, "api_calls", None),
     )
 
     return {
@@ -273,19 +270,19 @@ def _tick(reporter: Any | None, n: int, message: str) -> None:
         pass
 
 
-def _fallback_body(
-    client: Any,
-    slug: str,
-    entry: dict,
-    summary_path: str | None,
-) -> str | None:
-    """The Prosopia summary, plus the public summary artifact if there is one."""
+def _fallback_body(profile: Any, record: Any, paper_id: str) -> str | None:
+    """The record's own summary, plus the profile's summary artifact.
+
+    The two are usually not both present — the API's paper index carries
+    no ``summary`` field, so in practice this is the artifact — but a
+    profile read from files has both, and neither is worth dropping.
+    """
     parts: list[str] = []
-    summary = (entry.get("summary") or "").strip()
+    summary = (record.summary or "").strip()
     if summary:
         parts.append(summary)
-    if summary_path and client is not None:
-        artifact = (client.get_summary(slug, summary_path) or "").strip()
+    if profile is not None:
+        artifact = (read_summary(profile, paper_id) or "").strip()
         if artifact and artifact not in parts:
             parts.append(artifact)
     return "\n\n".join(parts) or None

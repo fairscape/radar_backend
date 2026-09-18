@@ -1,8 +1,12 @@
 """Prosopia import — the resolution ladder and the import endpoint.
 
-No network. The OpenAlex side is a stub whose canned answers are keyed
-by the identifier each rung uses, so a test can say "this entry has only
-a bioRxiv URL" and assert that the DOI rung is the one that caught it.
+No network on either side. The Prosopia side is a stand-in for the SDK's
+``ResearcherProfile`` — real ``PaperRecord`` objects, a name, and a lazy
+summaries mapping — because that object, not an HTTP response, is what
+RADAR now consumes. The OpenAlex side is a stub whose canned answers are
+keyed by the identifier each rung uses, so a test can say "this record
+carries only a DOI" and assert that the DOI rung is the one that caught
+it.
 
 The rung a paper came in on is the thing worth testing. Every paper ends
 up as a seed either way — the failure mode this guards against is a
@@ -13,21 +17,21 @@ by fuzzy title search, or worse, matched to the wrong paper entirely.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 
 import httpx
 import pytest
+from researcher_profiles import PaperRecord
 
 from rag_lib.api import settings as settings_module
 from rag_lib.db import apply_migrations, connect
 from rag_lib.db.repos import users as users_repo
 from rag_lib.openalex_client import OpenAlexClient
 from rag_lib.paper import Paper
-from rag_lib.prosopia_client import ProfileNotFound, ProsopiaError, ProsopiaProfile
+from rag_lib.prosopia_client import ProfileNotFound, ProsopiaError, read_summary
 from rag_lib.api.services.prosopia import normalize_ref
 from rag_lib.prosopia_seeds import (
     WorkCache,
-    _doi_from_entry,
-    _pmcid_from_link,
     prefetch_works,
     resolve_seed,
     synthetic_id,
@@ -106,84 +110,115 @@ class StubOpenAlex:
         return OpenAlexClient.reconstruct_abstract(inv_index)
 
 
-class StubProsopia:
-    """Serves one canned ProsopiaProfile, or raises."""
+class StubSummaries(Mapping):
+    """``prof.summaries`` — a mapping that records what was asked for.
 
-    def __init__(self, profile=None, *, error=None, summaries=None):
+    The real one fetches one body per key on access, so "which keys were
+    touched" is the assertion that proves the import does not pull all 82
+    summaries to improve the handful of papers that need them.
+    """
+
+    def __init__(self, bodies: dict[str, str] | None = None):
+        self._bodies = dict(bodies or {})
+        self.reads: list[str] = []
+
+    def __getitem__(self, key: str) -> str:
+        self.reads.append(key)
+        return self._bodies[key]
+
+    def __iter__(self):
+        return iter(self._bodies)
+
+    def __len__(self) -> int:
+        return len(self._bodies)
+
+
+class StubProfile:
+    """The ``ResearcherProfile`` surface the import reads: three members."""
+
+    def __init__(self, name, papers, summaries=None):
+        self.name = name
+        self.papers = list(papers)
+        self.summaries = summaries if summaries is not None else StubSummaries()
+
+
+class StubProsopia:
+    """Serves one canned profile, or raises."""
+
+    def __init__(self, profile=None, *, error=None):
         self.profile = profile
         self.error = error
-        self.summaries = dict(summaries or {})
-        self.api_calls = 0
-        self.summary_reads: list[str] = []
+        self.fetches = 0
 
     def fetch_profile(self, slug):
-        self.api_calls += 1
+        self.fetches += 1
         if self.error is not None:
             raise self.error
         return self.profile
 
-    def get_summary(self, slug, content_url):
-        self.api_calls += 1
-        self.summary_reads.append(content_url)
-        return self.summaries.get(content_url, "")
-
 
 # ---------------------------------------------------------------------------
-# Fixture entries — the five shapes live Prosopia data actually produces
+# Fixture records — the shapes live Prosopia data actually produces
 # ---------------------------------------------------------------------------
+#
+# Real ``PaperRecord`` objects, built through the same validation the SDK
+# runs, so a field the SDK renames or coerces breaks these here rather
+# than in production.
 
 
-ENTRY_FULL = {
-    "@id": "https://doi.org/10.1101/2025.11.03.685753",
-    "@type": "ScholarlyArticle",
-    "name": "Atacformer: a foundation model for ATAC-seq",
-    "summary": "Introduces Atacformer.",
-    "paper_id": "leroy2025atacformer",
-    "doi": "10.1101/2025.11.03.685753",
-    "openalex_id": "W4415881950",
-    "datePublished": "2025",
-    "isPartOf": {"@type": "Periodical", "name": "bioRxiv"},
-    "full_text_link": "https://www.biorxiv.org/content/biorxiv/early/2025/11/04/2025.11.03.685753.full.pdf",
-    "access": "open",
-}
+def _record(**fields) -> PaperRecord:
+    return PaperRecord.model_validate(fields)
 
-ENTRY_BIORXIV_ONLY = {
-    "@id": "#paper/smith2023protein",
-    "@type": "ScholarlyArticle",
-    "name": "Protein Kinase A Inhibition Epigenetically Silences Ren1",
-    "summary": "PKA inhibition silences renin.",
-    "paper_id": "smith2023protein",
-    "datePublished": "2023",
-    "full_text_link": "https://www.biorxiv.org/content/biorxiv/early/2023/09/22/2023.09.19.558267.full.pdf",
-}
 
-ENTRY_PMC_ONLY = {
-    "@id": "#paper/sheffield2016lola",
-    "@type": "ScholarlyArticle",
-    "name": "LOLA: enrichment analysis for genomic region sets",
-    "summary": "Region set enrichment in R.",
-    "paper_id": "sheffield2016lola",
-    "datePublished": "2016",
-    "full_text_link": "https://pmc.ncbi.nlm.nih.gov/articles/PMC4743627/",
-}
+RECORD_FULL = _record(
+    name="Atacformer: a foundation model for ATAC-seq",
+    summary="Introduces Atacformer.",
+    paper_id="leroy2025atacformer",
+    doi="10.1101/2025.11.03.685753",
+    openalex_id="W4415881950",
+    datePublished="2025",
+    isPartOf={"@type": "Periodical", "name": "bioRxiv"},
+    full_text_link=(
+        "https://www.biorxiv.org/content/biorxiv/early/2025/11/04/"
+        "2025.11.03.685753.full.pdf"
+    ),
+    access="open",
+)
 
-ENTRY_TITLE_ONLY = {
-    "@id": "#paper/campbell2025taming",
-    "@type": "ScholarlyArticle",
-    "name": "Taming the reference genome jungle",
-    "summary": "The refget sequence collection standard.",
-    "paper_id": "campbell2025taming",
-    "datePublished": "2025",
-}
+RECORD_DOI_ONLY = _record(
+    name="Protein Kinase A Inhibition Epigenetically Silences Ren1",
+    summary="PKA inhibition silences renin.",
+    paper_id="smith2023protein",
+    doi="10.1101/2023.09.19.558267",
+    datePublished="2023",
+    full_text_link=(
+        "https://www.biorxiv.org/content/biorxiv/early/2023/09/22/"
+        "2023.09.19.558267.full.pdf"
+    ),
+)
 
-ENTRY_NOTHING = {
-    "@id": "#paper/ghost2020nowhere",
-    "@type": "ScholarlyArticle",
-    "name": "A paper that is in no index anywhere",
-    "summary": "Only the Prosopia summary describes this work.",
-    "paper_id": "ghost2020nowhere",
-    "datePublished": "2020",
-}
+RECORD_PMC_ONLY = _record(
+    name="LOLA: enrichment analysis for genomic region sets",
+    summary="Region set enrichment in R.",
+    paper_id="sheffield2016lola",
+    pmcid="PMC4743627",
+    datePublished="2016",
+    full_text_link="https://pmc.ncbi.nlm.nih.gov/articles/PMC4743627/",
+)
+
+RECORD_TITLE_ONLY = _record(
+    name="Taming the reference genome jungle",
+    summary="The refget sequence collection standard.",
+    paper_id="campbell2025taming",
+    datePublished="2025",
+)
+
+RECORD_NOTHING = _record(
+    name="A paper that is in no index anywhere",
+    summary="Only the Prosopia summary describes this work.",
+    paper_id="ghost2020nowhere",
+    datePublished="2020",
+)
 
 
 def _work(doi, oid, title, year=2024):
@@ -194,41 +229,25 @@ def _work(doi, oid, title, year=2024):
 
 
 # ---------------------------------------------------------------------------
-# Extractors
+# Summaries
 # ---------------------------------------------------------------------------
 
 
-def test_doi_from_entry_prefers_explicit_field():
-    assert _doi_from_entry(ENTRY_FULL) == "10.1101/2025.11.03.685753"
+def test_read_summary_returns_empty_for_a_paper_without_one():
+    """A profile that publishes no summary for a paper is normal, not broken."""
+    profile = StubProfile("N", [], StubSummaries({"a": "body"}))
+    assert read_summary(profile, "a") == "body"
+    assert read_summary(profile, "b") == ""
 
 
-def test_doi_from_entry_reads_doi_org_url():
-    entry = {"@id": "https://doi.org/10.1093/Bioinformatics/btv612"}
-    assert _doi_from_entry(entry) == "10.1093/bioinformatics/btv612"
+def test_read_summary_survives_a_fetch_that_raises():
+    """``summaries`` fetches on access, so one bad artifact is one 502."""
 
+    class Exploding(StubSummaries):
+        def __getitem__(self, key):
+            raise RuntimeError("server error 500")
 
-def test_doi_from_entry_derives_modern_biorxiv_accession():
-    assert _doi_from_entry(ENTRY_BIORXIV_ONLY) == "10.1101/2023.09.19.558267"
-
-
-def test_doi_from_entry_derives_legacy_biorxiv_serial():
-    entry = {
-        "full_text_link":
-            "https://www.biorxiv.org/content/early/2016/01/22/037689.full.pdf",
-    }
-    # The date segments are 2 and 4 digits; only the 6-digit serial is a
-    # plausible accession, so 2016 must not become 10.1101/2016.
-    assert _doi_from_entry(entry) == "10.1101/037689"
-
-
-def test_doi_from_entry_ignores_non_doi_urls():
-    assert _doi_from_entry(ENTRY_PMC_ONLY) is None
-    assert _doi_from_entry(ENTRY_TITLE_ONLY) is None
-
-
-def test_pmcid_from_link():
-    assert _pmcid_from_link(ENTRY_PMC_ONLY) == "PMC4743627"
-    assert _pmcid_from_link(ENTRY_BIORXIV_ONLY) is None
+    assert read_summary(StubProfile("N", [], Exploding()), "a") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +258,7 @@ def test_pmcid_from_link():
 def test_resolve_seed_work_id_rung():
     work = _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer", 2025)
     client = StubOpenAlex(by_id={"W4415881950": work})
-    res = resolve_seed(ENTRY_FULL, client, slug="sheffield-nathan")
+    res = resolve_seed(RECORD_FULL, client, slug="sheffield-nathan")
     assert res.rung == "work_id"
     assert res.openalex_id == "https://openalex.org/W4415881950"
     assert res.paper["source"] == "prosopia"
@@ -248,10 +267,10 @@ def test_resolve_seed_work_id_rung():
     assert client.api_calls == 1
 
 
-def test_resolve_seed_doi_rung_from_biorxiv_url():
+def test_resolve_seed_doi_rung():
     work = _work("10.1101/2023.09.19.558267", "W4386953349", "Protein Kinase A", 2023)
     client = StubOpenAlex(by_doi={"10.1101/2023.09.19.558267": work})
-    res = resolve_seed(ENTRY_BIORXIV_ONLY, client, slug="s")
+    res = resolve_seed(RECORD_DOI_ONLY, client, slug="s")
     assert res.rung == "doi"
     assert res.openalex_id == "https://openalex.org/W4386953349"
 
@@ -259,7 +278,7 @@ def test_resolve_seed_doi_rung_from_biorxiv_url():
 def test_resolve_seed_pmcid_rung():
     work = _work("10.1093/bioinformatics/btv612", "W2184563578", "LOLA", 2016)
     client = StubOpenAlex(by_pmcid={"PMC4743627": work})
-    res = resolve_seed(ENTRY_PMC_ONLY, client, slug="s")
+    res = resolve_seed(RECORD_PMC_ONLY, client, slug="s")
     assert res.rung == "pmcid"
     assert res.openalex_id == "https://openalex.org/W2184563578"
 
@@ -270,7 +289,7 @@ def test_resolve_seed_title_rung():
     client = StubOpenAlex(
         title_hits={"Taming the reference genome jungle": [work]},
     )
-    res = resolve_seed(ENTRY_TITLE_ONLY, client, slug="s")
+    res = resolve_seed(RECORD_TITLE_ONLY, client, slug="s")
     assert res.rung == "title"
     assert res.openalex_id == "https://openalex.org/W4414879798"
 
@@ -286,14 +305,14 @@ def test_resolve_seed_rejects_a_near_miss_title():
     client = StubOpenAlex(
         title_hits={"Taming the reference genome jungle": [wrong]},
     )
-    res = resolve_seed(ENTRY_TITLE_ONLY, client, slug="s")
+    res = resolve_seed(RECORD_TITLE_ONLY, client, slug="s")
     assert res.rung == "none"
     assert res.openalex_id == synthetic_id("s", "campbell2025taming")
 
 
 def test_resolve_seed_falls_to_synthetic_id_and_embeds_the_summary():
     client = StubOpenAlex()
-    res = resolve_seed(ENTRY_NOTHING, client, slug="sheffield-nathan")
+    res = resolve_seed(RECORD_NOTHING, client, slug="sheffield-nathan")
     assert res.rung == "none"
     assert res.resolved is False
     assert res.openalex_id == "prosopia:sheffield-nathan:ghost2020nowhere"
@@ -306,7 +325,7 @@ def test_resolve_seed_falls_to_synthetic_id_and_embeds_the_summary():
 def test_resolve_seed_fallback_text_overrides_the_summary():
     client = StubOpenAlex()
     res = resolve_seed(
-        ENTRY_NOTHING, client, slug="s", fallback_text="summary\n\nartifact body",
+        RECORD_NOTHING, client, slug="s", fallback_text="summary\n\nartifact body",
     )
     assert res.paper["body_text"] == "summary\n\nartifact body"
 
@@ -320,7 +339,7 @@ def test_resolve_seed_survives_a_lookup_that_raises():
 
     work = _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer", 2025)
     client = Exploding(by_doi={"10.1101/2025.11.03.685753": work})
-    res = resolve_seed(ENTRY_FULL, client, slug="s")
+    res = resolve_seed(RECORD_FULL, client, slug="s")
     assert res.rung == "doi"
 
 
@@ -330,7 +349,7 @@ def test_resolve_seed_survives_a_lookup_that_raises():
 
 
 def test_prefetch_batches_dois_and_keys_both_ways():
-    entries = [ENTRY_FULL, ENTRY_BIORXIV_ONLY, ENTRY_PMC_ONLY]
+    records = [RECORD_FULL, RECORD_DOI_ONLY, RECORD_PMC_ONLY]
     works = {
         "10.1101/2025.11.03.685753":
             _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer"),
@@ -338,20 +357,20 @@ def test_prefetch_batches_dois_and_keys_both_ways():
             _work("10.1101/2023.09.19.558267", "W4386953349", "Protein Kinase A"),
     }
     client = StubOpenAlex(by_doi=works)
-    cache = prefetch_works(entries, client)
-    # Two DOIs (the PMC entry yields none) in one request.
+    cache = prefetch_works(records, client)
+    # Two DOIs (the PMC record carries none) in one request.
     assert client.api_calls == 1
     assert set(cache.by_doi) == set(works)
     assert set(cache.by_id) == {"W4415881950", "W4386953349"}
 
 
 def test_prefetch_chunks_at_the_batch_size():
-    entries = [
-        {"paper_id": f"p{i}", "doi": f"10.1234/{i}", "name": f"Paper {i}"}
+    records = [
+        _record(paper_id=f"p{i}", doi=f"10.1234/{i}", name=f"Paper {i}")
         for i in range(120)
     ]
     client = StubOpenAlex()
-    prefetch_works(entries, client, batch_size=50)
+    prefetch_works(records, client, batch_size=50)
     assert client.api_calls == 3
 
 
@@ -362,10 +381,10 @@ def test_prefetch_batch_failure_degrades_to_per_paper():
 
     work = _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer", 2025)
     client = Failing(by_id={"W4415881950": work})
-    cache = prefetch_works([ENTRY_FULL], client)
+    cache = prefetch_works([RECORD_FULL], client)
     assert cache.by_id == {} and cache.by_doi == {}
     # The ladder still resolves, just at one request per paper.
-    res = resolve_seed(ENTRY_FULL, client, slug="s", cache=cache)
+    res = resolve_seed(RECORD_FULL, client, slug="s", cache=cache)
     assert res.rung == "work_id"
 
 
@@ -373,7 +392,7 @@ def test_cached_work_costs_no_request():
     work = _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer", 2025)
     cache = WorkCache(by_id={"W4415881950": work})
     client = StubOpenAlex()
-    res = resolve_seed(ENTRY_FULL, client, slug="s", cache=cache)
+    res = resolve_seed(RECORD_FULL, client, slug="s", cache=cache)
     assert res.rung == "work_id"
     assert client.api_calls == 0
 
@@ -388,7 +407,7 @@ def test_stale_prosopia_id_still_resolves_on_the_doi_rung():
     work = _work("10.1101/2025.11.03.685753", "W5555555555", "Atacformer", 2025)
     cache = WorkCache(by_doi={"10.1101/2025.11.03.685753": work})
     client = StubOpenAlex()
-    res = resolve_seed(ENTRY_FULL, client, slug="s", cache=cache)
+    res = resolve_seed(RECORD_FULL, client, slug="s", cache=cache)
     assert res.rung == "doi"
     assert res.openalex_id == "https://openalex.org/W5555555555"
     # One GET for the dangling id, then the cache answers the DOI.
@@ -400,37 +419,14 @@ def test_stale_prosopia_id_still_resolves_on_the_doi_rung():
 # ---------------------------------------------------------------------------
 
 
-MANIFEST = [
-    {
-        "@type": "Collection", "role": "works",
-        "contentUrl": "sources/papers.jsonld", "effective_visibility": "public",
-    },
-    {
-        "@type": "DigitalDocument", "role": "paper_summary",
-        "paperId": "ghost2020nowhere",
-        "contentUrl": "sources/summaries/ghost2020nowhere.summary.md",
-        "visibility": "public", "effective_visibility": "public",
-    },
-    {
-        "@type": "DigitalDocument", "role": "paper_summary",
-        "paperId": "campbell2025taming",
-        "contentUrl": "sources/summaries/campbell2025taming.summary.md",
-        "visibility": "public", "effective_visibility": "withheld",
-    },
-]
-
-
-def _stub_profile():
-    return ProsopiaProfile(
-        slug="sheffield-nathan",
-        name="Nathan C. Sheffield",
-        base_url="https://prosopia.example",
-        metadata={"name": "Nathan C. Sheffield"},
-        manifest=MANIFEST,
-        entries=[
-            ENTRY_FULL, ENTRY_BIORXIV_ONLY, ENTRY_PMC_ONLY,
-            ENTRY_TITLE_ONLY, ENTRY_NOTHING,
+def _stub_profile(summaries=None):
+    return StubProfile(
+        "Nathan C. Sheffield",
+        [
+            RECORD_FULL, RECORD_DOI_ONLY, RECORD_PMC_ONLY,
+            RECORD_TITLE_ONLY, RECORD_NOTHING,
         ],
+        StubSummaries(summaries or {}),
     )
 
 
@@ -543,10 +539,7 @@ def test_start_returns_the_draft_slug_and_a_run_id(env):
 
 def test_status_reports_the_rung_each_paper_came_in_on(env):
     prosopia = StubProsopia(
-        _stub_profile(),
-        summaries={
-            "sources/summaries/ghost2020nowhere.summary.md": "A longer summary.",
-        },
+        _stub_profile({"ghost2020nowhere": "A longer summary."}),
     )
     app = _app(prosopia, _stub_openalex())
     run_id = _start(app, ref="sheffield-nathan").json()["run_id"]
@@ -615,22 +608,18 @@ def test_import_attaches_and_embeds_every_seed(env):
         conn.close()
 
 
-def test_import_appends_only_public_summary_artifacts(env):
-    prosopia = StubProsopia(
-        _stub_profile(),
-        summaries={
-            "sources/summaries/ghost2020nowhere.summary.md": "Artifact prose.",
-            "sources/summaries/campbell2025taming.summary.md": "Withheld prose.",
-        },
-    )
-    app = _app(prosopia, _stub_openalex())
+def test_import_reads_a_summary_only_for_the_paper_that_needs_one(env):
+    profile = _stub_profile({
+        "ghost2020nowhere": "Artifact prose.",
+        "campbell2025taming": "Prose nobody asked for.",
+    })
+    app = _app(StubProsopia(profile), _stub_openalex())
     _start(app, ref="sheffield-nathan")
 
-    # The withheld entry is never requested, and the resolved papers do
-    # not need a summary at all — only the unresolved one is fetched.
-    assert prosopia.summary_reads == [
-        "sources/summaries/ghost2020nowhere.summary.md",
-    ]
+    # ``summaries`` is lazy, so a read is a request. The resolved papers
+    # describe themselves through OpenAlex and never need one; only the
+    # unresolved paper costs a round trip.
+    assert profile.summaries.reads == ["ghost2020nowhere"]
 
     conn = connect(env)
     try:
@@ -725,7 +714,7 @@ def test_status_404s_for_another_users_run(env):
 
 def test_import_of_an_empty_profile_still_creates_a_draft(env):
     profile = _stub_profile()
-    profile.entries = []
+    profile.papers = []
     app = _app(StubProsopia(profile), _stub_openalex())
     resp = _start(app, ref="sheffield-nathan")
     assert resp.status_code == 200, resp.text
