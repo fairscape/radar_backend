@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rag_lib"
 version = "0.1.0a1"
 description = "Personal Research Radar and RAG System — Track 1 backend (Phase 1A scaffolding)."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 readme = "README.md"
 dependencies = [
     "numpy>=1.26",
@@ -18,6 +18,10 @@ dependencies = [
     "python-multipart>=0.0.9",
     "apscheduler>=3.10",
     "httpx>=0.27",
+    # scholarcore is pinned explicitly because it is not on PyPI, so pip
+    # cannot resolve rp-sdk's dependency on it. Bump both SHAs together.
+    "scholarcore @ git+https://github.com/databio/researcher-profiles@7fe1bd35f1e24a06aebf4e658302647608dd207c#subdirectory=scholarcore",
+    "researcher-profiles[client] @ git+https://github.com/databio/researcher-profiles@7fe1bd35f1e24a06aebf4e658302647608dd207c#subdirectory=rp-sdk",
 ]
 
 [project.optional-dependencies]
