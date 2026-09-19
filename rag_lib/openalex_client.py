@@ -96,6 +96,23 @@ class OpenAlexClient:
     # openalex_lookup.py logic.
     # ------------------------------------------------------------------
 
+    def get_work(self, openalex_id: str) -> dict | None:
+        """Fetch one work by its OpenAlex id. ``None`` if OpenAlex 404s.
+
+        Accepts either the bare id (``"W4415881950"``) or the URL form
+        (``"https://openalex.org/W4415881950"``) — external sources carry
+        both, and ``/works/https://...`` is not a valid path.
+        """
+        wid = _strip_id_prefix((openalex_id or "").strip())
+        if not wid:
+            return None
+        try:
+            return self._get(f"/works/{wid}")
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            raise
+
     def lookup_by_doi(self, doi: str) -> dict | None:
         """Return the raw OpenAlex work record for a DOI, or None if 404."""
         try:
@@ -105,15 +122,46 @@ class OpenAlexClient:
                 return None
             raise
 
-    def lookup_by_title(self, title: str, year_hint: int | None = None) -> dict | None:
-        """Fall back to title search. Returns the top hit or None."""
-        params: dict = {"search": title, "per-page": 5}
+    def lookup_by_pmcid(self, pmcid: str) -> dict | None:
+        """Look a work up by PubMed Central id. ``None`` if unknown.
+
+        OpenAlex indexes PMCIDs only for a subset of works, so a miss
+        here is common and is not an error — the caller drops to the
+        next rung. The id is normalized to the ``PMC1234567`` form the
+        filter expects.
+        """
+        pid = _normalize_pmcid(pmcid)
+        if not pid:
+            return None
+        j = self._get("/works", params={"filter": f"ids.pmcid:{pid}", "per-page": 1})
+        results = j.get("results") or []
+        return results[0] if results else None
+
+    def search_by_title(
+        self,
+        title: str,
+        year_hint: int | None = None,
+        *,
+        per_page: int = 5,
+    ) -> list[dict]:
+        """Title search. Returns the top ``per_page`` hits (possibly empty).
+
+        The caller picks the match; OpenAlex's relevance ranking will
+        happily return a near-miss at rank 1 for a title it does not
+        have, so taking ``results[0]`` unchecked is how you get the
+        wrong paper into a seed corpus.
+        """
+        params: dict = {"search": title, "per-page": per_page}
         if year_hint:
             params["filter"] = (
                 f"publication_year:{year_hint - 1}|{year_hint}|{year_hint + 1}"
             )
         j = self._get("/works", params=params)
-        results = j.get("results") or []
+        return j.get("results") or []
+
+    def lookup_by_title(self, title: str, year_hint: int | None = None) -> dict | None:
+        """Fall back to title search. Returns the top hit or None."""
+        results = self.search_by_title(title, year_hint)
         return results[0] if results else None
 
     # ------------------------------------------------------------------
@@ -340,6 +388,17 @@ def _strip_id_prefix(s: str) -> str:
         tail = s[len(_OPENALEX_ID_PREFIX):]
         return tail.rsplit("/", 1)[-1]
     return s
+
+
+def _normalize_pmcid(pmcid: str | None) -> str | None:
+    """``"PMC4743627"`` from any of the forms sources hand us."""
+    raw = (pmcid or "").strip()
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    return f"PMC{digits}"
 
 
 def _normalize_ids(values) -> list[str]:
