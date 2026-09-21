@@ -592,7 +592,27 @@ def dry_run_profile(
         return DryRunResponse(ok=True, key=key, n=0, scores=[])
     profile_id = int(row["id"])
     scores = candidates_repo.scores_for_profile(db, profile_id)
-    return DryRunResponse(ok=True, key=key, n=len(scores), scores=scores)
+    from rag_lib import calibration
+    from rag_lib.api.mappers import _col
+    from rag_lib.api.schemas import SeedSimilarity
+
+    sim_min = _col(row, "seed_sim_min")
+    band = None
+    if sim_min is not None:
+        band = {
+            "min": float(sim_min),
+            "median": float(_col(row, "seed_sim_median", sim_min)),
+            "max": float(_col(row, "seed_sim_max", sim_min)),
+        }
+    rng = calibration.score_range(scores, band)
+    return DryRunResponse(
+        ok=True, key=key, n=len(scores), scores=scores,
+        suggested_threshold=calibration.suggest_threshold(
+            band["min"] if band else None, scores,
+        ) if scores or band else None,
+        seed_similarity=SeedSimilarity(**{k: round(v, 4) for k, v in band.items()}) if band else None,
+        score_range=list(rng) if rng else None,
+    )
 
 
 def _resolve_profile_id(db: sqlite3.Connection, user_id: int, key: str) -> int:

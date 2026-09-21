@@ -149,7 +149,11 @@ def test_list_profiles_returns_seeded_profile(app):
     assert isinstance(p["hue"], int) and 0 <= p["hue"] < 360
     # Health derives from coherence + 30d engagement; coherence=0.78 OK,
     # but no saves/dismisses yet → warn.
-    assert p["health"] in {"warn", "ok"}
+    # Calibrated bands (rag_lib.calibration): 0.78 sits below the
+    # similarity of random same-field papers, so it reads as "mixed".
+    assert p["health"] == "err"
+    assert p["coherenceLabel"] == "mixed"
+    assert isinstance(p["agreement"], int)
 
 
 def test_get_profile_by_key(app):

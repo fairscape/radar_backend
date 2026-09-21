@@ -152,7 +152,8 @@ def test_coherence_endpoint(app, tmp_path):
     resp = _request(app, "POST", f"/api/profiles/draft/{slug}/coherence")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body.keys()) == {"bins", "median", "iqr", "bimodal", "n"}
+    assert {"bins", "median", "iqr", "bimodal", "n", "label", "agreement", "summary",
+            "seed_similarity", "least_similar"} <= set(body.keys())
     assert body["n"] == 8
     assert len(body["bins"]) == 16
     # Tight cluster → median > 0.7.

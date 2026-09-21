@@ -136,9 +136,16 @@ def daily(
         active = _active_topic_ids(topic_filters)
         rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap)
         shown_ids: list[str] = []
+        threshold = prow["threshold"]
+        try:
+            seed_sim_min = prow["seed_sim_min"]
+        except (IndexError, KeyError):
+            seed_sim_min = None
         for crow in rows:
             card = candidate_row_to_card(
                 crow, profile_slug=slug, active_topic_ids=active,
+                threshold=float(threshold) if threshold is not None else None,
+                seed_sim_min=float(seed_sim_min) if seed_sim_min is not None else None,
             )
             # Filter on the card's own bucket rather than recomputing it.
             # Two copies of this rule had already drifted apart once.

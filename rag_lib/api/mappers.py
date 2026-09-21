@@ -22,6 +22,7 @@ import json
 import sqlite3
 from typing import Any, Iterable
 
+from .. import calibration
 from .schemas import (
     BUCKET_HIGH,
     BUCKET_MEDIUM,
@@ -35,6 +36,15 @@ from .schemas import (
 )
 
 
+def _col(row: sqlite3.Row | dict, name: str, default=None):
+    """Read a column that may not exist on rows from older schemas."""
+    try:
+        v = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
+
+
 def _hue_from_slug(slug: str) -> int:
     """Stable hash of slug into [0, 360). Avoids a DB column for hue."""
     h = hashlib.sha1(slug.encode("utf-8")).digest()
@@ -42,6 +52,7 @@ def _hue_from_slug(slug: str) -> int:
 
 
 def _bucket_for(score: float) -> Bucket:
+    """Percentile fallback: top tenth high, top third medium."""
     if score >= BUCKET_HIGH:
         return "high"
     if score >= BUCKET_MEDIUM:
@@ -49,24 +60,39 @@ def _bucket_for(score: float) -> Bucket:
     return "low"
 
 
-def _health_for(
-    coherence_median: float | None, saves30: int, dismisses30: int
-) -> HealthStatus:
-    """err < 0.5 < warn < 0.6 < ok-only-when-engaged.
+def bucket_for_similarity(
+    similarity: float | None,
+    *,
+    threshold: float | None,
+    seed_sim_min: float | None,
+    percentile: float | None,
+) -> Bucket:
+    """Colour a card by what its similarity means for this profile.
 
-    Engagement bonus: even with healthy coherence, fall back to ``warn``
-    when the user hasn't interacted with the profile in the last 30
-    days — matches the spec note in phase-05 doc.
+    ``high``: at least as similar to the centroid as the least typical
+    seed — "this is like your own papers". ``medium``: above the
+    profile's threshold. ``low``: below it (possible when the threshold
+    was raised after the gather). Without a raw similarity, or without
+    a threshold to compare against, fall back to the rank percentile.
     """
-    if coherence_median is None:
-        return "warn"
-    if coherence_median < 0.5:
-        return "err"
-    if coherence_median < 0.6:
-        return "warn"
-    if (saves30 + dismisses30) == 0:
-        return "warn"
-    return "ok"
+    if similarity is not None and threshold is not None:
+        if seed_sim_min is not None and similarity >= seed_sim_min:
+            return "high"
+        if similarity >= threshold:
+            return "medium"
+        return "low"
+    if percentile is not None:
+        return _bucket_for(percentile)
+    if similarity is not None:
+        return _bucket_for(similarity)
+    return "low"
+
+
+def _health_for(
+    coherence_median: float | None, n_seed: int = 0
+) -> HealthStatus:
+    """Calibrated: focused → ok, broad / unknown → warn, mixed → err."""
+    return calibration.health_for(coherence_median, n_seed)  # type: ignore[return-value]
 
 
 def profile_row_to_profile(
@@ -77,17 +103,25 @@ def profile_row_to_profile(
 ) -> Profile:
     slug = row["slug"] if row["slug"] else row["name"]
     coh = row["coherence_median"]
+    n_seed = int(row["n_seed"] or 0)
+    iqr = _col(row, "coherence_iqr")
+    sim_min = _col(row, "seed_sim_min")
+    sim_max = _col(row, "seed_sim_max")
     return Profile(
         key=slug,
         name=row["name"],
         hue=_hue_from_slug(slug),
-        health=_health_for(coh, saves30, dismisses30),
+        health=_health_for(coh, n_seed),
         threshold=float(row["threshold"]) if row["threshold"] is not None else 0.0,
         coherence=float(coh) if coh is not None else 0.0,
-        seeds=int(row["n_seed"] or 0),
+        seeds=n_seed,
         saves30=saves30,
         dismisses30=dismisses30,
         isDraft=bool(row["is_draft"]),
+        coherenceLabel=calibration.coherence_label(coh, iqr, n_seed),
+        agreement=calibration.agreement_score(coh) if n_seed >= 2 else None,
+        seedSimMin=float(sim_min) if sim_min is not None else None,
+        seedSimMax=float(sim_max) if sim_max is not None else None,
     )
 
 
@@ -162,6 +196,8 @@ def candidate_row_to_card(
     *,
     profile_slug: str,
     active_topic_ids: Iterable[str],
+    threshold: float | None = None,
+    seed_sim_min: float | None = None,
 ) -> Card:
     """Build a ``Card`` from a ``profile_candidates JOIN papers`` row.
 
@@ -182,6 +218,8 @@ def candidate_row_to_card(
     """
     pct = row["score_pct"]
     score = float(pct if pct is not None else row["score"])
+    raw = _col(row, "score_raw")
+    similarity = float(raw) if raw is not None else None
     topics_payload = _decode_topics(row["topics_json"])
     abstract = row["abstract"] or ""
     pub_date = row["publication_date"] or ""
@@ -201,13 +239,21 @@ def candidate_row_to_card(
         openalex=row["openalex_id"],
         profile=profile_slug,
         score=round(score, 4),
-        bucket=_bucket_for(score),
+        similarity=round(similarity, 4) if similarity is not None else None,
+        bucket=bucket_for_similarity(
+            similarity,
+            threshold=threshold,
+            seed_sim_min=seed_sim_min,
+            # ``score`` is the percentile when one exists and the legacy
+            # raw score otherwise; either way it is the fallback figure.
+            percentile=score,
+        ),
         abstract=abstract,
         mesh=[],
         terms=terms,
         matched=matched,
         topicMatch=_topic_match_for(topics_payload, active_topic_ids),
-        centroidCos=round(score, 4),
+        centroidCos=round(similarity if similarity is not None else score, 4),
         noveltyDelta=0.0,
         mins=_read_minutes(abstract),
     )

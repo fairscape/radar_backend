@@ -257,6 +257,27 @@ def list_seed_openalex_ids(
     return [r["openalex_id"] for r in rows]
 
 
+def update_seed_similarity(
+    conn: sqlite3.Connection, profile_id: int, band: dict | None
+) -> None:
+    """Store the leave-one-out seed band (see ``calibration.seed_similarity_band``)."""
+    conn.execute(
+        """
+        UPDATE profiles SET
+          seed_sim_min = ?, seed_sim_median = ?, seed_sim_max = ?,
+          updated_at = datetime('now')
+        WHERE id = ?
+        """,
+        (
+            band["min"] if band else None,
+            band["median"] if band else None,
+            band["max"] if band else None,
+            profile_id,
+        ),
+    )
+    conn.commit()
+
+
 def update_threshold(
     conn: sqlite3.Connection, profile_id: int, threshold: float
 ) -> None:

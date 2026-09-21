@@ -39,6 +39,7 @@ EXPECTED_VERSIONS = [
     "0012_umls",
     "0013_reranker",
     "0014_candidate_source_topic",
+    "0015_seed_similarity",
 ]
 
 

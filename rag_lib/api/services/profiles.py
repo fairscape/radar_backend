@@ -119,8 +119,12 @@ def get_profile_detail(
         row, saves30=saves30, dismisses30=dismisses30,
     )
 
-    # Seeds — order by added_at; idx is 1-based for UI list keys.
+    # Seeds — order by added_at; idx is 1-based for UI list keys. Each
+    # carries its leave-one-out cosine to the centroid of the other
+    # seeds, so the table shows which papers are typical and which are
+    # the odd ones out.
     seed_oa_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
+    loo = _seed_loo_cosines(conn, profile_id, row["embedding_model"])
     seed_rows = []
     for idx, oa_id in enumerate(seed_oa_ids, start=1):
         paper_row = conn.execute(
@@ -129,7 +133,7 @@ def get_profile_detail(
         ).fetchone()
         if paper_row is None:
             continue
-        seed_rows.append(seed_row_to_seed(paper_row, idx=idx))
+        seed_rows.append(seed_row_to_seed(paper_row, idx=idx, coh_to_centroid=loo.get(oa_id)))
 
     # Topics from profile_filters; coherence histogram from seed embeddings.
     topic_filters = profiles_repo.topic_filters(conn, profile_id)
@@ -169,3 +173,30 @@ def get_profile_detail(
         feedbackLog=feedback_log,
         feedbackMoreCount=feedback_more,
     )
+
+
+def _seed_loo_cosines(
+    conn: sqlite3.Connection, profile_id: int, model: str | None
+) -> dict[str, float]:
+    """``{openalex_id: leave-one-out cosine to the other seeds' centroid}``."""
+    if not model:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT ps.openalex_id AS oa, pe.vector
+        FROM profile_seeds ps
+        JOIN paper_embeddings pe ON pe.openalex_id = ps.openalex_id
+        WHERE ps.profile_id = ? AND pe.embedding_model = ?
+        """,
+        (profile_id, model),
+    ).fetchall()
+    if len(rows) < 2:
+        return {}
+    from rag_lib import calibration
+    from rag_lib.db.codec import decode_vector
+
+    vecs = [decode_vector(r["vector"]).tolist() for r in rows]
+    band = calibration.seed_similarity_band(vecs)
+    if band is None:
+        return {}
+    return {r["oa"]: round(v, 4) for r, v in zip(rows, band["values"])}

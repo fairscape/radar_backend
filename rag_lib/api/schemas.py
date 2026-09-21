@@ -16,9 +16,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-# Bucket thresholds — Phase 5 reads these when assigning ``bucket`` from ``score``.
-BUCKET_HIGH = 0.95
-BUCKET_MEDIUM = 0.925
+# Rank-percentile fallback cut-points for ``bucket`` when a candidate row
+# has no raw similarity (rows written before ``score_raw`` existed): top
+# tenth is "high", top third "medium". Rows with a raw similarity are
+# bucketed against the profile's threshold and seed band instead — see
+# ``rag_lib.calibration`` and ``mappers.candidate_row_to_card``.
+BUCKET_HIGH = 0.90
+BUCKET_MEDIUM = 0.67
 
 
 HealthStatus = Literal["ok", "warn", "err"]
@@ -55,6 +59,15 @@ class Profile(_Model):
     saves30: int
     dismisses30: int
     isDraft: bool = False
+    # Calibrated reading of ``coherence`` (see ``rag_lib.calibration``):
+    # one of focused / broad / mixed / single / none, plus a 0–100
+    # agreement figure for display.
+    coherenceLabel: str = "none"
+    agreement: int | None = None
+    # Leave-one-out similarity of the seeds to their centroid: the band a
+    # candidate has to reach to be "as close as your own papers".
+    seedSimMin: float | None = None
+    seedSimMax: float | None = None
 
 
 class Card(_Model):
@@ -66,7 +79,13 @@ class Card(_Model):
     doi: str | None
     openalex: str
     profile: str
+    # ``score`` is the rank percentile within the profile's pool (1.0 =
+    # top). ``similarity`` is the raw cosine to the seed centroid — the
+    # number the profile threshold is compared against. ``bucket`` is
+    # derived from ``similarity`` vs the threshold and seed band when
+    # available, else from the percentile.
     score: float
+    similarity: float | None = None
     bucket: Bucket
     abstract: str
     mesh: list[str]
@@ -250,6 +269,14 @@ class RefitResponse(_Model):
     cost: str
 
 
+class SeedSimilarity(_Model):
+    """Leave-one-out cosine of each seed to the centroid of the others."""
+
+    min: float
+    median: float
+    max: float
+
+
 class DryRunResponse(_Model):
     ok: bool = True
     key: str
@@ -258,6 +285,10 @@ class DryRunResponse(_Model):
     # candidate set. The UI uses this list to render a slider-driven
     # histogram showing "how many of the N fetched would pass at θ".
     scores: list[float] = Field(default_factory=list)
+    suggested_threshold: float | None = None
+    seed_similarity: SeedSimilarity | None = None
+    # [lo, hi] the slider should span: observed scores + seed band.
+    score_range: list[float] | None = None
 
 
 class GatherRun(_Model):
@@ -400,6 +431,14 @@ class ProsopiaImportStatus(_Model):
     result: ProsopiaImportResult | None = None
 
 
+class LeastSimilarPair(_Model):
+    a_id: str
+    a_title: str
+    b_id: str
+    b_title: str
+    cosine: float
+
+
 class DraftCoherence(_Model):
     """Output of ``POST /api/profiles/draft/{slug}/coherence``.
 
@@ -414,6 +453,13 @@ class DraftCoherence(_Model):
     iqr: float = 0.0
     bimodal: bool = False
     n: int = 0
+    # Calibrated reading for people: label, 0–100 agreement, a sentence,
+    # the seed band, and which two seeds agree least.
+    label: str = "none"
+    agreement: int | None = None
+    summary: str = ""
+    seed_similarity: SeedSimilarity | None = None
+    least_similar: LeastSimilarPair | None = None
 
 
 class DraftDryRunRequest(_Model):
@@ -440,6 +486,9 @@ class DraftDryRun(_Model):
     sweep: list[SweepRow] = Field(default_factory=list)
     preview: list[Card] = Field(default_factory=list)
     scores: list[float] = Field(default_factory=list)
+    suggested_threshold: float | None = None
+    seed_similarity: SeedSimilarity | None = None
+    score_range: list[float] | None = None
 
 
 class DraftDryRunStart(_Model):

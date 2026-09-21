@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 import structlog
 
+from ... import calibration
 from ...coherence import coherence as coherence_compute
 from ...db import encode_vector
 from ...db.repos import (
@@ -49,8 +50,15 @@ from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
 from ...profile import Profile
 from ...selectors import get_selector
-from ..mappers import _bucket_for, _read_minutes
-from ..schemas import Card, DraftCoherence, DraftDryRun, SweepRow
+from ..mappers import _read_minutes, bucket_for_similarity
+from ..schemas import (
+    Card,
+    DraftCoherence,
+    DraftDryRun,
+    LeastSimilarPair,
+    SeedSimilarity,
+    SweepRow,
+)
 
 log = structlog.get_logger("rag_lib.api.services.wizard")
 
@@ -151,7 +159,7 @@ def compute_draft_coherence(
     profile_id = int(row["id"])
     embedding_model = row["embedding_model"]
 
-    vecs = _seed_embeddings(conn, profile_id, embedding_model)
+    ids, vecs = _seed_embeddings_with_ids(conn, profile_id, embedding_model)
     bins = profiles_repo.coherence_bins(conn, profile_id)
     if not vecs:
         conn.execute(
@@ -160,6 +168,9 @@ def compute_draft_coherence(
               coherence_median  = NULL,
               coherence_iqr     = NULL,
               coherence_bimodal = NULL,
+              seed_sim_min      = NULL,
+              seed_sim_median   = NULL,
+              seed_sim_max      = NULL,
               n_seed            = 0,
               updated_at        = datetime('now')
             WHERE id = ?
@@ -167,12 +178,28 @@ def compute_draft_coherence(
             (profile_id,),
         )
         conn.commit()
-        return DraftCoherence(bins=bins, median=0.0, iqr=0.0, bimodal=False, n=0)
+        return DraftCoherence(
+            bins=bins, median=0.0, iqr=0.0, bimodal=False, n=0,
+            label="none", summary=calibration.describe_coherence("none", 0, None),
+        )
     metrics = coherence_compute(vecs)
     median = _finite(metrics["median"])
     iqr = _finite(metrics["iqr"])
     bimodal = bool(metrics["bimodal"])
     n = int(metrics["n"])
+    band = calibration.seed_similarity_band(vecs)
+    label = calibration.coherence_label(median if n >= 2 else None, iqr, n)
+    agreement = calibration.agreement_score(median) if n >= 2 else None
+    least = None
+    pair = calibration.least_similar_pair(vecs) if n >= 2 else None
+    if pair is not None:
+        i, j, cos = pair
+        titles = _titles_for(conn, [ids[i], ids[j]])
+        least = LeastSimilarPair(
+            a_id=ids[i], a_title=titles.get(ids[i], ""),
+            b_id=ids[j], b_title=titles.get(ids[j], ""),
+            cosine=round(cos, 4),
+        )
     # Persist now so the profile row reflects what we just showed
     # instead of waiting for commit_draft. Lets the profile detail page
     # render the histogram + median without re-running the compute.
@@ -182,14 +209,46 @@ def compute_draft_coherence(
           coherence_median  = ?,
           coherence_iqr     = ?,
           coherence_bimodal = ?,
+          seed_sim_min      = ?,
+          seed_sim_median   = ?,
+          seed_sim_max      = ?,
           n_seed            = ?,
           updated_at        = datetime('now')
         WHERE id = ?
         """,
-        (median, iqr, 1 if bimodal else 0, len(vecs), profile_id),
+        (
+            median, iqr, 1 if bimodal else 0,
+            band["min"] if band else None,
+            band["median"] if band else None,
+            band["max"] if band else None,
+            len(vecs), profile_id,
+        ),
     )
     conn.commit()
-    return DraftCoherence(bins=bins, median=median, iqr=iqr, bimodal=bimodal, n=n)
+    return DraftCoherence(
+        bins=bins, median=median, iqr=iqr, bimodal=bimodal, n=n,
+        label=label, agreement=agreement,
+        summary=calibration.describe_coherence(label, n, agreement),
+        seed_similarity=_seed_similarity_schema(band),
+        least_similar=least,
+    )
+
+
+def _seed_similarity_schema(band: dict | None) -> SeedSimilarity | None:
+    if not band:
+        return None
+    return SeedSimilarity(
+        min=round(band["min"], 4), median=round(band["median"], 4), max=round(band["max"], 4),
+    )
+
+
+def _titles_for(conn: sqlite3.Connection, openalex_ids: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for oa in openalex_ids:
+        prow = papers_repo.get_by_openalex_id(conn, oa)
+        if prow is not None:
+            out[oa] = prow["title"] or ""
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -396,10 +455,27 @@ def compute_dry_run_for_profile(
 
     # Raw selector cosines for every fetched candidate. The wizard
     # renders a slider over these so the user picks θ against a real
-    # histogram instead of a coarse grid of bucket cards.
-    scores = [round(float(e[0]), 4) for e in ranked]
+    # histogram instead of a coarse grid of bucket cards. ``e[0]`` is the
+    # selector's cosine here — the dry run does not rerank — but read
+    # ``score_raw`` when present so this stays true if it ever does.
+    scores = [round(float(e[2].get("score_raw", e[0])), 4) for e in ranked]
 
-    return DraftDryRun(sweep=sweep, preview=preview, scores=scores)
+    band = None
+    try:
+        band = calibration.seed_similarity_band(
+            profile.seed_embeddings(profile.embedding_model)
+        )
+    except ValueError:
+        band = None
+    suggested = calibration.suggest_threshold(band["min"] if band else None, scores)
+    rng = calibration.score_range(scores, band)
+
+    return DraftDryRun(
+        sweep=sweep, preview=preview, scores=scores,
+        suggested_threshold=suggested,
+        seed_similarity=_seed_similarity_schema(band),
+        score_range=list(rng) if rng else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +535,13 @@ def commit_draft(
         coherence_bimodal=diag.get("coherence_bimodal"),
         n_seed=len(profile.papers),
     )
+    try:
+        band = calibration.seed_similarity_band(
+            profile.seed_embeddings(profile.embedding_model)
+        )
+    except ValueError:
+        band = None
+    profiles_repo.update_seed_similarity(conn, profile_id, band)
     schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
     return {"slug": slug, "id": profile_id}
 
@@ -531,6 +614,24 @@ def _require_profile(
     if row is None:
         raise LookupError(f"profile '{slug}' not found for user {user_id}")
     return row
+
+
+def _seed_embeddings_with_ids(
+    conn: sqlite3.Connection, profile_id: int, model: str
+) -> tuple[list[str], list[list[float]]]:
+    rows = conn.execute(
+        """
+        SELECT ps.openalex_id AS oa, pe.vector
+        FROM profile_seeds ps
+        JOIN paper_embeddings pe ON pe.openalex_id = ps.openalex_id
+        WHERE ps.profile_id = ? AND pe.embedding_model = ?
+        """,
+        (profile_id, model),
+    ).fetchall()
+    if not rows:
+        return [], []
+    from ...db.codec import decode_vector
+    return [r["oa"] for r in rows], [decode_vector(r["vector"]).tolist() for r in rows]
 
 
 def _seed_embeddings(
@@ -656,8 +757,12 @@ def _ranked_to_preview(
     """Build preview Cards directly from the selector's ranked output."""
     out: list[Card] = []
     for entry in ranked[:PREVIEW_CARDS]:
-        score, paper, _breakdown = _unpack(entry)
-        out.append(_paper_to_card(paper, score, slug, active_topic_ids))
+        score, paper, breakdown = _unpack(entry)
+        pct = (breakdown or {}).get("score_pct")
+        out.append(_paper_to_card(
+            paper, score, slug, active_topic_ids,
+            percentile=float(pct) if pct is not None else None,
+        ))
     return out
 
 
@@ -672,6 +777,8 @@ def _paper_to_card(
     score: float,
     slug: str,
     active_topic_ids: list[str],
+    *,
+    percentile: float | None = None,
 ) -> Card:
     """Construct a ``Card`` from an in-memory ``Paper`` (preview only).
 
@@ -696,7 +803,10 @@ def _paper_to_card(
         openalex=paper.openalex_id or "",
         profile=slug,
         score=score,
-        bucket=_bucket_for(score),
+        similarity=score,
+        bucket=bucket_for_similarity(
+            score, threshold=None, seed_sim_min=None, percentile=percentile,
+        ),
         abstract=abstract,
         mesh=list(paper.mesh or []),
         terms=terms,

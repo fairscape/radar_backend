@@ -216,20 +216,23 @@ def count_for_profile(conn: sqlite3.Connection, profile_id: int) -> int:
 def scores_for_profile(
     conn: sqlite3.Connection, profile_id: int
 ) -> list[float]:
-    """Raw selector scores for every persisted candidate, score desc.
+    """Raw selector cosines for every persisted candidate, descending.
 
-    Drives the dry-run histogram on the profile detail page: the UI
-    bins these and lets the user slide θ to see "X of N would pass".
+    Drives the threshold histogram on the profile detail page. Reads
+    ``score_raw``, not ``score``: with a reranker active ``score`` holds
+    a batch-relative blend in [0, 1], and the threshold is a cosine, so
+    comparing the two produced an all-or-nothing slider. Rows from
+    before ``score_raw`` existed fall back to ``score``.
     """
     rows = conn.execute(
         """
-        SELECT score FROM profile_candidates
+        SELECT COALESCE(score_raw, score) AS s FROM profile_candidates
         WHERE profile_id = ?
-        ORDER BY score DESC
+        ORDER BY s DESC
         """,
         (profile_id,),
     ).fetchall()
-    return [float(r["score"]) for r in rows]
+    return [float(r["s"]) for r in rows]
 
 
 def mark_shown_bulk(
