@@ -243,6 +243,18 @@ def attach_seed(
         """,
         (profile_id, openalex_id),
     )
+    # Keep the denormalised count honest for drafts too, so a list of
+    # interests shows how many seeds a draft has before its coherence
+    # has ever been computed.
+    conn.execute(
+        """
+        UPDATE profiles SET
+          n_seed = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?),
+          updated_at = datetime('now')
+        WHERE id = ?
+        """,
+        (profile_id, profile_id),
+    )
     conn.commit()
     return cur.rowcount
 
