@@ -14,6 +14,8 @@ def test_bands_follow_the_measured_scale():
     assert cal.coherence_label(0.878, 0.073, 8) == "broad"     # the two mixed
     assert cal.coherence_label(0.847, 0.03, 4) == "mixed"      # random same-field
     assert cal.coherence_label(0.92, 0.08, 6) == "broad"       # high median, two groups
+    assert cal.coherence_label(0.934, 0.058, 5) == "focused"   # real 5-paper set, agreement 88
+    assert cal.coherence_label(0.94, 0.09, 6) == "focused"     # 92/100 is one topic whatever the spread
     assert cal.coherence_label(None, None, 1) == "single"
     assert cal.coherence_label(None, None, 0) == "none"
 

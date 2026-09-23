@@ -371,9 +371,10 @@ class DraftCreateRequest(_Model):
 class ProsopiaImportRequest(_Model):
     """Body of ``POST /api/import/prosopia``.
 
-    ``ref`` is a bare slug *or* a full profile URL — the latter is what
-    a user copies out of the address bar, and rejecting it would be a
-    gratuitous papercut. ``base_url`` points at a non-default Prosopia
+    ``ref`` is a bare slug, a full profile URL — what a user copies out
+    of the address bar, and rejecting it would be a gratuitous papercut —
+    or an ORCID (bare or as an ``orcid.org`` URL), which is resolved to
+    the slug of the profile that researcher published. ``base_url`` points at a non-default Prosopia
     instance. ``name`` overrides the draft name, which otherwise comes
     from the Prosopia profile's own metadata; ``embedding_model``
     overrides the configured default, exactly as on the wizard's
@@ -382,6 +383,71 @@ class ProsopiaImportRequest(_Model):
 
     ref: str
     base_url: str | None = None
+    name: str | None = None
+    embedding_model: str | None = None
+    # The ``id`` values from GET /api/import/prosopia/works to keep;
+    # omitted = every paper on the profile.
+    paper_ids: list[str] | None = None
+
+
+class ProsopiaWork(_Model):
+    """One paper on a Prosopia profile, slimmed for a pick list."""
+
+    id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    openalex_id: str | None = None
+    cited_by_count: int | None = None
+    authors: list[str] = []
+    n_authors: int | None = None
+
+
+class ProsopiaWorksResponse(_Model):
+    """``GET /api/import/prosopia/works`` — the profile's papers, to pick from."""
+
+    slug: str
+    name: str | None = None
+    works: list[ProsopiaWork]
+
+
+class OrcidWork(_Model):
+    """One of an author's OpenAlex works, slimmed for a pick list."""
+
+    openalex_id: str
+    doi: str | None = None
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    type: str | None = None
+    cited_by_count: int | None = None
+    authors: list[str] = []
+    n_authors: int | None = None
+    author_position: str | None = None
+
+
+class OrcidWorksResponse(_Model):
+    """``GET /api/import/orcid/{orcid}/works`` — what the author published.
+
+    ``name`` is read off the authorships and is null when OpenAlex has
+    no works for the ORCID (there is nothing to read it from).
+    """
+
+    orcid: str
+    name: str | None = None
+    works: list[OrcidWork]
+
+
+class OrcidImportRequest(_Model):
+    """Body of ``POST /api/import/orcid``.
+
+    ``openalex_ids`` are the works the user kept from the listing. The
+    draft is named after the author unless ``name`` says otherwise.
+    """
+
+    orcid: str
+    openalex_ids: list[str]
     name: str | None = None
     embedding_model: str | None = None
 

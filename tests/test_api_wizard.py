@@ -298,6 +298,32 @@ def test_delete_unknown_draft_404(app):
     assert resp.status_code == 404
 
 
+def test_remove_draft_seed(app, tmp_path):
+    db = str(tmp_path / "radar.db")
+    resp = _request(app, "POST", "/api/profiles/draft", json={"name": "Pruned"})
+    slug = resp.json()["slug"]
+    profile_id = _attach_seeds(db, user_id=1, slug=slug)
+
+    resp = _request(app, "DELETE", f"/api/profiles/draft/{slug}/seeds/W3000000")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"ok": True}
+
+    conn = connect(db)
+    try:
+        seeds = profiles_repo.list_seed_openalex_ids(conn, profile_id)
+        assert "W3000000" not in seeds and len(seeds) == 7
+        assert profiles_repo.get(conn, profile_id)["n_seed"] == 7
+    finally:
+        conn.close()
+
+    docs = _request(app, "GET", "/api/vault/docs", params={"tag": slug}).json()
+    assert "W3000000" not in {d["id"] for d in docs}
+
+    # Already gone, and unknown drafts, are 404s.
+    assert _request(app, "DELETE", f"/api/profiles/draft/{slug}/seeds/W3000000").status_code == 404
+    assert _request(app, "DELETE", "/api/profiles/draft/nope/seeds/W3000001").status_code == 404
+
+
 def test_dry_run_unknown_draft_404(app):
     resp = _request(
         app, "POST", "/api/profiles/draft/missing/dry-run",

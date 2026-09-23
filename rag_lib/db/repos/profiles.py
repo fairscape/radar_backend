@@ -259,6 +259,30 @@ def attach_seed(
     return cur.rowcount
 
 
+def detach_seed(
+    conn: sqlite3.Connection, profile_id: int, openalex_id: str
+) -> int:
+    """Remove one seed. Returns 1 if a row was deleted, 0 if it was not a seed.
+
+    The paper itself stays in the vault; only the link to the profile goes.
+    """
+    cur = conn.execute(
+        "DELETE FROM profile_seeds WHERE profile_id = ? AND openalex_id = ?",
+        (profile_id, openalex_id),
+    )
+    conn.execute(
+        """
+        UPDATE profiles SET
+          n_seed = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?),
+          updated_at = datetime('now')
+        WHERE id = ?
+        """,
+        (profile_id, profile_id),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def list_seed_openalex_ids(
     conn: sqlite3.Connection, profile_id: int
 ) -> list[str]:

@@ -29,15 +29,18 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
     GatherRun,
+    OrcidImportRequest,
+    OrcidWorksResponse,
     ProsopiaImportRequest,
     ProsopiaImportResult,
     ProsopiaImportStart,
     ProsopiaImportStatus,
+    ProsopiaWorksResponse,
 )
 from ..settings import Settings
 
@@ -45,6 +48,7 @@ router = APIRouter()
 
 
 TIER = "prosopia_import"
+TIER_ORCID = "orcid_import"
 
 
 def get_prosopia_client():
@@ -107,11 +111,21 @@ def import_prosopia(
             name=body.name,
             embedding_model=body.embedding_model,
             prosopia_client=prosopia_client,
+            paper_ids=body.paper_ids,
         )
-    except prosopia_service.ProfileNotFound as exc:
+    except prosopia_service.PapersNotFound as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"prosopia profile '{body.ref}' not found",
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    except prosopia_service.ProfileNotFound as exc:
+        # The client's own message is more specific when it names the
+        # ref (an ORCID nobody published under); otherwise say which
+        # slug was asked for, since a bare "not found" helps nobody.
+        message = str(exc)
+        if body.ref.strip().lower() not in message.lower():
+            message = f"prosopia profile '{body.ref}' not found"
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=message,
         ) from exc
     except prosopia_service.ProsopiaError as exc:
         raise HTTPException(
@@ -123,13 +137,38 @@ def import_prosopia(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
         ) from exc
 
+    return _launch(request, db, settings, plan, user_id=int(user["id"]),
+                   tier=TIER, openalex_client=openalex_client)
+
+
+def _launch(
+    request: Request,
+    db: sqlite3.Connection,
+    settings: Settings,
+    plan,
+    *,
+    user_id: int,
+    tier: str,
+    openalex_client: object | None,
+) -> ProsopiaImportStart:
+    """Open the run row and start the import job for ``plan``.
+
+    Shared by the Prosopia and ORCID kick-off routes: once a plan
+    exists the two are the same job (``run_import``), audited under a
+    different ``tier_used`` so the run history says where the seeds
+    came from.
+    """
+    from ...scheduler.jobs import import_prosopia_profile
+    from ..services import prosopia as prosopia_service
+    from ...db.repos import gather_runs as gather_runs_repo
+
     # Opened eagerly so the response can echo a real run_id even on the
     # inline path below.
     run_id = gather_runs_repo.start(
         db,
         profile_id=plan.profile_id,
-        user_id=int(user["id"]),
-        tier_used=TIER,
+        user_id=user_id,
+        tier_used=tier,
     )
 
     if openalex_client is not None:
@@ -144,7 +183,7 @@ def import_prosopia(
         except Exception as exc:  # noqa: BLE001 — mirror the job's audit write
             gather_runs_repo.finish(
                 db, run_id, n_fetched=0, n_new=0, n_redup=0,
-                tier_used=TIER, error=f"{type(exc).__name__}: {exc}",
+                tier_used=tier, error=f"{type(exc).__name__}: {exc}",
             )
             raise
         gather_runs_repo.finish(
@@ -152,7 +191,7 @@ def import_prosopia(
             n_fetched=result["drafted"],
             n_new=result["drafted"],
             n_redup=0,
-            tier_used=TIER,
+            tier_used=tier,
             result_json=json.dumps(result),
         )
         return ProsopiaImportStart(draft_slug=plan.draft_slug, run_id=run_id)
@@ -160,7 +199,7 @@ def import_prosopia(
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is None:
         gather_runs_repo.finish(
-            db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=TIER,
+            db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
             error="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
         )
         raise HTTPException(
@@ -173,11 +212,133 @@ def import_prosopia(
         run_date=datetime.now(tz=timezone.utc),
         args=[plan],
         kwargs={"run_id": run_id},
-        id=f"prosopia-import:{plan.profile_id}:{run_id}",
+        id=f"{tier}:{plan.profile_id}:{run_id}",
         replace_existing=False,
         max_instances=1,
     )
     return ProsopiaImportStart(draft_slug=plan.draft_slug, run_id=run_id)
+
+
+@router.get("/orcid/{orcid}/works", response_model=OrcidWorksResponse)
+def orcid_works(
+    orcid: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    openalex_client: Annotated[
+        object | None, Depends(get_import_openalex_client)
+    ] = None,
+) -> OrcidWorksResponse:
+    """The works OpenAlex attributes to an ORCID, for the user to pick from.
+
+    400 for something that is not an ORCID; 502 when OpenAlex could not
+    be read. An ORCID with no works is a 200 with an empty list and no
+    name — nothing is wrong, there is just nothing to import.
+    """
+    from ...openalex_client import OpenAlexClient
+    from ..services import orcid as orcid_service
+
+    oid = orcid_service.normalize_orcid(orcid)
+    if not oid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000)",
+        )
+    client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+    try:
+        listing = orcid_service.list_works(oid, client)
+    except Exception as exc:  # noqa: BLE001 — upstream trouble is a 502
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not read works for ORCID {oid} from OpenAlex: {exc}",
+        ) from exc
+    return OrcidWorksResponse(**listing)
+
+
+@router.post("/orcid", response_model=ProsopiaImportStart)
+def import_orcid(
+    body: OrcidImportRequest,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    openalex_client: Annotated[
+        object | None, Depends(get_import_openalex_client)
+    ] = None,
+) -> ProsopiaImportStart:
+    """Import the chosen works of an ORCID as a draft's seeds.
+
+    Same contract as the Prosopia kick-off: the draft exists when this
+    returns, the resolution + embedding runs under ``run_id``, and
+    ``GET /api/import/prosopia/{run_id}`` reports on it (the status route
+    reads any import run, whichever route started it). 400 for a bad
+    ORCID or an empty selection, 404 when none of the selected works are
+    the author's, 502 when OpenAlex could not be read.
+    """
+    from ..services import orcid as orcid_service
+
+    try:
+        plan = orcid_service.prepare_import(
+            db,
+            settings,
+            user_id=int(user["id"]),
+            orcid=body.orcid,
+            openalex_ids=body.openalex_ids,
+            name=body.name,
+            embedding_model=body.embedding_model,
+            openalex_client=openalex_client,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+        ) from exc
+    except orcid_service.WorksNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {exc}",
+        ) from exc
+
+    return _launch(request, db, settings, plan, user_id=int(user["id"]),
+                   tier=TIER_ORCID, openalex_client=openalex_client)
+
+
+@router.get("/prosopia/works", response_model=ProsopiaWorksResponse)
+def prosopia_works(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    ref: str = Query(..., description="Profile slug, profile URL or ORCID"),
+    base_url: str | None = Query(default=None),
+    prosopia_client: Annotated[object | None, Depends(get_prosopia_client)] = None,
+) -> ProsopiaWorksResponse:
+    """The papers on a Prosopia profile, for the user to pick from.
+
+    Read-only counterpart of the kick-off: same ref forms, same 400 /
+    404 / 502, nothing created. Declared before ``/prosopia/{run_id}``
+    so "works" is not parsed as a run id.
+    """
+    from ..services import prosopia as prosopia_service
+
+    try:
+        listing = prosopia_service.list_works(
+            ref, base_url=base_url or settings.RADAR_PROSOPIA_BASE_URL,
+            prosopia_client=prosopia_client,
+        )
+    except prosopia_service.ProfileNotFound as exc:
+        message = str(exc)
+        if ref.strip().lower() not in message.lower():
+            message = f"prosopia profile '{ref}' not found"
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message) from exc
+    except prosopia_service.ProsopiaError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not read prosopia profile '{ref}': {exc}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return ProsopiaWorksResponse(**listing)
 
 
 @router.get("/prosopia/{run_id}", response_model=ProsopiaImportStatus)

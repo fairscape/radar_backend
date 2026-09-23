@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     # fall back to the demo user (id=1). Production ``.env`` flips this on
     # so the API rejects unauthenticated traffic with 401.
     RADAR_REQUIRE_AUTH: bool = False
+    # Ceiling on how many candidates one gather may pull from OpenAlex
+    # (trial scan, scan-now, and the daily job alike). None = each caller's
+    # own default (1000 for the trial scan, 500 for scans). A CPU-only
+    # deployment embeds every candidate in-process, so this is the knob
+    # that bounds a scan's wall time.
+    RADAR_GATHER_MAX_CANDIDATES: int | None = None
 
     # UMLS concept extraction (Phase B+). On by default — it is part of the
     # upload path now, not an opt-in extra; the comment here said "disabled

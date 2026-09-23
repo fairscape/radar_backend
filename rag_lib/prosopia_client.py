@@ -22,8 +22,10 @@ all a seed corpus needs.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import requests
 import structlog
 from researcher_profiles import ResearcherProfile
 
@@ -32,6 +34,15 @@ log = structlog.get_logger("rag_lib.prosopia_client")
 
 
 DEFAULT_BASE_URL = "https://prosopia.databio.org"
+
+# 0000-0001-5643-4068 — four groups, last char may be X. Matched on the
+# whole string so a slug that merely contains digits is never mistaken.
+ORCID_RE = re.compile(r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$", re.IGNORECASE)
+
+
+def looks_like_orcid(value: str) -> bool:
+    """True for a bare ORCID iD (``0000-0001-5643-4068``)."""
+    return bool(ORCID_RE.match((value or "").strip()))
 
 
 class ProsopiaError(RuntimeError):
@@ -80,6 +91,33 @@ class ProsopiaClient:
             slug=slug, name=name, n_papers=len(papers), base_url=self.base_url,
         )
         return profile
+
+    def resolve_orcid(self, orcid: str) -> str:
+        """The slug of the profile whose researcher id is ``orcid``.
+
+        Prosopia has no lookup-by-ORCID route, but every entry in the
+        public profile list carries its ``rid``, which is the ORCID for
+        every profile published so far. One list read is cheap and the
+        list is short, so this scans it. Raises ``ProfileNotFound`` when
+        nobody with that ORCID has published a profile here.
+        """
+        want = orcid.strip().upper()
+        url = f"{self.base_url}/api/v1/profiles"
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            entries = resp.json().get("profiles") or []
+        except Exception as exc:  # noqa: BLE001
+            raise ProsopiaError(
+                f"could not list profiles at {self.base_url}: {exc}"
+            ) from exc
+        for entry in entries:
+            rid = str(entry.get("rid") or "").strip().upper()
+            slug = entry.get("slug")
+            if rid == want and slug:
+                log.info("prosopia.resolve_orcid", orcid=want, slug=slug)
+                return str(slug)
+        raise ProfileNotFound(f"no prosopia profile with ORCID '{want}'")
 
 
 def read_summary(profile: Any, paper_id: str) -> str:

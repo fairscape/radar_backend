@@ -390,6 +390,27 @@ def delete_draft(
     return {"ok": True}
 
 
+@router.delete("/draft/{slug}/seeds/{openalex_id}")
+def remove_draft_seed(
+    slug: str,
+    openalex_id: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    try:
+        removed = wizard_service.remove_draft_seed(
+            db, user_id=int(user["id"]), slug=slug, openalex_id=openalex_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"'{openalex_id}' is not a seed of draft '{slug}'",
+        )
+    return {"ok": True}
+
+
 @router.post("", response_model=Profile)
 def commit_draft(
     body: CommitDraftRequest,

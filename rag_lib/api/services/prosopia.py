@@ -59,8 +59,9 @@ from ...prosopia_client import (
     ProsopiaClient,
     ProsopiaError,
     read_summary,
+    looks_like_orcid,
 )
-from ...prosopia_seeds import RUNGS, prefetch_works, resolve_seed
+from ...prosopia_seeds import RUNGS, _paper_id, normalize_doi, prefetch_works, resolve_seed
 from . import wizard as wizard_service
 
 
@@ -70,12 +71,18 @@ log = structlog.get_logger("rag_lib.api.services.prosopia")
 __all__ = [
     "DEFAULT_BASE_URL",
     "ImportPlan",
+    "PapersNotFound",
     "ProfileNotFound",
     "ProsopiaError",
+    "list_works",
     "prepare_import",
     "run_import",
     "normalize_ref",
 ]
+
+
+class PapersNotFound(LookupError):
+    """None of the requested paper ids are on this profile."""
 
 
 # How often the per-paper loop writes a progress tick. Every paper would
@@ -106,24 +113,86 @@ class ImportPlan:
 
 
 def normalize_ref(raw: str) -> str:
-    """Accept a bare slug or the profile URL the user copied.
+    """Accept a bare slug, the profile URL the user copied, or an ORCID.
 
     ``https://prosopia.databio.org/sheffield-nathan`` and
-    ``.../api/v1/profiles/sheffield-nathan`` both reduce to the slug;
-    anything else is returned trimmed and left to 404 on its own.
+    ``.../api/v1/profiles/sheffield-nathan`` both reduce to the slug, and
+    ``https://orcid.org/0000-0001-5643-4068`` to the bare ORCID (which
+    :func:`prepare_import` then resolves to a slug); anything else is
+    returned trimmed and left to 404 on its own.
     """
     value = (raw or "").strip()
     if not value:
         return ""
-    if "://" in value:
+    from_url = "://" in value
+    if from_url:
         parts = value.split("://", 1)[1].split("/", 1)
         value = parts[1] if len(parts) > 1 else ""
     value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
     if not value:
         return ""
     segments = [p for p in value.split("/") if p]
-    # ``api/v1/profiles/<slug>`` and ``profiles/<slug>`` both end in it.
+    # ``api/v1/profiles/<slug>`` names the slug right after ``profiles``,
+    # and so does anything deeper that a user might copy, such as
+    # ``.../profiles/<slug>/content/profile.jsonld``. A site URL
+    # (``https://host/<slug>[/...]``) names it first. Only a bare value
+    # keeps the old last-segment reading.
+    if "profiles" in segments:
+        idx = segments.index("profiles")
+        if idx + 1 < len(segments):
+            return segments[idx + 1]
+    if from_url:
+        return segments[0]
     return segments[-1]
+
+
+def _resolve_profile(ref: str, base_url: str | None, prosopia_client: Any | None):
+    """``(slug, profile)`` for a ref, with the ORCID indirection applied."""
+    slug = normalize_ref(ref)
+    if not slug:
+        raise ValueError("ref must be a non-empty slug, profile URL or ORCID")
+
+    client = prosopia_client or ProsopiaClient(base_url or DEFAULT_BASE_URL)
+    # An ORCID (bare, or as an orcid.org URL, which normalize_ref has
+    # already reduced to the bare id) names a researcher, not a profile;
+    # the client turns it into the slug of the profile they published.
+    if looks_like_orcid(slug):
+        slug = client.resolve_orcid(slug)
+    return slug, client.fetch_profile(slug)
+
+
+def _work_summary(record: Any) -> dict[str, Any]:
+    authors = [a for a in (getattr(record, "authors", None) or []) if a]
+    return {
+        "id": _paper_id(record),
+        "title": (record.name or "").strip() or _paper_id(record),
+        "year": record.year,
+        "venue": record.journal or record.venue,
+        "doi": normalize_doi(record.doi),
+        "openalex_id": record.openalex_id or None,
+        "cited_by_count": getattr(record, "cited_by_count", None),
+        "authors": authors[:3],
+        "n_authors": len(authors) or None,
+    }
+
+
+def list_works(
+    ref: str,
+    *,
+    base_url: str | None = None,
+    prosopia_client: Any | None = None,
+) -> dict[str, Any]:
+    """The papers on a profile, slimmed for a pick list.
+
+    Same errors as :func:`prepare_import` (400 / 404 / 502 material),
+    but nothing is written: this is the read the wizard makes before the
+    user decides which papers to keep.
+    """
+    slug, profile = _resolve_profile(ref, base_url, prosopia_client)
+    works = [_work_summary(r) for r in profile.papers]
+    works.sort(key=lambda w: (-(w["year"] or 0), w["title"]))
+    log.info("prosopia.list_works", slug=slug, n=len(works))
+    return {"slug": slug, "name": profile.name or None, "works": works}
 
 
 def prepare_import(
@@ -136,19 +205,26 @@ def prepare_import(
     name: str | None = None,
     embedding_model: str | None = None,
     prosopia_client: Any | None = None,
+    paper_ids: list[str] | None = None,
 ) -> ImportPlan:
     """Read the profile and open the draft. Fast enough for a request.
 
-    Raises ``ValueError`` on an empty ref, ``ProfileNotFound`` when the
-    slug is unknown to the Prosopia instance, and ``ProsopiaError`` for
-    any other upstream failure; the router maps those to 400 / 404 / 502.
+    ``paper_ids`` (the ``id`` values from :func:`list_works`) keeps only
+    those papers; ``None`` imports the whole profile. Raises
+    ``ValueError`` on an empty ref, ``ProfileNotFound`` when the slug is
+    unknown to the Prosopia instance, :class:`PapersNotFound` when none
+    of ``paper_ids`` are on the profile, and ``ProsopiaError`` for any
+    other upstream failure; the router maps those to 400 / 404 / 502.
     """
-    slug = normalize_ref(ref)
-    if not slug:
-        raise ValueError("ref must be a non-empty slug or profile URL")
-
-    client = prosopia_client or ProsopiaClient(base_url or DEFAULT_BASE_URL)
-    profile = client.fetch_profile(slug)
+    slug, profile = _resolve_profile(ref, base_url, prosopia_client)
+    records = list(profile.papers)
+    if paper_ids is not None:
+        wanted = {(p or "").strip() for p in paper_ids if (p or "").strip()}
+        if not wanted:
+            raise ValueError("select at least one paper to import")
+        records = [r for r in records if _paper_id(r) in wanted]
+        if not records:
+            raise PapersNotFound(f"none of the selected papers are on profile '{slug}'")
 
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     draft = wizard_service.create_draft(
@@ -169,7 +245,7 @@ def prepare_import(
         profile_id=int(draft_row["id"]),
         user_id=user_id,
         embedding_model=model,
-        records=list(profile.papers),
+        records=records,
         profile=profile,
     )
 

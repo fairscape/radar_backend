@@ -288,6 +288,10 @@ def gather_for_profile(
     if settings is None:
         from ..api.settings import get_settings  # avoid circular at import time
         settings = get_settings()
+    # Deployment-wide ceiling on the fetch (RADAR_GATHER_MAX_CANDIDATES);
+    # the route's ``limit`` query param and the daily default both bow to it.
+    from ..api.services.wizard import capped_fetch_limit
+    limit = capped_fetch_limit(settings, limit)
 
     conn = connect(settings.RADAR_DB_PATH)
     try:
@@ -580,6 +584,10 @@ def import_prosopia_profile(
 
     conn = connect(settings.RADAR_DB_PATH)
     try:
+        # The kick-off route opened the row under the tier that says where
+        # the seeds come from (prosopia_import / orcid_import); keep it.
+        row = gather_runs_repo.get(conn, run_id)
+        tier = (row["tier_used"] if row is not None else None) or "prosopia_import"
         reporter = _ProgressReporter(conn, run_id)
         try:
             reporter.step(
@@ -594,7 +602,7 @@ def import_prosopia_profile(
                 n_fetched=result["drafted"],
                 n_new=result["drafted"],
                 n_redup=0,
-                tier_used="prosopia_import",
+                tier_used=tier,
                 result_json=json.dumps(result),
             )
             log.info(
@@ -608,7 +616,7 @@ def import_prosopia_profile(
             gather_runs_repo.finish(
                 conn, run_id,
                 n_fetched=0, n_new=0, n_redup=0,
-                tier_used="prosopia_import",
+                tier_used=tier,
                 error=f"{type(exc).__name__}: {exc}",
             )
             log.exception(

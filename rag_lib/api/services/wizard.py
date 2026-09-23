@@ -73,6 +73,14 @@ MAX_DRY_RUN_DAYS = 30
 DRY_RUN_FETCH_LIMIT = 1000
 
 
+def capped_fetch_limit(settings: Any, requested: int) -> int:
+    """``requested`` bounded by ``RADAR_GATHER_MAX_CANDIDATES`` when set."""
+    cap = getattr(settings, "RADAR_GATHER_MAX_CANDIDATES", None)
+    if cap is None or int(cap) <= 0:
+        return requested
+    return min(int(requested), int(cap))
+
+
 # ---------------------------------------------------------------------------
 # Step 0 — create draft
 # ---------------------------------------------------------------------------
@@ -372,16 +380,17 @@ def compute_dry_run_for_profile(
 
     gatherer = gatherer or OpenAlexGatherer(mailto=settings.RADAR_DEFAULT_MAILTO)
     since = _days_ago(days)
+    fetch_limit = capped_fetch_limit(settings, DRY_RUN_FETCH_LIMIT)
 
     log.info(
         "dry_run.openalex_query",
         slug=slug, days=days, since=since,
-        limit=DRY_RUN_FETCH_LIMIT,
+        limit=fetch_limit,
     )
 
     if reporter is not None:
         reporter.step("fetching", message="Querying OpenAlex")
-    candidates = gatherer.fetch(profile, since=since, limit=DRY_RUN_FETCH_LIMIT)
+    candidates = gatherer.fetch(profile, since=since, limit=fetch_limit)
     log.info(
         "dry_run.fetched",
         slug=slug, n=len(candidates),
@@ -559,6 +568,18 @@ def delete_draft(
         return False
     profiles_repo.delete(conn, int(row["id"]))
     return True
+
+
+def remove_draft_seed(
+    conn: sqlite3.Connection, *, user_id: int, slug: str, openalex_id: str
+) -> bool:
+    """Drop one seed from a draft, e.g. the off-topic half of the least-alike pair.
+
+    Raises ``LookupError`` when the draft doesn't exist; returns False
+    when the paper was not one of its seeds.
+    """
+    row = _require_draft(conn, user_id, slug)
+    return profiles_repo.detach_seed(conn, int(row["id"]), openalex_id) > 0
 
 
 # ---------------------------------------------------------------------------

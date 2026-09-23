@@ -152,9 +152,19 @@ class StubProsopia:
 
     def fetch_profile(self, slug):
         self.fetches += 1
+        self.last_slug = slug
         if self.error is not None:
             raise self.error
         return self.profile
+
+    # ORCID → slug, the way the real client scans the profile list.
+    orcids = {"0000-0001-5643-4068": "sheffield-nathan"}
+
+    def resolve_orcid(self, orcid):
+        try:
+            return self.orcids[orcid.upper()]
+        except KeyError as exc:
+            raise ProfileNotFound(f"no prosopia profile with ORCID '{orcid}'") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +466,7 @@ def _stub_openalex():
 
 def test_normalize_ref_accepts_slugs_and_urls():
     assert normalize_ref("sheffield-nathan") == "sheffield-nathan"
+    assert normalize_ref("https://orcid.org/0000-0001-5643-4068") == "0000-0001-5643-4068"
     assert normalize_ref(
         "https://prosopia.databio.org/sheffield-nathan"
     ) == "sheffield-nathan"
@@ -657,6 +668,22 @@ def test_import_honours_an_embedding_model_override(env):
         assert model == "placeholder-v1"
     finally:
         conn.close()
+
+
+def test_an_orcid_ref_resolves_to_the_profile_slug(env):
+    stub = StubProsopia(_stub_profile())
+    app = _app(stub, _stub_openalex())
+    resp = _start(app, ref="https://orcid.org/0000-0001-5643-4068")
+    assert resp.status_code == 200, resp.text
+    assert stub.last_slug == "sheffield-nathan"
+    assert resp.json()["draft_slug"] == "nathan-c-sheffield"
+
+
+def test_an_unknown_orcid_is_404_on_the_post(env):
+    app = _app(StubProsopia(_stub_profile()), _stub_openalex())
+    resp = _start(app, ref="0000-0002-0000-0000")
+    assert resp.status_code == 404, resp.text
+    assert "ORCID" in resp.json()["detail"]
 
 
 def test_unknown_profile_is_404_on_the_post(env):

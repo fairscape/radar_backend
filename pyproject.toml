@@ -44,6 +44,14 @@ phase1b = [
 llm-providers = [
     "pydantic-ai-slim[anthropic,openai]>=0.0.40",
 ]
+# UMLS concept extraction (rag_lib/umls). scispacy 0.6.2 caps Python at
+# <3.13 and numpy at <2.0; the sci-lg model is not on PyPI so it is a
+# direct URL. The container installs this extra; local dev may skip it
+# and run with RADAR_UMLS_ENABLED=false.
+umls = [
+    "scispacy==0.6.2",
+    "en_core_sci_lg @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz",
+]
 dev = [
     "pytest>=8.0",
 ]

@@ -53,3 +53,6 @@ env/
 # Model caches
 .cache/
 models/
+
+# Topic-index seed baked into the container (scripts/build_topic_index.py output)
+/umls_seed

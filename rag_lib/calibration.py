@@ -43,8 +43,13 @@ NULL_CROSS_FIELD_MEDIAN = 0.82
 COHERENCE_FOCUSED = 0.90
 COHERENCE_BROAD = 0.86
 # An interquartile range this wide means two groups, not one loose one:
-# the focused real sets had IQR 0.02–0.03, the mixed set 0.07.
-COHERENCE_SPREAD_MIXED = 0.05
+# the focused real sets had IQR 0.02–0.03, the mixed set 0.073. A real
+# five-paper set with median 0.934 (agreement 88) had IQR 0.058 and was
+# wrongly demoted at the earlier 0.05, so the gate sits at 0.07 and is
+# skipped altogether once agreement is 80+: that high a median is one
+# topic whatever the spread says.
+COHERENCE_SPREAD_MIXED = 0.07
+AGREEMENT_OVERRIDES_SPREAD = 80
 
 # Plain-language "agreement" score: 0 at cross-field noise, 100 at the
 # similarity of near-duplicate papers.
@@ -84,7 +89,10 @@ def coherence_label(median: float | None, iqr: float | None, n: int) -> Coherenc
         return "none"
     m = float(median)
     spread = float(iqr) if iqr is not None and np.isfinite(iqr) else 0.0
-    if m >= COHERENCE_FOCUSED and spread < COHERENCE_SPREAD_MIXED:
+    agreement = agreement_score(m) or 0
+    if m >= COHERENCE_FOCUSED and (
+        spread < COHERENCE_SPREAD_MIXED or agreement >= AGREEMENT_OVERRIDES_SPREAD
+    ):
         return "focused"
     if m >= COHERENCE_BROAD:
         return "broad"

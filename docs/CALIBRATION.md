@@ -48,7 +48,9 @@ not the cause of anything users noticed.
 ## What `rag_lib/calibration.py` does instead
 
 - **Coherence label** from the median: focused ≥ 0.90, broad ≥ 0.86,
-  otherwise mixed; an IQR ≥ 0.05 downgrades focused to broad. An
+  otherwise mixed; an IQR ≥ 0.07 downgrades focused to broad unless
+  agreement is 80 or more (a real 5-paper set at median 0.934 / IQR
+  0.058 was wrongly called broad at the earlier 0.05 gate). An
   **agreement** figure maps 0.82→0 and 0.95→100 for display.
 - **Seed similarity band**: each seed's leave-one-out cosine to the
   centroid of the others. Stored on the profile (`seed_sim_*`).
