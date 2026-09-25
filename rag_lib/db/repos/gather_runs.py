@@ -14,19 +14,22 @@ import sqlite3
 def start(
     conn: sqlite3.Connection,
     *,
-    profile_id: int,
+    profile_id: int | None,
     user_id: int,
     since_date: str | None = None,
     filter_string: str | None = None,
     tier_used: str | None = None,
+    researcher_id: int | None = None,
 ) -> int:
+    """Open a run row. A researcher import has no profile; a scan has no
+    researcher. At least one of the two should be set."""
     cur = conn.execute(
         """
         INSERT INTO gather_runs
-          (profile_id, user_id, since_date, filter_string, tier_used)
-        VALUES (?, ?, ?, ?, ?)
+          (profile_id, researcher_id, user_id, since_date, filter_string, tier_used)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (profile_id, user_id, since_date, filter_string, tier_used),
+        (profile_id, researcher_id, user_id, since_date, filter_string, tier_used),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -139,4 +142,18 @@ def recent_for_profile(
         LIMIT ?
         """,
         (profile_id, limit),
+    ).fetchall()
+
+
+def recent_for_researcher(
+    conn: sqlite3.Connection, researcher_id: int, limit: int = 20
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM gather_runs
+        WHERE researcher_id = ?
+        ORDER BY started_at DESC, id DESC
+        LIMIT ?
+        """,
+        (researcher_id, limit),
     ).fetchall()

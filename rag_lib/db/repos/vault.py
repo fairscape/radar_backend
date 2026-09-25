@@ -56,6 +56,13 @@ def list_for_user(
             WHERE p.uploaded_by_user_id = ?
                OR EXISTS (
                  SELECT 1
+                 FROM researcher_papers rp
+                 JOIN researchers r ON r.id = rp.researcher_id
+                 WHERE rp.openalex_id = p.openalex_id
+                   AND r.user_id = ?
+               )
+               OR EXISTS (
+                 SELECT 1
                  FROM profile_candidates pc
                  JOIN profiles pr ON pr.id = pc.profile_id
                  WHERE pc.openalex_id = p.openalex_id
@@ -64,7 +71,7 @@ def list_for_user(
                )
             ORDER BY p.first_seen_at DESC, p.openalex_id
             """,
-            (user_id, user_id),
+            (user_id, user_id, user_id),
         ).fetchall()
     return conn.execute(
         f"""
@@ -77,7 +84,16 @@ def list_for_user(
               WHERE ps.openalex_id = p.openalex_id
                 AND pr.user_id = ?
                 AND pr.slug = ?
-                AND p.uploaded_by_user_id = ?
+                AND (
+                  p.uploaded_by_user_id = ?
+                  OR EXISTS (
+                    SELECT 1
+                    FROM researcher_papers rp
+                    JOIN researchers r ON r.id = rp.researcher_id
+                    WHERE rp.openalex_id = p.openalex_id
+                      AND r.user_id = ?
+                  )
+                )
             )
            OR EXISTS (
               SELECT 1
@@ -90,7 +106,7 @@ def list_for_user(
             )
         ORDER BY p.first_seen_at DESC, p.openalex_id
         """,
-        (user_id, tag, user_id, user_id, tag),
+        (user_id, tag, user_id, user_id, user_id, tag),
     ).fetchall()
 
 

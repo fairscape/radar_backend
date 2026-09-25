@@ -107,6 +107,7 @@ def profile_row_to_profile(
     iqr = _col(row, "coherence_iqr")
     sim_min = _col(row, "seed_sim_min")
     sim_max = _col(row, "seed_sim_max")
+    researcher_id = _col(row, "researcher_id")
     return Profile(
         key=slug,
         name=row["name"],
@@ -122,6 +123,7 @@ def profile_row_to_profile(
         agreement=calibration.agreement_score(coh) if n_seed >= 2 else None,
         seedSimMin=float(sim_min) if sim_min is not None else None,
         seedSimMax=float(sim_max) if sim_max is not None else None,
+        researcherId=int(researcher_id) if researcher_id is not None else None,
     )
 
 

@@ -8,7 +8,7 @@ convert rows ↔ domain objects.
 
 from . import (
     users, profiles, papers, embeddings, candidates,
-    gather_runs, schedules, feedback, chat,
+    gather_runs, schedules, feedback, chat, researchers,
 )
 
 __all__ = [
@@ -21,4 +21,5 @@ __all__ = [
     "schedules",
     "feedback",
     "chat",
+    "researchers",
 ]

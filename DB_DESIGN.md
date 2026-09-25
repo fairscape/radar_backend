@@ -142,6 +142,60 @@ CREATE TABLE gather_runs (
 );
 ```
 
+## Researchers (migration 0016)
+
+A researcher is a stored person — a Prosopia profile or an ORCID — and
+the papers that came with them. It exists so the expensive part of an
+import (OpenAlex resolution, one embedding per paper) is paid once per
+person and any number of interests can be built from the result.
+
+```sql
+CREATE TABLE researchers (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source         TEXT    NOT NULL,            -- 'prosopia' | 'orcid'
+  key            TEXT    NOT NULL,            -- prosopia slug, or bare ORCID
+  base_url       TEXT, orcid TEXT, name TEXT NOT NULL, affiliation TEXT, url TEXT,
+  expertise      TEXT, soul TEXT, grants_json TEXT, document_json TEXT,
+  n_papers       INTEGER NOT NULL DEFAULT 0,
+  imported_at    TEXT, last_run_id INTEGER,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT,
+  UNIQUE (user_id, source, key)
+);
+
+CREATE TABLE researcher_papers (
+  researcher_id  INTEGER NOT NULL REFERENCES researchers(id) ON DELETE CASCADE,
+  openalex_id    TEXT    NOT NULL REFERENCES papers(openalex_id),
+  paper_id       TEXT,           -- the source's own id for the paper
+  resolved_by    TEXT,           -- work_id | doi | pmcid | title | none
+  summary        TEXT,
+  added_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (researcher_id, openalex_id)
+);
+
+ALTER TABLE profiles ADD COLUMN researcher_id INTEGER REFERENCES researchers(id) ON DELETE SET NULL;
+```
+
+Ownership is per user: the same profile imported by two users is two
+rows. Papers stay shared in `papers` / `paper_embeddings`; the vault
+listing treats a paper that came in with one of the user's researchers
+as theirs, the same as an upload.
+
+`gather_runs.profile_id` became nullable in the same migration and a
+`researcher_id` column was added, because a researcher import runs on
+the same job, progress row and status route as the wizard's imports but
+creates no draft. SQLite cannot relax NOT NULL in place, and foreign
+keys are on for every connection and cannot be turned off inside the
+migration transaction, so the table is rebuilt under
+`PRAGMA defer_foreign_keys = ON`: the DROP counts one deferred violation
+per `profile_candidates` row that references a run, and re-inserting
+the runs under their original ids counts each one back down before
+COMMIT. Row ids and the AUTOINCREMENT sequence survive.
+
+The wizard's own import routes (`/api/import/prosopia`, `/api/import/orcid`)
+record the researcher too and stamp the draft's `researcher_id`, so an
+interest built by import leaves the person behind for the next one.
+
 ## Dedup mechanics
 
 The whole point of the new layer. When a gather run fetches K papers:

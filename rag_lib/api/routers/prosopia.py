@@ -137,11 +137,11 @@ def import_prosopia(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
         ) from exc
 
-    return _launch(request, db, settings, plan, user_id=int(user["id"]),
-                   tier=TIER, openalex_client=openalex_client)
+    return launch_import(request, db, settings, plan, user_id=int(user["id"]),
+                         tier=TIER, openalex_client=openalex_client)
 
 
-def _launch(
+def launch_import(
     request: Request,
     db: sqlite3.Connection,
     settings: Settings,
@@ -153,23 +153,30 @@ def _launch(
 ) -> ProsopiaImportStart:
     """Open the run row and start the import job for ``plan``.
 
-    Shared by the Prosopia and ORCID kick-off routes: once a plan
-    exists the two are the same job (``run_import``), audited under a
-    different ``tier_used`` so the run history says where the seeds
-    came from.
+    Shared by the Prosopia, ORCID and researcher kick-off routes: once a
+    plan exists they are the same job (``run_import``), audited under a
+    different ``tier_used`` so the run history says where the papers
+    came from. ``draft_slug`` in the ack is null for a researcher
+    import, which creates no draft.
     """
     from ...scheduler.jobs import import_prosopia_profile
     from ..services import prosopia as prosopia_service
     from ...db.repos import gather_runs as gather_runs_repo
+    from ...db.repos import researchers as researchers_repo
 
     # Opened eagerly so the response can echo a real run_id even on the
     # inline path below.
     run_id = gather_runs_repo.start(
         db,
         profile_id=plan.profile_id,
+        researcher_id=plan.researcher_id,
         user_id=user_id,
         tier_used=tier,
     )
+    if plan.researcher_id is not None:
+        # Point the researcher at its run right away, so a listing made
+        # while the job is still resolving papers can say "importing".
+        researchers_repo.mark_imported(db, plan.researcher_id, run_id=run_id)
 
     if openalex_client is not None:
         # Test path: run synchronously with the injected client so tests
@@ -179,6 +186,7 @@ def _launch(
         try:
             result = prosopia_service.run_import(
                 db, settings, plan=plan, openalex_client=openalex_client,
+                run_id=run_id,
             )
         except Exception as exc:  # noqa: BLE001 — mirror the job's audit write
             gather_runs_repo.finish(
@@ -212,11 +220,15 @@ def _launch(
         run_date=datetime.now(tz=timezone.utc),
         args=[plan],
         kwargs={"run_id": run_id},
-        id=f"{tier}:{plan.profile_id}:{run_id}",
+        id=f"{tier}:{plan.profile_id or 0}:{plan.researcher_id or 0}:{run_id}",
         replace_existing=False,
         max_instances=1,
     )
     return ProsopiaImportStart(draft_slug=plan.draft_slug, run_id=run_id)
+
+
+# The old private name, for anything that imported it.
+_launch = launch_import
 
 
 @router.get("/orcid/{orcid}/works", response_model=OrcidWorksResponse)
@@ -301,8 +313,8 @@ def import_orcid(
             detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {exc}",
         ) from exc
 
-    return _launch(request, db, settings, plan, user_id=int(user["id"]),
-                   tier=TIER_ORCID, openalex_client=openalex_client)
+    return launch_import(request, db, settings, plan, user_id=int(user["id"]),
+                         tier=TIER_ORCID, openalex_client=openalex_client)
 
 
 @router.get("/prosopia/works", response_model=ProsopiaWorksResponse)
@@ -364,9 +376,14 @@ def import_prosopia_status(
             detail=f"import run {run_id} not found",
         )
     # Runs are addressed by a bare id, so ownership has to be checked
-    # against the profile rather than assumed from the URL.
-    profile = profiles_repo.get(db, int(row["profile_id"]))
-    if profile is None or int(profile["user_id"]) != int(user["id"]):
+    # against the profile rather than assumed from the URL. A researcher
+    # import has no profile; its run carries the user directly.
+    if row["profile_id"] is not None:
+        profile = profiles_repo.get(db, int(row["profile_id"]))
+        owner = int(profile["user_id"]) if profile is not None else None
+    else:
+        owner = int(row["user_id"]) if row["user_id"] is not None else None
+    if owner != int(user["id"]):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"import run {run_id} not found",
@@ -374,7 +391,8 @@ def import_prosopia_status(
 
     run = GatherRun(
         id=int(row["id"]),
-        profile_id=int(row["profile_id"]),
+        profile_id=int(row["profile_id"]) if row["profile_id"] is not None else None,
+        researcher_id=int(row["researcher_id"]) if row["researcher_id"] is not None else None,
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         since_date=row["since_date"],

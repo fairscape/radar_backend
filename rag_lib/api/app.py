@@ -22,7 +22,7 @@ from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
 
 from .logging import configure_logging
-from .routers import chat, health, profiles, prosopia, radar, users, vault
+from .routers import chat, health, profiles, prosopia, radar, researchers, users, vault
 from .settings import get_settings
 
 
@@ -166,6 +166,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
     app.include_router(users.router, prefix="/api/users", tags=["users"])
     app.include_router(prosopia.router, prefix="/api/import", tags=["import"])
+    app.include_router(researchers.router, prefix="/api/researchers", tags=["researchers"])
 
     # Top-level liveness for load-balancer / docker healthcheck use.
     @app.get("/health", include_in_schema=False)

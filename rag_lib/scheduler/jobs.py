@@ -595,7 +595,9 @@ def import_prosopia_profile(
                 total=len(plan.records),
                 message=f"Importing {len(plan.records)} works from '{plan.slug}'",
             )
-            result = run_import(conn, settings, plan=plan, reporter=reporter)
+            result = run_import(
+                conn, settings, plan=plan, reporter=reporter, run_id=run_id,
+            )
             reporter.step("persisting", message="Saving import result")
             gather_runs_repo.finish(
                 conn, run_id,

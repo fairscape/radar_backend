@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 
 from ...db.repos import profiles as profiles_repo
+from ...db.repos import researchers as researchers_repo
 from ...openalex_client import OpenAlexClient
 from ...prosopia_seeds import normalize_doi
 from . import wizard as wizard_service
@@ -46,6 +47,7 @@ __all__ = [
     "list_works",
     "normalize_orcid",
     "prepare_import",
+    "records_for",
 ]
 
 
@@ -186,23 +188,17 @@ def prepare_import(
 
     client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
     listing = list_works(oid, client)
-    chosen = [w for w in listing["works"] if w["openalex_id"] in wanted]
-    if not chosen:
+    records = records_for(listing, wanted)
+    if not records:
         raise WorksNotFound(f"none of the selected works are by ORCID {oid}")
 
-    records = [
-        WorkRecord(
-            paper_id=w["openalex_id"],
-            name=w["title"],
-            openalex_id=w["openalex_id"],
-            doi=w["doi"],
-            year=w["year"],
-            venue=w["venue"],
-        )
-        for w in chosen
-    ]
-
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    # Record the researcher too: the works embedded for this draft are
+    # then on hand for the next interest built from the same person.
+    from . import researchers as researchers_service
+    researcher_id = researchers_service.record_orcid_researcher(
+        conn, user_id=user_id, orcid=oid, name=listing["name"],
+    )
     draft_name = (name or listing["name"] or f"ORCID {oid}").strip()
     draft = wizard_service.create_draft(
         conn,
@@ -214,6 +210,7 @@ def prepare_import(
     draft_row = profiles_repo.get_by_slug(conn, user_id, draft["slug"])
     if draft_row is None:  # pragma: no cover — create_draft just wrote it
         raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
+    researchers_repo.set_profile_researcher(conn, int(draft_row["id"]), researcher_id)
 
     log.info(
         "orcid.prepare_import",
@@ -225,8 +222,28 @@ def prepare_import(
         draft_slug=draft["slug"],
         draft_name=draft["name"],
         profile_id=int(draft_row["id"]),
+        researcher_id=researcher_id,
         user_id=user_id,
         embedding_model=model,
         records=records,
         profile=None,
     )
+
+
+def records_for(listing: dict[str, Any], wanted: set[str] | None) -> list[WorkRecord]:
+    """The listing's works as ladder records; ``wanted`` narrows to a selection."""
+    chosen = [
+        w for w in listing["works"]
+        if wanted is None or w["openalex_id"] in wanted
+    ]
+    return [
+        WorkRecord(
+            paper_id=w["openalex_id"],
+            name=w["title"],
+            openalex_id=w["openalex_id"],
+            doi=w["doi"],
+            year=w["year"],
+            venue=w["venue"],
+        )
+        for w in chosen
+    ]

@@ -21,6 +21,8 @@ EXPECTED_TABLES = {
     "profile_schedules",
     "feedback_events",
     "chat_turns",
+    "researchers",
+    "researcher_papers",
 }
 
 
@@ -40,6 +42,7 @@ EXPECTED_VERSIONS = [
     "0013_reranker",
     "0014_candidate_source_topic",
     "0015_seed_similarity",
+    "0016_researchers",
 ]
 
 

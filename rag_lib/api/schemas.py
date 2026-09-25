@@ -68,6 +68,8 @@ class Profile(_Model):
     # candidate has to reach to be "as close as your own papers".
     seedSimMin: float | None = None
     seedSimMax: float | None = None
+    # The stored researcher this interest was built from, if any.
+    researcherId: int | None = None
 
 
 class Card(_Model):
@@ -295,7 +297,9 @@ class GatherRun(_Model):
     """One row from ``gather_runs`` shaped for API consumers."""
 
     id: int
-    profile_id: int
+    # Null for a researcher import, which has no profile.
+    profile_id: int | None = None
+    researcher_id: int | None = None
     started_at: str
     finished_at: str | None = None
     since_date: str | None = None
@@ -462,7 +466,8 @@ class ProsopiaImportStart(_Model):
     background under ``run_id``.
     """
 
-    draft_slug: str
+    # Null for a researcher import, which creates no draft.
+    draft_slug: str | None = None
     run_id: int
 
 
@@ -478,7 +483,10 @@ class ProsopiaImportResult(_Model):
     """
 
     slug: str
-    draft_slug: str
+    # Null for an import that targeted a researcher rather than a draft.
+    draft_slug: str | None = None
+    # The stored researcher the papers were recorded under, when any.
+    researcher_id: int | None = None
     name: str
     drafted: int
     resolved_by: dict[str, int] = Field(default_factory=dict)
@@ -495,6 +503,148 @@ class ProsopiaImportStatus(_Model):
 
     run: GatherRun
     result: ProsopiaImportResult | None = None
+
+
+# ---------------------------------------------------------------------------
+# Researchers — stored people and the papers that came with them
+# ---------------------------------------------------------------------------
+
+
+class Researcher(_Model):
+    """One stored person, as ``GET /api/researchers`` lists them."""
+
+    id: int
+    source: str                         # 'prosopia' | 'orcid'
+    key: str                            # prosopia slug or bare ORCID
+    name: str
+    orcid: str | None = None
+    affiliation: str | None = None
+    url: str | None = None
+    base_url: str | None = None
+    n_papers: int = 0
+    n_interests: int = 0
+    imported_at: str | None = None
+    last_run_id: int | None = None
+    # True while the last import is still running; poll it through
+    # ``GET /api/import/prosopia/{last_run_id}``.
+    importing: bool = False
+    last_error: str | None = None
+    created_at: str | None = None
+
+
+class ResearcherPaper(_Model):
+    """One of a researcher's papers. ``id`` is the OpenAlex id (or the
+    synthetic ``prosopia:`` id for a paper that resolved nowhere)."""
+
+    id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    abstract: str | None = None
+    resolved_by: str | None = None
+    summary: str | None = None
+    pdf_url: str | None = None
+    added_at: str | None = None
+
+
+class ResearcherDetail(_Model):
+    """``GET /api/researchers/{id}``: the person, what the source said
+    about them, their papers, and the interests built from them."""
+
+    researcher: Researcher
+    expertise: str | None = None
+    soul: str | None = None
+    grants: list[dict] = Field(default_factory=list)
+    papers: list[ResearcherPaper] = Field(default_factory=list)
+    interests: list[Profile] = Field(default_factory=list)
+
+
+class SuggestedInterest(_Model):
+    """One group of a researcher's papers that could be an interest."""
+
+    name: str
+    # Papers to seed with, most typical first; ``loose_ids`` are papers
+    # in the group that sit below the same-field floor — listed so the
+    # user can tick them, unticked by default.
+    paper_ids: list[str] = Field(default_factory=list)
+    loose_ids: list[str] = Field(default_factory=list)
+    topics: list[dict] = Field(default_factory=list)
+    coherence_median: float | None = None
+    agreement: int | None = None
+    label: str = "none"
+    seed_titles: list[str] = Field(default_factory=list)
+
+
+class ResearcherSuggestions(_Model):
+    """``GET /api/researchers/{id}/suggestions``: at most three groups.
+
+    ``note`` says why there is only one (too few papers, or no split
+    that was clearly better than the whole set).
+    """
+
+    researcher_id: int
+    embedding_model: str
+    n_papers: int
+    n_embedded: int
+    # Papers inside some suggestion; the rest did not belong clearly
+    # enough to any group and are left out on purpose.
+    n_grouped: int = 0
+    suggestions: list[SuggestedInterest] = Field(default_factory=list)
+    note: str | None = None
+
+
+class ResearcherImportRequest(_Model):
+    """Body of ``POST /api/researchers/import``.
+
+    ``source`` says how to read ``ref``: ``prosopia`` takes a slug, a
+    profile URL or an ORCID published there; ``orcid`` takes an ORCID
+    and reads the works off OpenAlex. ``paper_ids`` keeps a selection
+    (Prosopia paper ids, or OpenAlex work ids); omitted = everything.
+    Re-importing an existing researcher refreshes it in place.
+    """
+
+    source: str
+    ref: str
+    base_url: str | None = None
+    paper_ids: list[str] | None = None
+    embedding_model: str | None = None
+
+
+class ResearcherImportStart(_Model):
+    """The researcher row exists when this returns; the papers arrive
+    under ``run_id``, polled through ``GET /api/import/prosopia/{run_id}``."""
+
+    researcher_id: int
+    run_id: int
+
+
+class ResearcherInterestRequest(_Model):
+    """Body of ``POST /api/researchers/{id}/interests``: a draft named
+    ``name`` seeded with ``openalex_ids`` (omitted = every paper)."""
+
+    name: str
+    openalex_ids: list[str] | None = None
+    embedding_model: str | None = None
+
+
+class ResearcherInterestResponse(_Model):
+    draft: Draft
+    n_seeds: int
+
+
+class DraftSeedsRequest(_Model):
+    """Body of ``POST /api/profiles/draft/{slug}/seeds``: papers the user
+    already has (uploaded, or imported with a researcher) to attach as seeds."""
+
+    openalex_ids: list[str]
+
+
+class DraftSeedsResponse(_Model):
+    attached: int
+    # Ids that were not the user's to use; nothing was attached for these.
+    rejected: list[str] = Field(default_factory=list)
 
 
 class LeastSimilarPair(_Model):

@@ -24,6 +24,8 @@ from ..schemas import (
     DraftDryRun,
     DraftDryRunRequest,
     DraftDryRunStart,
+    DraftSeedsRequest,
+    DraftSeedsResponse,
     DraftDryRunStatus,
     DryRunResponse,
     FeedbackEventOut,
@@ -409,6 +411,33 @@ def remove_draft_seed(
             detail=f"'{openalex_id}' is not a seed of draft '{slug}'",
         )
     return {"ok": True}
+
+
+@router.post("/draft/{slug}/seeds", response_model=DraftSeedsResponse)
+def add_draft_seeds(
+    slug: str,
+    body: DraftSeedsRequest,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> DraftSeedsResponse:
+    """Attach papers the user already has as seeds of a draft.
+
+    The upload route attaches a PDF as it lands; this is the equivalent
+    for papers that are already in the vault — uploaded earlier, or
+    imported with a researcher. Nothing is embedded here. Ids the user
+    does not own come back in ``rejected``.
+    """
+    from ..services import researchers as researchers_service
+
+    try:
+        attached, rejected = researchers_service.attach_seeds(
+            db, user_id=int(user["id"]), slug=slug, openalex_ids=body.openalex_ids,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return DraftSeedsResponse(attached=attached, rejected=rejected)
 
 
 @router.post("", response_model=Profile)
