@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -475,6 +476,39 @@ def test_normalize_ref_accepts_slugs_and_urls():
         "https://prosopia.databio.org/api/v1/profiles/sheffield-nathan/"
     ) == "sheffield-nathan"
     assert normalize_ref("  ") == ""
+
+
+DOC_URL = (
+    "https://prosopia.databio.org/api/v1/profiles/sheffield-nathan/"
+    "content/profile.jsonld"
+)
+
+
+@pytest.mark.parametrize("raw", [
+    "https://prosopia.databio.org/manage/sheffield-nathan",
+    "https://prosopia.databio.org/manage/sheffield-nathan/view",
+    "https://prosopia.databio.org/manage/sheffield-nathan/view/soul",
+    "https://prosopia.databio.org/manage/sheffield-nathan/edit",
+    "prosopia.databio.org/manage/sheffield-nathan/privacy",
+    "https://prosopia.databio.org/privacy?profile=sheffield-nathan",
+    "https://prosopia.databio.org/p?u=" + quote(DOC_URL, safe=""),
+    DOC_URL,
+    "https://prosopia.databio.org/api/v1/profiles/sheffield-nathan/profile.jsonld",
+])
+def test_normalize_ref_extracts_the_slug_from_prosopia_urls(raw):
+    assert normalize_ref(raw) == "sheffield-nathan"
+
+
+@pytest.mark.parametrize("raw", [
+    "https://prosopia.databio.org/privacy",
+    "https://prosopia.databio.org/p",
+])
+def test_normalize_ref_is_empty_for_pages_naming_no_profile(raw):
+    assert normalize_ref(raw) == ""
+
+
+def test_normalize_ref_keeps_a_rid():
+    assert normalize_ref("0000-0001-5643-4068") == "0000-0001-5643-4068"
 
 
 @pytest.fixture()

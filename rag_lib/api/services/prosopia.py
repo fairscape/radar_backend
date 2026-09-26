@@ -43,6 +43,7 @@ from ..schemas import MAX_NAME
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import structlog
 
@@ -127,37 +128,72 @@ class ImportPlan:
 
 
 def normalize_ref(raw: str) -> str:
-    """Accept a bare slug, the profile URL the user copied, or an ORCID.
+    """Accept a bare slug, any Prosopia URL the user copied, or an ORCID.
 
-    ``https://prosopia.databio.org/sheffield-nathan`` and
-    ``.../api/v1/profiles/sheffield-nathan`` both reduce to the slug, and
-    ``https://orcid.org/0000-0001-5643-4068`` to the bare ORCID (which
-    :func:`prepare_import` then resolves to a slug); anything else is
-    returned trimmed and left to 404 on its own.
+    All of these reduce to ``sheffield-nathan``:
+
+    - ``sheffield-nathan`` (a bare slug; a rid works the same way)
+    - ``https://prosopia.databio.org/sheffield-nathan[/...]`` (a site URL
+      names the slug first)
+    - ``https://prosopia.databio.org/manage/sheffield-nathan/view`` (any
+      ``/manage/<slug>/...`` page, with or without the scheme)
+    - ``https://prosopia.databio.org/privacy?profile=sheffield-nathan``
+    - ``https://prosopia.databio.org/p?u=<encoded document URL>`` (the
+      public profile page, whose ``u`` is the document URL below)
+    - ``.../api/v1/profiles/sheffield-nathan[/content/profile.jsonld]``
+      (the slug right after ``profiles``, however deep the URL goes)
+
+    ``https://orcid.org/0000-0001-5643-4068`` reduces to the bare ORCID,
+    which :func:`prepare_import` then resolves to a slug. A known page
+    that names no profile (``/privacy``, ``/p`` without ``u``) reduces to
+    ``""``; anything else is returned trimmed and left to 404 on its own.
     """
     value = (raw or "").strip()
     if not value:
         return ""
     from_url = "://" in value
-    if from_url:
-        parts = value.split("://", 1)[1].split("/", 1)
-        value = parts[1] if len(parts) > 1 else ""
-    value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
-    if not value:
+    if not from_url and "/" not in value and "?" not in value:
+        return unquote(value)
+    if not from_url:
+        first = value.lstrip("/").split("/", 1)[0]
+        # ``prosopia.databio.org/manage/x`` (a host) vs ``/manage/x``.
+        if "." in first:
+            value, from_url = f"https://{value}", True
+        else:
+            value = f"https://host/{value.lstrip('/')}"
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    if query.get("profile"):
+        return query["profile"][0].strip()
+    if query.get("u"):
+        inner = _slug_named_in([unquote(p) for p in urlparse(query["u"][0]).path.split("/") if p])
+        if inner:
+            return inner
+    segments = [unquote(p) for p in parsed.path.split("/") if p]
+    if not segments:
         return ""
-    segments = [p for p in value.split("/") if p]
-    # ``api/v1/profiles/<slug>`` names the slug right after ``profiles``,
-    # and so does anything deeper that a user might copy, such as
-    # ``.../profiles/<slug>/content/profile.jsonld``. A site URL
-    # (``https://host/<slug>[/...]``) names it first. Only a bare value
-    # keeps the old last-segment reading.
+    named = _slug_named_in(segments)
+    if named:
+        return named
+    if len(segments) == 1 and segments[0] in _NON_PROFILE_PAGES:
+        return ""
+    return segments[0] if from_url else segments[-1]
+
+
+# SPA pages that name no profile by themselves.
+_NON_PROFILE_PAGES = {"p", "privacy", "manage", "me", "account", "lenses", "admin"}
+
+
+def _slug_named_in(segments: list[str]) -> str:
+    """The slug a path names outright: ``manage/<slug>/...``, or the
+    segment after ``profiles`` (``api/v1/profiles/<slug>/...``)."""
+    if len(segments) >= 2 and segments[0] == "manage":
+        return segments[1]
     if "profiles" in segments:
         idx = segments.index("profiles")
         if idx + 1 < len(segments):
             return segments[idx + 1]
-    if from_url:
-        return segments[0]
-    return segments[-1]
+    return ""
 
 
 def _resolve_profile(ref: str, base_url: str | None, prosopia_client: Any | None):
