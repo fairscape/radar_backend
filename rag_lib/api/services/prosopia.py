@@ -41,6 +41,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import structlog
 
@@ -106,23 +107,60 @@ class ImportPlan:
 
 
 def normalize_ref(raw: str) -> str:
-    """Accept a bare slug or the profile URL the user copied.
+    """Accept a bare slug or any Prosopia URL the user copied.
 
-    ``https://prosopia.databio.org/sheffield-nathan`` and
-    ``.../api/v1/profiles/sheffield-nathan`` both reduce to the slug;
-    anything else is returned trimmed and left to 404 on its own.
+    All of these reduce to ``sheffield-nathan``:
+
+    - ``sheffield-nathan`` (a bare slug; a rid works the same way)
+    - ``https://prosopia.databio.org/manage/sheffield-nathan/view``
+      (any ``/manage/<slug>/...`` page)
+    - ``https://prosopia.databio.org/privacy?profile=sheffield-nathan``
+    - ``https://prosopia.databio.org/p?u=<encoded document URL>`` (the
+      public profile page, whose ``u`` is the document URL below)
+    - ``.../api/v1/profiles/sheffield-nathan/content/profile.jsonld``
+      and ``.../api/v1/profiles/sheffield-nathan``
+
+    A URL whose path is a single segment (``https://host/<slug>``) is
+    taken as that slug. Anything else is returned as its last path
+    segment and left to 404 on its own; a known page that names no
+    profile (``/privacy``, ``/p`` without ``u``) reduces to ``""``.
     """
     value = (raw or "").strip()
     if not value:
         return ""
-    if "://" in value:
-        parts = value.split("://", 1)[1].split("/", 1)
-        value = parts[1] if len(parts) > 1 else ""
-    value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
-    if not value:
+    if "://" not in value and "/" not in value and "?" not in value:
+        return unquote(value)
+    if "://" not in value:
+        first = value.lstrip("/").split("/", 1)[0]
+        # ``prosopia.databio.org/manage/x`` (a host) vs ``/manage/x``.
+        value = f"https://{value}" if "." in first else f"https://host/{value.lstrip('/')}"
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    if query.get("profile"):
+        return query["profile"][0].strip()
+    if query.get("u"):
+        inner = _slug_from_path(urlparse(query["u"][0]).path)
+        if inner:
+            return inner
+    return _slug_from_path(parsed.path, fallback=True)
+
+
+# SPA pages that name no profile by themselves.
+_NON_PROFILE_PAGES = {"p", "privacy", "manage", "me", "account", "lenses", "admin"}
+
+
+def _slug_from_path(path: str, *, fallback: bool = False) -> str:
+    segments = [unquote(p) for p in path.split("/") if p]
+    if len(segments) >= 2 and segments[0] == "manage":
+        return segments[1]
+    if len(segments) >= 4 and segments[:3] == ["api", "v1", "profiles"]:
+        return segments[3]
+    if len(segments) >= 2 and segments[0] == "profiles":
+        return segments[1]
+    if not fallback or not segments:
         return ""
-    segments = [p for p in value.split("/") if p]
-    # ``api/v1/profiles/<slug>`` and ``profiles/<slug>`` both end in it.
+    if len(segments) == 1 and segments[0] in _NON_PROFILE_PAGES:
+        return ""
     return segments[-1]
 
 
