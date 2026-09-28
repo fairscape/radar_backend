@@ -88,7 +88,26 @@ def profile_row_to_profile(
         saves30=saves30,
         dismisses30=dismisses30,
         isDraft=bool(row["is_draft"]),
+        rp_meta=_decode_rp_meta(row),
     )
+
+
+def _decode_rp_meta(row: sqlite3.Row) -> dict | None:
+    """``profiles.rp_meta_json`` as a dict; None when absent or unreadable.
+
+    ``row.keys()`` guards rows selected before migration 0016 (tests that
+    build a Row by hand) — a missing column reads as "no profile metadata".
+    """
+    if "rp_meta_json" not in row.keys():
+        return None
+    raw = row["rp_meta_json"]
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _decode_topics(topics_json: str | None) -> dict[str, Any]:

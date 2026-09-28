@@ -538,4 +538,250 @@ def dry_run_for_draft(
         conn.close()
 
 
-__all__ = ["gather_for_profile", "dry_run_for_draft"]
+def import_orcid_for_draft(
+    user_id: int,
+    profile_id: int,
+    slug: str,
+    *,
+    orcid: str,
+    name: str,
+    mailto: str,
+    settings: Any | None = None,
+    run_id: int,
+) -> int | None:
+    """Async body for the wizard's "From ORCID" seeding step.
+
+    Same shape as :func:`dry_run_for_draft`: own connection, progress
+    through ``_ProgressReporter`` (steps ``fetch_author`` → ``fetch_works``
+    → ``embedding`` → ``attach_seeds`` → ``topics`` → ``write_rp``), and
+    the serialized ``OrcidImportResult`` stashed in ``result_json`` for the
+    status-poll endpoint. Any failure lands on the run row as ``error``.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+
+    from ..api.services import orcid_import
+    from ..openalex_client import OpenAlexClient
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        profile_row = profiles_repo.get(conn, profile_id)
+        if profile_row is None:
+            log.error("orcid_import.profile_missing", profile_id=profile_id)
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import",
+                error=f"profile {profile_id} not found at dispatch time",
+            )
+            return run_id
+
+        reporter = _ProgressReporter(conn, run_id)
+        client = OpenAlexClient(mailto=mailto)
+        try:
+            result = orcid_import.run_fetch(
+                conn, settings,
+                user_id=user_id, profile_id=profile_id, slug=slug,
+                orcid=orcid, name=name, client=client, reporter=reporter,
+            )
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=result.n_fetched,
+                n_new=result.n_works,
+                n_redup=0,
+                api_calls=client.api_calls,
+                tier_used="orcid_import",
+                result_json=result.model_dump_json(),
+            )
+            log.info(
+                "orcid_import.ok",
+                profile_id=profile_id, run_id=run_id,
+                n_kept=result.n_kept, n_seeds=result.n_seeds,
+            )
+            return run_id
+        except orcid_import.ImportAborted as exc:
+            # The draft is gone (deleted/committed); the run row may be
+            # gone with it (CASCADE). finish() then updates zero rows.
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import",
+                error=str(exc),
+            )
+            log.info("orcid_import.aborted", profile_id=profile_id, run_id=run_id)
+            return run_id
+        except Exception as exc:  # noqa: BLE001 — surface into audit row
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                api_calls=client.api_calls,
+                tier_used="orcid_import",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception(
+                "orcid_import.failed",
+                profile_id=profile_id, run_id=run_id,
+            )
+            return run_id
+    finally:
+        conn.close()
+
+
+
+
+def import_profile_for_draft(
+    user_id: int,
+    profile_id: int,
+    slug: str,
+    *,
+    profile_meta: dict,
+    name: str,
+    mailto: str,
+    settings: Any | None = None,
+    run_id: int,
+) -> int | None:
+    """Async body for the wizard's "From Profile" seeding step.
+
+    The parsed profile travels as ``profile_meta`` (the dict the route
+    stored on ``profiles.rp_meta_json``); the job rebuilds the
+    :class:`RpProfile` from it and runs the ORCID pipeline followed by the
+    profile's expertise / not_interests signal. Same run-row bookkeeping
+    as :func:`import_orcid_for_draft`.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+
+    from ..api.services import orcid_import, rp_profile_import
+    from ..openalex_client import OpenAlexClient
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        profile_row = profiles_repo.get(conn, profile_id)
+        if profile_row is None:
+            log.error("rp_import.profile_missing", profile_id=profile_id)
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import",
+                error=f"profile {profile_id} not found at dispatch time",
+            )
+            return run_id
+
+        profile = rp_profile_import.RpProfile(
+            name=profile_meta.get("name") or name,
+            orcid=profile_meta.get("orcid"),
+            rid=profile_meta.get("rid"),
+            openalex_author_id=profile_meta.get("openalex_author_id"),
+            level=profile_meta.get("level"),
+            provenance=profile_meta.get("provenance"),
+            date_modified=profile_meta.get("date_modified"),
+            affiliation=profile_meta.get("affiliation"),
+            field=profile_meta.get("field"),
+            summary=profile_meta.get("summary"),
+            expertise=list(profile_meta.get("expertise") or []),
+            not_interests=list(profile_meta.get("not_interests") or []),
+            collaborators=list(profile_meta.get("collaborators") or []),
+            same_as=list(profile_meta.get("same_as") or []),
+            paper_stats=profile_meta.get("paper_stats"),
+            warnings=list(profile_meta.get("warnings") or []),
+        )
+        reporter = _ProgressReporter(conn, run_id)
+        client = OpenAlexClient(mailto=mailto)
+        try:
+            result = rp_profile_import.run_profile_fetch(
+                conn, settings,
+                user_id=user_id, profile_id=profile_id, slug=slug,
+                profile=profile, name=name, client=client, reporter=reporter,
+            )
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=result.n_fetched, n_new=result.n_works, n_redup=0,
+                api_calls=client.api_calls, tier_used="orcid_import",
+                result_json=result.model_dump_json(),
+            )
+            log.info("rp_import.ok", profile_id=profile_id, run_id=run_id,
+                     n_kept=result.n_kept, n_seeds=result.n_seeds)
+            return run_id
+        except orcid_import.ImportAborted as exc:
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import", error=str(exc),
+            )
+            log.info("rp_import.aborted", profile_id=profile_id, run_id=run_id)
+            return run_id
+        except Exception as exc:  # noqa: BLE001 — surface into audit row
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                api_calls=client.api_calls, tier_used="orcid_import",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception("rp_import.failed", profile_id=profile_id, run_id=run_id)
+            return run_id
+    finally:
+        conn.close()
+
+
+def seed_orcid_draft(
+    user_id: int,
+    profile_id: int,
+    slug: str,
+    *,
+    selected_ids: list[str],
+    settings: Any | None = None,
+    run_id: int,
+) -> int | None:
+    """Async body for phase B of an ORCID / profile import: the user's seed choice.
+
+    Steps ``embedding`` (ticked) → ``attach_seeds`` → ``topics`` →
+    (``rp_signals`` for profile-seeded drafts) → ``write_rp``. Bookkeeping
+    as in :func:`import_orcid_for_draft`, tier ``orcid_seed``.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+
+    from ..api.services import orcid_import, rp_profile_import
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        profile_row = profiles_repo.get(conn, profile_id)
+        if profile_row is None:
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_seed", error=f"profile {profile_id} not found at dispatch time",
+            )
+            return run_id
+        reporter = _ProgressReporter(conn, run_id)
+        try:
+            result = orcid_import.run_seed(
+                conn, settings, user_id=user_id, profile_id=profile_id, slug=slug,
+                selected_ids=selected_ids, reporter=reporter,
+                after_topics=rp_profile_import.after_topics_hook(conn, profile_id),
+            )
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=result.n_works, n_new=result.n_seeds, n_redup=0,
+                tier_used="orcid_seed", result_json=result.model_dump_json(),
+            )
+            log.info("orcid_seed.ok", profile_id=profile_id, run_id=run_id, n_seeds=result.n_seeds)
+            return run_id
+        except orcid_import.ImportAborted as exc:
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_seed", error=str(exc),
+            )
+            log.info("orcid_seed.aborted", profile_id=profile_id, run_id=run_id)
+            return run_id
+        except Exception as exc:  # noqa: BLE001 — surface into audit row
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_seed", error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception("orcid_seed.failed", profile_id=profile_id, run_id=run_id)
+            return run_id
+    finally:
+        conn.close()
+
+
+__all__ = ["gather_for_profile", "dry_run_for_draft", "import_orcid_for_draft",
+           "import_profile_for_draft", "seed_orcid_draft"]

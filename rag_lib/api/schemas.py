@@ -55,6 +55,9 @@ class Profile(_Model):
     saves30: int
     dismisses30: int
     isDraft: bool = False
+    #: Researcher Profile metadata when the topic was seeded "From Profile"
+    #: (summary, affiliation, expertise, not_interests, collaborators, …)
+    rp_meta: dict | None = None
 
 
 class Card(_Model):
@@ -87,6 +90,9 @@ class VaultDoc(_Model):
     pages: int
     chunks: int
     added: str
+    # Seeds imported from OpenAlex have no PDF (pages=0); the wizard shows
+    # the year instead.
+    year: int | None = None
 
 
 class Seed(_Model):
@@ -103,6 +109,11 @@ class Topic(_Model):
     count: int
     on: bool
     source: str | None = None
+    #: ORCID profiles only: how many seed papers carry this topic (drives the default ``on``)
+    seed_papers: int | None = None
+    #: "From Profile" imports: which expertise / not_interests phrases switched it on / off
+    rp_on_by: list[str] | None = None
+    rp_off_by: list[str] | None = None
 
 
 class SweepRow(_Model):
@@ -283,6 +294,9 @@ class GatherRun(_Model):
     n_processed: int | None = None
     n_total: int | None = None
     last_message: str | None = None
+    # When the job last wrote progress; the wizard uses it to tell a slow
+    # step from a job that died with a server restart.
+    progress_updated_at: str | None = None
 
 
 class GatherNowResponse(_Model):
@@ -324,6 +338,28 @@ class Draft(_Model):
 
     slug: str
     name: str
+
+
+class DraftSummary(_Model):
+    """One row of ``GET /api/profiles/drafts`` — an unfinished wizard draft."""
+
+    slug: str
+    name: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    n_seeds: int = 0
+    orcid: str | None = None
+    researcher_name: str | None = None
+    #: an ORCID import job is still running for this draft
+    importing: bool = False
+    #: latest ORCID import run for this draft (to resume polling / show its result)
+    import_run_id: int | None = None
+    #: seeded from a Researcher Profile document
+    rp: bool = False
+    #: fetched works waiting in the seed picker (ORCID / profile drafts)
+    n_works: int = 0
+    #: ORCID / profile drafts: fetching | selecting | seeding | seeded; None for PDF drafts
+    phase: str | None = None
 
 
 class DraftCreateRequest(_Model):
@@ -419,6 +455,171 @@ class WizardOptions(_Model):
 
     embedders: list[WizardOption] = Field(default_factory=list)
     selectors: list[WizardOption] = Field(default_factory=list)
+
+
+class OrcidDraftCreateRequest(_Model):
+    """Body of ``POST /api/profiles/draft/from-orcid``.
+
+    ``orcid`` accepts the bare id or the ``https://orcid.org/…`` URL; it
+    is normalised and check-digit validated by the route. ``name``
+    defaults to OpenAlex's display name for the author. ``mailto`` joins
+    the OpenAlex polite pool (defaults to the user's email).
+    """
+
+    orcid: str
+    name: str | None = None
+    mailto: str | None = None
+    embedding_model: str | None = None
+    selector: str | None = None
+
+
+class OrcidDraftStart(_Model):
+    """Kickoff response: the draft handle plus the run to poll."""
+
+    slug: str
+    name: str
+    run_id: int
+
+
+class OrcidAuthor(_Model):
+    orcid: str
+    openalex_author_id: str | None = None
+    display_name: str
+    institution: str | None = None
+
+
+class OrcidImportResult(_Model):
+    """``result_json`` of an ``orcid_import`` (phase "fetch") or ``orcid_seed``
+    (phase "seed") gather_runs row."""
+
+    phase: str = "seed"
+    n_fetched: int
+    n_kept: int
+    #: works offered to the seed picker / what the default rule pre-checks
+    n_works: int = 0
+    n_default_seeds: int = 0
+    n_seeds: int
+    n_embedded: int
+    author: OrcidAuthor
+    rp_profile_dir: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    report: dict[str, int] = Field(default_factory=dict)
+    #: "From Profile" imports only: what the profile's expertise /
+    #: not_interests did to the concept list (see rp_profile_import)
+    rp: dict | None = None
+
+
+class OrcidWork(_Model):
+    """One fetched work of an ORCID / profile draft, as the seed picker shows it."""
+
+    openalex_id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    first_author: str | None = None
+    position: str | None = None
+    is_corresponding: bool = False
+    author_index: int | None = None
+    total_authors: int | None = None
+    work_type: str | None = None
+    cited_by_count: int = 0
+    #: the person's ORCID record lists it (None: registry unavailable)
+    claimed: bool | None = None
+    #: datasets cannot be seeds
+    seed_eligible: bool = True
+    #: openalex_id of the copy the default rule keeps when this is a duplicate version
+    dup_of: str | None = None
+    has_abstract: bool = False
+    #: what the default rule pre-checks
+    default_selected: bool = False
+    #: the user's last confirmed choice (None before any confirmation)
+    selected: bool | None = None
+    is_seed: bool = False
+
+
+class SeedSelectRequest(_Model):
+    """Body of ``POST /api/profiles/draft/{slug}/seeds/select``."""
+
+    openalex_ids: list[str]
+
+
+class ResearcherSummary(_Model):
+    """One row of the user's Researchers library (``GET /api/researchers``)."""
+
+    id: int
+    rid: str
+    orcid: str | None = None
+    name: str
+    affiliation: str | None = None
+    field: str | None = None
+    level: str | None = None
+    provenance: str | None = None
+    date_modified: str | None = None
+    source_kind: str = "paste"
+    imported_at: str | None = None
+    updated_at: str | None = None
+    n_expertise: int = 0
+    n_not_interests: int = 0
+    n_papers: int | None = None
+
+
+class ResearcherDetail(ResearcherSummary):
+    """``GET /api/researchers/{id}``: the parsed view plus the raw document."""
+
+    parsed: dict = Field(default_factory=dict)
+    doc: dict = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ResearcherImportRequest(_Model):
+    """Body of ``POST /api/researchers``: the text of a profile.jsonld."""
+
+    profile_json: str
+    source_kind: str = "paste"
+
+
+class ResearcherImportResult(_Model):
+    researcher: ResearcherSummary
+    created: bool
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RpDraftCreateRequest(_Model):
+    """Body of ``POST /api/profiles/draft/from-profile``.
+
+    ``profile_json`` is the text of a Researcher Profile ``profile.jsonld``
+    (pasted or read from a file client-side). ``name`` defaults to the
+    profile's ``name``. ``mailto`` joins the OpenAlex polite pool.
+    """
+
+    profile_json: str
+    name: str | None = None
+    mailto: str | None = None
+
+
+class RpDraftStart(_Model):
+    """Kickoff response for a profile import.
+
+    ``mode`` is ``"orcid"`` when the profile carries an ORCID and the
+    OpenAlex import was dispatched (poll ``run_id``), or ``"pdf"`` when it
+    does not: the draft exists with the profile's metadata attached and
+    the user uploads PDFs as seeds (``run_id`` is null).
+    """
+
+    slug: str
+    name: str
+    mode: str
+    run_id: int | None = None
+    orcid: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class OrcidImportStatus(_Model):
+    """Status-poll response for ``GET /api/profiles/draft/{slug}/import/{run_id}``."""
+
+    run: GatherRun
+    result: OrcidImportResult | None = None
 
 
 class CommitDraftRequest(_Model):

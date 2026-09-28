@@ -80,6 +80,45 @@ def list_for_user(
     ).fetchall()
 
 
+def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
+    """The user's unfinished wizard drafts, newest first, with a seed count
+    and whether an ORCID import is still running for them.
+
+    This is what lets a draft survive a cleared browser: the wizard asks
+    here on entry and offers to resume or discard each one.
+    """
+    return conn.execute(
+        """
+        SELECT p.id, p.slug, p.name, p.orcid, p.researcher_name,
+               p.created_at, p.updated_at,
+               (SELECT COUNT(*) FROM profile_seeds s WHERE s.profile_id = p.id) AS n_seeds,
+               EXISTS (
+                 SELECT 1 FROM gather_runs g
+                 WHERE g.profile_id = p.id AND g.tier_used IN ('orcid_import', 'orcid_seed')
+                   AND g.finished_at IS NULL
+               ) AS importing,
+               (SELECT MAX(g.id) FROM gather_runs g
+                 WHERE g.profile_id = p.id AND g.tier_used = 'orcid_import') AS import_run_id,
+               (p.rp_meta_json IS NOT NULL) AS rp,
+               (SELECT COUNT(*) FROM orcid_works w WHERE w.profile_id = p.id) AS n_works,
+               CASE
+                 WHEN p.orcid IS NULL AND p.rp_meta_json IS NULL THEN NULL
+                 WHEN EXISTS (SELECT 1 FROM gather_runs g WHERE g.profile_id = p.id
+                              AND g.tier_used = 'orcid_import' AND g.finished_at IS NULL) THEN 'fetching'
+                 WHEN EXISTS (SELECT 1 FROM gather_runs g WHERE g.profile_id = p.id
+                              AND g.tier_used = 'orcid_seed' AND g.finished_at IS NULL) THEN 'seeding'
+                 WHEN EXISTS (SELECT 1 FROM profile_seeds s WHERE s.profile_id = p.id) THEN 'seeded'
+                 WHEN EXISTS (SELECT 1 FROM orcid_works w WHERE w.profile_id = p.id) THEN 'selecting'
+                 ELSE 'fetching'
+               END AS phase
+        FROM profiles p
+        WHERE p.user_id = ? AND p.is_draft = 1
+        ORDER BY p.id DESC
+        """,
+        (user_id,),
+    ).fetchall()
+
+
 def create_draft(
     conn: sqlite3.Connection,
     *,
@@ -321,3 +360,22 @@ def coherence_bins(
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     hist, _ = np.histogram(np.clip(cos, 0.0, 1.0), bins=edges)
     return [int(c) for c in hist]
+
+
+def set_orcid(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    *,
+    orcid: str,
+    researcher_name: str | None,
+) -> None:
+    """Record the ORCID (and OpenAlex display name) a draft was seeded from."""
+    conn.execute(
+        """
+        UPDATE profiles
+           SET orcid = ?, researcher_name = ?, updated_at = datetime('now')
+         WHERE id = ?
+        """,
+        (orcid, researcher_name, profile_id),
+    )
+    conn.commit()

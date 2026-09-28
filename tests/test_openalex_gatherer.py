@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from rag_lib.gatherers.openalex import OpenAlexGatherer
+from rag_lib.gatherers.openalex import OpenAlexGatherer, junk_reason
 from rag_lib.paper import Paper
 from rag_lib.profile import Profile
 from tests.fake_openalex_client import FakeOpenAlexClient, canned_openalex_work
@@ -508,3 +508,66 @@ def test_min_results_is_the_target_when_no_limit_is_given():
     papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
 
     assert len(papers) == 50
+
+
+# --------------------------------------------------------------------------- junk filter
+
+
+def _canned(title, *, oid, abstract=True, **kw):
+    return canned_openalex_work(
+        doi=f"10.x/{oid}", openalex_id=oid, title=title,
+        abstract_words=["an", "abstract"] if abstract else None, **kw,
+    )
+
+
+@pytest.mark.parametrize("title", [
+    "Occurrence download data",
+    "occurrence download",
+    "Additional file 3 of Some paper title",
+    "Supplementary Material for a study",
+    "Supplementary data",
+    "Supporting Information",
+    "Data from: Wolves and elk",
+    "Figure 2 from a figshare deposit",
+    "Table S1",
+    "Erratum: something",
+    "Correction to: something",
+    "Corrigendum",
+    "",
+])
+def test_junk_reason_flags_non_paper_titles(title):
+    assert junk_reason(_canned(title, oid="W1")) == "junk_title"
+
+
+@pytest.mark.parametrize("title", [
+    "Additional evidence for a role of X in Y",
+    "Supplementary motor area activation in Parkinson's disease",
+    "Corrections for multiple testing in GWAS",
+    "Data from wearables predicts sleep quality",
+    "Figures of merit for transcriptome assembly",
+])
+def test_junk_reason_keeps_real_titles(title):
+    assert junk_reason(_canned(title, oid="W1")) is None
+
+
+def test_junk_reason_no_abstract_is_configurable():
+    w = _canned("A perfectly good paper", oid="W1", abstract=False)
+    assert junk_reason(w) == "no_abstract"
+    assert junk_reason(w, require_abstract=False) is None
+
+
+def test_fetch_drops_junk_and_abstractless_works_by_default():
+    client = FakeOpenAlexClient(search_results=[
+        _canned("Occurrence download data", oid="WX1"),
+        _canned("A real paper with an abstract", oid="WX2"),
+        _canned("A real paper without an abstract", oid="WX3", abstract=False),
+    ])
+    g = OpenAlexGatherer(mailto="test@example.com", client=client)
+    papers = g.fetch(_profile_with_filters(), since="2026-01-01")
+    assert [p.openalex_id for p in papers] == ["WX2"]
+    assert g.last_dropped == {"junk_title": 1, "no_abstract": 1}
+    assert g.diagnostics()["last_dropped"] == {"junk_title": 1, "no_abstract": 1}
+
+    g2 = OpenAlexGatherer(mailto="test@example.com", client=client, require_abstract=False)
+    assert [p.openalex_id for p in g2.fetch(_profile_with_filters(), since="2026-01-01")] == ["WX2", "WX3"]
+    assert OpenAlexGatherer.from_config(g2.config()).require_abstract is False

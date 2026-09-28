@@ -1,0 +1,210 @@
+{
+  "@context": "https://profiles.databio.org/context/v1.jsonld",
+  "@id": "https://orcid.org/0000-0001-5643-4068",
+  "@type": "Person",
+  "conformsTo": "https://profiles.databio.org/context/v1.jsonld",
+  "name": "Nathan C. Sheffield",
+  "rid": "0000-0001-5643-4068",
+  "provenance": "self_published",
+  "license": "https://creativecommons.org/licenses/by/4.0/",
+  "dateModified": "2026-09-05T00:44:39+00:00",
+  "visibility": "public",
+  "hasCitationGraph": true,
+  "hasEmbeddingIndex": true,
+  "expertiseCitesPaperIds": true,
+  "level": "full",
+  "affiliation": "University of Virginia",
+  "field": "Computational Biology",
+  "summary": "Nathan Sheffield is a computational biologist who develops methods and standards for analyzing genomic region data, particularly chromatin accessibility and DNA methylation. His lab creates infrastructure for reproducible genomics including sample metadata standards (PEP), reference genome management (refgenie), and analysis pipelines (PEPATAC, PEPPRO), with recent emphasis on AI-readiness of biomedical data.",
+  "sameAs": [
+    "https://scholar.google.com/citations?user=DwYCmoIAAAAJ"
+  ],
+  "identifier": [
+    {
+      "@type": "PropertyValue",
+      "propertyID": "openalex",
+      "value": "A5055872618"
+    }
+  ],
+  "training": [
+    {
+      "field": null,
+      "advisor": "Gregory Wray",
+      "degree": "PhD",
+      "institution": "Duke University",
+      "kind": "degree",
+      "year_end": 2013,
+      "year_start": null
+    },
+    {
+      "field": null,
+      "advisor": "Christoph Bock",
+      "degree": "Postdoc",
+      "institution": "CeMM Research Center for Molecular Medicine",
+      "kind": "postdoc",
+      "year_end": 2016,
+      "year_start": null
+    }
+  ],
+  "career": [
+    {
+      "role": "Director of Graduate Studies, Computational Biology PhD",
+      "end_year": null,
+      "institution": "University of Virginia",
+      "start_year": 2024
+    },
+    {
+      "role": "Associate Professor, Genome Sciences",
+      "end_year": null,
+      "institution": "University of Virginia",
+      "start_year": 2022
+    },
+    {
+      "role": "Assistant Professor, Center for Public Health Genomics",
+      "end_year": 2022,
+      "institution": "University of Virginia",
+      "start_year": 2016
+    }
+  ],
+  "expertise": [
+    "chromatin-accessibility-analysis",
+    "atac-seq-pipelines",
+    "dna-methylation-analysis",
+    "genomic-region-set-analysis",
+    "sample-metadata-standardization",
+    "reference-genome-management",
+    "bioinformatics-pipeline-development",
+    "vector-embeddings-for-genomics",
+    "epigenetic-heterogeneity-quantification"
+  ],
+  "not_interests": [
+    "phylogenomics",
+    "insect-evolutionary-biology",
+    "population-genetics",
+    "wet-lab-protocol-development"
+  ],
+  "collaborators": [
+    "Jason P. Smith",
+    "John T. Lawson",
+    "Michal Stolarczyk",
+    "Oleksandr Khoroshevskyi",
+    "Erfaneh Gharavi",
+    "Christoph Bock",
+    "Artur Jarosz"
+  ],
+  "paper_stats": {
+    "corresponding": 29,
+    "first": 12,
+    "last": 27,
+    "middle": 40,
+    "total": 83,
+    "unknown": 4,
+    "year_max": 2025,
+    "year_min": 2008
+  },
+  "hasPart": [
+    {
+      "@type": "DigitalDocument",
+      "name": "Profile page",
+      "visibility": "public",
+      "role": "html",
+      "encodingFormat": "text/html",
+      "contentUrl": "index.html",
+      "bytes": 63852,
+      "sha256": "35f80e1e5a9254211e8223f882914c2399ec81cdfbba989c53ba1ec43bc394c6"
+    },
+    {
+      "@type": "Collection",
+      "name": "Works",
+      "visibility": "public",
+      "role": "works",
+      "encodingFormat": "application/ld+json",
+      "contentUrl": "sources/papers.jsonld",
+      "bytes": 68996,
+      "sha256": "ebd444b7c65e84dd02864063e29fc7ba7867542839ff304b6a82e9a01f2490f0"
+    },
+    {
+      "@type": "DigitalDocument",
+      "name": "Citations",
+      "visibility": "public",
+      "role": "citations",
+      "encodingFormat": "application/json",
+      "contentUrl": "sources/citations.json",
+      "bytes": 15569,
+      "sha256": "a955891cdf15c6e16f5c3f13100e0433200c42af89acfb9e10634bc43c8f6588"
+    },
+    {
+      "@type": "DigitalDocument",
+      "name": "Summary: bock2016multi",
+      "visibility": "public",
+      "role": "paper_summary",
+      "paperId": "bock2016multi",
+      "encodingFormat": "text/markdown",
+      "contentUrl": "sources/summaries/bock2016multi.summary.md",
+      "bytes": 362,
+      "sha256": "8e260c9c051e7d9561a6ff1c98c2de38c16cfd0541ca7062f2dca1fcb9cf62e5"
+    },
+    {
+      "@type": "DigitalDocument",
+      "name": "Summary: campbell2025taming",
+      "visibility": "public",
+      "role": "paper_summary",
+      "paperId": "campbell2025taming",
+      "encodingFormat": "text/markdown",
+      "contentUrl": "sources/summaries/campbell2025taming.summary.md",
+      "bytes": 359,
+      "sha256": "76d9803e04491ab062252436665c625017b5cdebb40f23d38d423a655c1957e8"
+    },
+    {
+      "@type": "DigitalDocument",
+      "name": "Full text: clark2024ai",
+      "visibility": "restricted",
+      "role": "paper_fulltext",
+      "paperId": "clark2024ai",
+      "encodingFormat": "text/markdown",
+      "contentUrl": "sources/papers/clark2024ai.md",
+      "bytes": 67837,
+      "sha256": "38d0d890f73f1e0979fe7105e33860c01ee69378fce78e664799b3eec56209fa"
+    }
+  ],
+  "subjectOf": [
+    {
+      "@type": "DigitalDocument",
+      "name": "SOUL",
+      "visibility": "public",
+      "role": "soul",
+      "encodingFormat": "text/markdown",
+      "contentUrl": "personality/SOUL.md",
+      "bytes": 7081,
+      "sha256": "d3134cb99050423578f3e9c4d9c87be98421d828c2f6274ff4f1a8c93666a415"
+    },
+    {
+      "@type": "DigitalDocument",
+      "name": "Expertise",
+      "visibility": "public",
+      "role": "expertise",
+      "encodingFormat": "text/markdown",
+      "contentUrl": "personality/expertise.md",
+      "bytes": 6936,
+      "sha256": "c58f01c39c1f936693845b857f7e3dc54f63a2642838107c746b53779cf6e930"
+    }
+  ],
+  "career_stage": {
+    "as_of": "2026-08-06",
+    "clinical_training_end_year": null,
+    "confidence": "medium",
+    "current_rank": "associate_professor",
+    "evidence": "Derived mechanically from this profile's own training[] and career[] entries; no other source was opened. Used terminal degree from training[] PhD (Duke University, 2013). Used earliest faculty/PI-titled career[] entry Assistant Professor, Center for Public Health Genomics (University of Virginia, 2016-2022). Used held career[] entry Associate Professor, Genome Sciences (University of Virginia, 2022-present).",
+    "first_independent_appointment_year": 2016,
+    "first_r01_equivalent_year": null,
+    "independence": "independent",
+    "notes": "No grant records were collected for this profile (no sources/grants.jsonld), so 'grants' is absent from sources_checked and the null first_r01_equivalent_year means grant history was never consulted -- the absence of an R01-equivalent award is unconfirmed, not established. tenure_status is 'unknown' because tenure was never recorded and must not be inferred from rank.",
+    "sources_checked": [
+      "training",
+      "employment"
+    ],
+    "tenure_status": "unknown",
+    "terminal_degree_type": "research",
+    "terminal_degree_year": 2013
+  }
+}

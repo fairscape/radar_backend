@@ -16,8 +16,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from datetime import datetime, timezone
 
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
+from ...db.repos import profiles as profiles_repo
 from ..schemas import (
     CommitDraftRequest,
+    OrcidDraftCreateRequest,
+    OrcidDraftStart,
+    OrcidImportResult,
+    OrcidImportStatus,
+    VaultDoc,
     Draft,
     DraftCoherence,
     DraftCreateRequest,
@@ -42,7 +48,13 @@ from ..schemas import (
     TopicYieldResponse,
     WizardOption,
     WizardOptions,
+    DraftSummary,
+    RpDraftCreateRequest,
+    RpDraftStart,
+    OrcidWork,
+    SeedSelectRequest,
 )
+from ..services import orcid_import, rp_profile_import
 from ..services import profiles as profiles_service
 from ..services import wizard as wizard_service
 from ..settings import Settings
@@ -58,6 +70,41 @@ def get_wizard_gatherer():
     ``app.dependency_overrides`` to inject a FixtureGatherer.
     """
     return None
+
+
+def get_orcid_client():
+    """OpenAlex client dependency for the "From ORCID" path.
+
+    ``None`` by default: the route builds a real ``OpenAlexClient`` and
+    dispatches the import to the scheduler. Tests inject a
+    ``FakeOpenAlexClient`` here, which also switches the route to run the
+    import inline (same convention as ``get_wizard_gatherer``).
+    """
+    return None
+
+
+def _gather_run_from_row(row) -> GatherRun:
+    return GatherRun(
+        id=int(row["id"]),
+        profile_id=int(row["profile_id"]),
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        since_date=row["since_date"],
+        filter_string=row["filter_string"],
+        tier_used=row["tier_used"],
+        n_fetched=row["n_fetched"],
+        n_new=row["n_new"],
+        n_redup=row["n_redup"],
+        api_calls=row["api_calls"],
+        error=row["error"],
+        current_step=row["current_step"],
+        n_processed=row["n_processed"],
+        n_total=row["n_total"],
+        last_message=row["last_message"],
+        progress_updated_at=(
+            row["progress_updated_at"] if "progress_updated_at" in row.keys() else None
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +180,35 @@ def get_wizard_options(
     )
 
 
+@router.get("/drafts", response_model=list[DraftSummary])
+def list_drafts(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[DraftSummary]:
+    """The current user's unfinished wizard drafts, newest first.
+
+    Declared before ``/{key}`` so the literal path wins. The wizard calls
+    this on entry when it has no local draft, so a draft left in another
+    browser (or after site data was cleared) can be resumed or discarded
+    instead of accumulating invisibly.
+    """
+    rows = profiles_repo.list_drafts_for_user(db, int(user["id"]))
+    return [
+        DraftSummary(
+            slug=r["slug"], name=r["name"],
+            created_at=r["created_at"], updated_at=r["updated_at"],
+            n_seeds=int(r["n_seeds"] or 0),
+            orcid=r["orcid"], researcher_name=r["researcher_name"],
+            importing=bool(r["importing"]),
+            import_run_id=r["import_run_id"],
+            rp=bool(r["rp"]),
+            n_works=int(r["n_works"] or 0),
+            phase=r["phase"],
+        )
+        for r in rows
+    ]
+
+
 @router.post("/draft", response_model=Draft)
 def create_draft(
     body: DraftCreateRequest,
@@ -206,8 +282,424 @@ def draft_topics(
             count=int(entry.get("count") or 0),
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            seed_papers=entry.get("seed_papers"),
+            rp_on_by=entry.get("rp_on_by") or None,
+            rp_off_by=entry.get("rp_off_by") or None,
         ))
     return out
+
+
+@router.post("/draft/from-orcid", response_model=OrcidDraftStart)
+def create_draft_from_orcid(
+    body: OrcidDraftCreateRequest,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    client: Annotated[object | None, Depends(get_orcid_client)] = None,
+) -> OrcidDraftStart:
+    """Create a draft seeded from a researcher's OpenAlex works.
+
+    Resolves the author synchronously (one fast call) so an unknown ORCID
+    is a clean 404 with no draft created, then creates the draft and
+    dispatches the fetch/embed/seed work to the scheduler. Poll
+    ``GET /api/profiles/draft/{slug}/import/{run_id}``.
+    """
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.db.repos import profiles as profiles_repo
+    from rag_lib.scheduler.jobs import _resolve_mailto, import_orcid_for_draft
+
+    try:
+        orcid = orcid_import.normalize_orcid(body.orcid)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        ) from exc
+    user_id = int(user["id"])
+
+    inline = client is not None
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if not inline and scheduler is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
+        )
+
+    inflight = orcid_import.find_inflight_import(db, user_id, orcid)
+    if inflight is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"an import of ORCID {orcid} is already running",
+                "slug": inflight["slug"],
+                "run_id": int(inflight["run_id"]),
+            },
+        )
+
+    mailto = body.mailto or _resolve_mailto(user, settings.RADAR_DEFAULT_MAILTO)
+    if client is None:
+        from rag_lib.openalex_client import OpenAlexClient
+        client = OpenAlexClient(mailto=mailto)
+    try:
+        author = orcid_import.resolve_author(client, orcid)
+    except RuntimeError as exc:  # OpenAlex 429 after retries
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
+        ) from exc
+    if author is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ORCID {orcid} not found on OpenAlex",
+        )
+
+    name = (body.name or author.display_name or "").strip()
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OpenAlex has no display name for this ORCID; supply `name`",
+        )
+    # The embedder the job will use MUST be the model recorded on the
+    # draft: the wizard joins paper_embeddings on that string.
+    embedding_model = body.embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    selector_name = body.selector or settings.RADAR_DEFAULT_SELECTOR
+    try:
+        draft = wizard_service.create_draft(
+            db, user_id=user_id, name=name,
+            embedding_model=embedding_model, selector=selector_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+        ) from exc
+    slug = draft["slug"]
+    profile_row = profiles_repo.get_by_slug(db, user_id, slug)
+    profile_id = int(profile_row["id"])
+    profiles_repo.set_orcid(
+        db, profile_id, orcid=orcid, researcher_name=author.display_name or None,
+    )
+
+    run_id = gather_runs_repo.start(
+        db, profile_id=profile_id, user_id=user_id, tier_used="orcid_import",
+    )
+
+    if inline:
+        # Test path: run synchronously with the injected client. Domain
+        # errors are recorded on the run row exactly as the job would.
+        try:
+            result = orcid_import.run_fetch(
+                db, settings,
+                user_id=user_id, profile_id=profile_id, slug=slug,
+                orcid=orcid, name=name, client=client, author=author,
+            )
+            gather_runs_repo.finish(
+                db, run_id,
+                n_fetched=result.n_fetched, n_new=result.n_seeds, n_redup=0,
+                api_calls=getattr(client, "api_calls", None),
+                tier_used="orcid_import",
+                result_json=result.model_dump_json(),
+            )
+        except (LookupError, ValueError, RuntimeError) as exc:
+            gather_runs_repo.finish(
+                db, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return OrcidDraftStart(slug=slug, name=draft["name"], run_id=run_id)
+
+    scheduler.add_job(
+        import_orcid_for_draft,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc),
+        args=[user_id, profile_id, slug],
+        kwargs={"run_id": run_id, "orcid": orcid, "name": name, "mailto": mailto},
+        id=f"orcid-import:{profile_id}:{run_id}",
+        replace_existing=False,
+        max_instances=1,
+    )
+    return OrcidDraftStart(slug=slug, name=draft["name"], run_id=run_id)
+
+
+@router.post("/draft/from-profile", response_model=RpDraftStart)
+def create_draft_from_profile(
+    body: RpDraftCreateRequest,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    client: Annotated[object | None, Depends(get_orcid_client)] = None,
+) -> RpDraftStart:
+    """Create a draft from a Researcher Profile ``profile.jsonld``.
+
+    With an ORCID the profile rides the "From ORCID" import (the same job,
+    status endpoint and seeds endpoint), and the profile's expertise /
+    not_interests are applied to the concept list at the end. Without one
+    the draft is created with the profile's metadata attached and the
+    user uploads PDFs as seeds; the signal is applied at Step 3.
+    """
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.db.repos import profiles as profiles_repo
+    from rag_lib.scheduler.jobs import _resolve_mailto, import_profile_for_draft
+
+    try:
+        profile = rp_profile_import.parse_profile(body.profile_json)
+    except rp_profile_import.RpProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        ) from exc
+    user_id = int(user["id"])
+    name = (body.name or profile.name).strip()
+
+    inline = client is not None
+    scheduler = getattr(request.app.state, "scheduler", None)
+    orcid = profile.orcid
+    if orcid is not None and not inline and scheduler is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
+        )
+
+    author = None
+    mailto = body.mailto or _resolve_mailto(user, settings.RADAR_DEFAULT_MAILTO)
+    if orcid is not None:
+        inflight = orcid_import.find_inflight_import(db, user_id, orcid)
+        if inflight is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": f"an import of ORCID {orcid} is already running",
+                    "slug": inflight["slug"],
+                    "run_id": int(inflight["run_id"]),
+                },
+            )
+        if client is None:
+            from rag_lib.openalex_client import OpenAlexClient
+            client = OpenAlexClient(mailto=mailto)
+        try:
+            author = rp_profile_import.resolve_author_for_profile(client, profile)
+        except RuntimeError as exc:  # OpenAlex 429 after retries
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
+            ) from exc
+        if author is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"ORCID {orcid} (from the profile) not found on OpenAlex",
+            )
+
+    try:
+        draft = wizard_service.create_draft(
+            db, user_id=user_id, name=name,
+            embedding_model=settings.RADAR_DEFAULT_EMBEDDING_MODEL,
+            selector=settings.RADAR_DEFAULT_SELECTOR,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+        ) from exc
+    slug = draft["slug"]
+    profile_row = profiles_repo.get_by_slug(db, user_id, slug)
+    profile_id = int(profile_row["id"])
+    rp_profile_import.persist_meta(db, profile_id, profile.meta(), researcher_name=profile.name)
+
+    if orcid is None:
+        warnings = list(profile.warnings) + [
+            "profile has no ORCID: upload PDFs as seeds; its expertise and "
+            "not-interests will shape the concept list at Step 3"
+        ]
+        return RpDraftStart(slug=slug, name=draft["name"], mode="pdf", run_id=None,
+                            orcid=None, warnings=warnings)
+
+    profiles_repo.set_orcid(
+        db, profile_id, orcid=orcid, researcher_name=profile.name,
+    )
+    run_id = gather_runs_repo.start(
+        db, profile_id=profile_id, user_id=user_id, tier_used="orcid_import",
+    )
+
+    if inline:
+        try:
+            result = rp_profile_import.run_profile_fetch(
+                db, settings,
+                user_id=user_id, profile_id=profile_id, slug=slug,
+                profile=profile, name=name, client=client, author=author,
+            )
+            gather_runs_repo.finish(
+                db, run_id,
+                n_fetched=result.n_fetched, n_new=result.n_seeds, n_redup=0,
+                api_calls=getattr(client, "api_calls", None),
+                tier_used="orcid_import",
+                result_json=result.model_dump_json(),
+            )
+        except (LookupError, ValueError, RuntimeError) as exc:
+            gather_runs_repo.finish(
+                db, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_import",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return RpDraftStart(slug=slug, name=draft["name"], mode="orcid", run_id=run_id,
+                            orcid=orcid, warnings=list(profile.warnings))
+
+    scheduler.add_job(
+        import_profile_for_draft,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc),
+        args=[user_id, profile_id, slug],
+        kwargs={"run_id": run_id, "profile_meta": {**profile.meta(), "warnings": list(profile.warnings)},
+                "name": name, "mailto": mailto},
+        id=f"rp-import:{profile_id}:{run_id}",
+        replace_existing=False,
+        max_instances=1,
+    )
+    return RpDraftStart(slug=slug, name=draft["name"], mode="orcid", run_id=run_id,
+                        orcid=orcid, warnings=list(profile.warnings))
+
+
+@router.get("/draft/{slug}/works", response_model=list[OrcidWork])
+def list_draft_works(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[OrcidWork]:
+    """The works an ORCID / profile import fetched for this draft — the seed picker's rows."""
+    try:
+        row = wizard_service._require_draft(db, int(user["id"]), slug)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return [OrcidWork(**w) for w in orcid_import.works_for_draft(db, int(row["id"]))]
+
+
+@router.post("/draft/{slug}/seeds/select", response_model=OrcidDraftStart)
+def select_draft_seeds(
+    slug: str,
+    body: SeedSelectRequest,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    client: Annotated[object | None, Depends(get_orcid_client)] = None,
+) -> OrcidDraftStart:
+    """Confirm which fetched works become the seeds (phase B of the import).
+
+    Embeds the chosen works, attaches them (replacing any earlier choice),
+    aggregates the concept list from them, and — for profile-seeded
+    drafts — applies the profile's expertise / not_interests. Poll
+    ``GET /api/profiles/draft/{slug}/import/{run_id}``.
+    """
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.scheduler.jobs import seed_orcid_draft
+
+    user_id = int(user["id"])
+    try:
+        row = wizard_service._require_draft(db, user_id, slug)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    profile_id = int(row["id"])
+
+    ids = [i.strip() for i in body.openalex_ids if isinstance(i, str) and i.strip()]
+    if not ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="select at least one work")
+    known = {w["openalex_id"]: w for w in orcid_import.works_for_draft(db, profile_id)}
+    if not known:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="this draft has no fetched works to choose from")
+    bad = [i for i in ids if i not in known]
+    if bad:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"{len(bad)} id(s) are not fetched works of this draft: {bad[:3]}")
+    ineligible = [i for i in ids if not known[i]["seed_eligible"]]
+    if ineligible:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"{len(ineligible)} work(s) cannot be seeds (datasets): {ineligible[:3]}")
+    if orcid_import.has_unfinished_import(db, profile_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="an import phase is still running for this draft")
+
+    inline = client is not None
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if not inline and scheduler is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
+        )
+    run_id = gather_runs_repo.start(db, profile_id=profile_id, user_id=user_id, tier_used="orcid_seed")
+    if inline:
+        try:
+            result = orcid_import.run_seed(
+                db, settings, user_id=user_id, profile_id=profile_id, slug=slug,
+                selected_ids=ids, after_topics=rp_profile_import.after_topics_hook(db, profile_id),
+            )
+            gather_runs_repo.finish(
+                db, run_id, n_fetched=result.n_works, n_new=result.n_seeds, n_redup=0,
+                tier_used="orcid_seed", result_json=result.model_dump_json(),
+            )
+        except (LookupError, ValueError, RuntimeError) as exc:
+            gather_runs_repo.finish(
+                db, run_id, n_fetched=0, n_new=0, n_redup=0,
+                tier_used="orcid_seed", error=f"{type(exc).__name__}: {exc}",
+            )
+        return OrcidDraftStart(slug=slug, name=row["name"], run_id=run_id)
+
+    scheduler.add_job(
+        seed_orcid_draft,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc),
+        args=[user_id, profile_id, slug],
+        kwargs={"run_id": run_id, "selected_ids": ids},
+        id=f"orcid-seed:{profile_id}:{run_id}",
+        replace_existing=False,
+        max_instances=1,
+    )
+    return OrcidDraftStart(slug=slug, name=row["name"], run_id=run_id)
+
+
+@router.get("/draft/{slug}/import/{run_id}", response_model=OrcidImportStatus)
+def draft_import_status(
+    slug: str,
+    run_id: int,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> OrcidImportStatus:
+    """Progress + result of one ORCID import (mirrors the dry-run poll)."""
+    import json
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    try:
+        profile_row = wizard_service._require_draft(db, int(user["id"]), slug)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    row = gather_runs_repo.get(db, run_id)
+    if row is None or int(row["profile_id"]) != int(profile_row["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"import {run_id} not found for draft '{slug}'",
+        )
+    result: OrcidImportResult | None = None
+    if row["finished_at"] and not row["error"] and row["result_json"]:
+        try:
+            result = OrcidImportResult.model_validate(json.loads(row["result_json"]))
+        except (ValueError, TypeError):
+            result = None
+    return OrcidImportStatus(run=_gather_run_from_row(row), result=result)
+
+
+@router.get("/draft/{slug}/seeds", response_model=list[VaultDoc])
+def list_draft_seeds(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[VaultDoc]:
+    """Seeds attached to a draft (or profile), whoever uploaded them."""
+    try:
+        rows = wizard_service.list_draft_seeds(db, user_id=int(user["id"]), slug=slug)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    return [VaultDoc(**r) for r in rows]
 
 
 @router.post("/draft/{slug}/dry-run", response_model=DraftDryRunStart)
@@ -390,18 +882,69 @@ def delete_draft(
     return {"ok": True}
 
 
+def _register_gather_job(request: Request, db: sqlite3.Connection, user_id: int, profile_id: int) -> bool:
+    """Put a committed profile's cron gather on the LIVE scheduler.
+
+    ``runner.start`` only reads ``profile_schedules`` at boot, so a profile
+    committed while the server is up would otherwise not be gathered until
+    the next restart (observed 2026-09-07: an ORCID radar committed 25 min
+    after a restart sat for three days with zero candidates). Mirrors the
+    ``PATCH /{key}/schedule`` registration. Returns False when the scheduler
+    is disabled (tests) or the schedule row is missing/disabled.
+    """
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        return False
+    from apscheduler.triggers.cron import CronTrigger
+
+    from rag_lib.scheduler.jobs import gather_for_profile
+
+    row = db.execute(
+        "SELECT cron, tz, enabled FROM profile_schedules WHERE profile_id = ?",
+        (profile_id,),
+    ).fetchone()
+    if row is None or not row["enabled"]:
+        return False
+    try:
+        trigger = CronTrigger.from_crontab(row["cron"], timezone=row["tz"] or "UTC")
+    except (ValueError, TypeError):
+        return False
+    scheduler.add_job(
+        gather_for_profile,
+        trigger=trigger,
+        args=[user_id, profile_id],
+        id=f"gather:{profile_id}",
+        replace_existing=True,
+        max_instances=1,
+    )
+    return True
+
+
 @router.post("", response_model=Profile)
 def commit_draft(
     body: CommitDraftRequest,
+    request: Request,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> Profile:
     """Commit a wizard draft → live profile.
 
-    Flips ``is_draft=0``, fits the CentroidSelector, and registers a
-    schedule so the next scheduler boot picks the profile up. The
-    schedule defaults to daily 04:00 UTC; override via ``cron`` / ``tz``.
+    Flips ``is_draft=0``, fits the CentroidSelector, registers a schedule
+    row (default daily 04:00 UTC; override via ``cron`` / ``tz``) AND puts
+    the cron job on the running scheduler, so the first gather happens at
+    the next tick rather than after the next restart.
     """
+    try:
+        draft_row = wizard_service._require_draft(db, int(user["id"]), body.slug)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        ) from exc
+    if orcid_import.has_unfinished_import(db, int(draft_row["id"])):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="an ORCID import is still running for this draft; wait for it to finish",
+        )
     try:
         wizard_service.commit_draft(
             db,
@@ -416,6 +959,14 @@ def commit_draft(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    except ValueError as exc:
+        # Profile.seed_embeddings raises when no seed carries a vector for
+        # the draft's embedding model — a draft with zero usable seeds.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"draft has no seed embeddings to fit: {exc}",
+        ) from exc
+    _register_gather_job(request, db, int(user["id"]), int(draft_row["id"]))
     profile = profiles_service.get_profile(db, int(user["id"]), body.slug)
     if profile is None:
         # Should be unreachable — commit just flipped the row to live.
@@ -523,6 +1074,9 @@ def recompute_topics(
             count=int(entry.get("count") or 0),
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            seed_papers=entry.get("seed_papers"),
+            rp_on_by=entry.get("rp_on_by") or None,
+            rp_off_by=entry.get("rp_off_by") or None,
         ))
     return out
 

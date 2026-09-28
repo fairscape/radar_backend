@@ -117,6 +117,53 @@ class OpenAlexClient:
         return results[0] if results else None
 
     # ------------------------------------------------------------------
+    # Author lookups (used by the "From ORCID" wizard path).
+    # ------------------------------------------------------------------
+
+    def get_author_by_orcid(self, orcid: str) -> dict | None:
+        """Raw OpenAlex author record for a canonical ORCID, or None on 404.
+
+        ``orcid`` must already be normalised (``0000-0001-5643-4068``);
+        the ``orcid:`` id form avoids putting a URL in the path.
+        """
+        try:
+            return self._get(f"/authors/orcid:{orcid}")
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            raise
+
+    def get_author(self, author_id: str) -> dict | None:
+        """Raw OpenAlex author record for an author id (``A…`` or the IRI), or None on 404."""
+        bare = author_id.rsplit("/", 1)[-1]
+        try:
+            return self._get(f"/authors/{bare}")
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            raise
+
+    def works_by_orcid(
+        self,
+        orcid: str,
+        *,
+        limit: int | None = None,
+        per_page: int = 200,
+    ) -> list[dict]:
+        """Every work with this ORCID among its authorships, newest first.
+
+        Raw records — ``authorships``, ``type``, ``cited_by_count`` and
+        ``ids`` are kept because the importer needs the researcher's
+        author position, which ``slim_work`` throws away.
+        """
+        return self.paginate_filter(
+            f"authorships.author.orcid:{orcid}",
+            limit=limit,
+            per_page=per_page,
+            sort="publication_date:desc",
+        )
+
+    # ------------------------------------------------------------------
     # Candidate search (used by OpenAlexGatherer). Phase 1B deliverable.
     # ------------------------------------------------------------------
 
@@ -169,6 +216,7 @@ class OpenAlexClient:
         *,
         limit: int | None = None,
         per_page: int = 200,
+        sort: str | None = None,
     ) -> list[dict]:
         out: list[dict] = []
         cursor: str | None = "*"
@@ -178,6 +226,8 @@ class OpenAlexClient:
                 "per-page": per_page,
                 "cursor": cursor,
             }
+            if sort:
+                params["sort"] = sort
             j = self._get("/works", params=params)
             results = j.get("results") or []
             if limit is not None:

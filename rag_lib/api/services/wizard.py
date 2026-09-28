@@ -217,17 +217,45 @@ def aggregate_draft_topics(
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
     prior_on = _prior_topic_states(conn, profile_id)
-    papers = _load_seed_papers(conn, profile_id)
-    topic_filters = Profile.aggregate_topic_filters(papers)
+    from_orcid = bool(_row_get(row, "orcid"))
+    if from_orcid:
+        # An ORCID-seeded profile carries a topic list weighted over the
+        # researcher's WHOLE corpus (lead-author works x2, datasets x0),
+        # computed at import. Recomputing from the seeds alone would throw
+        # that away, so keep the stored non-UMLS entries and only re-merge
+        # UMLS on top.
+        stored = profiles_repo.topic_filters(conn, profile_id) or {}
+        topic_filters = {
+            **stored,
+            "topics": [
+                dict(t) for t in (stored.get("topics") or [])
+                if t.get("source") != "umls"
+            ],
+        }
+    else:
+        papers = _load_seed_papers(conn, profile_id)
+        topic_filters = Profile.aggregate_topic_filters(papers)
 
     # Best-effort UMLS topic merge: read the per-paper mapped topics
     # that vault.upload() stored and merge novel ones into the filters.
     topic_filters = _try_merge_umls_topics(conn, profile_id, topic_filters)
 
-    # Carry forward prior on/off state; topics we've never seen start on.
+    # A profile seeded "From Profile" without an ORCID had no import to
+    # apply its expertise / not_interests; do it here, on the list built
+    # from the uploaded seeds (and after UMLS, so its additions are
+    # subject to the not_interests too). ORCID-seeded ones already carry
+    # the signal in the stored list.
+    if not from_orcid and _row_get(row, "rp_meta_json"):
+        topic_filters = _try_apply_rp_signals(conn, profile_id, topic_filters)
+
+    # Carry forward prior on/off state; topics we've never seen start on,
+    # except UMLS-derived ones on an ORCID profile, which start off: the
+    # researcher's own OpenAlex topics are the evidence there and UMLS
+    # mapping is a noisy supplement the user opts into.
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
-            t["on"] = prior_on.get(t["id"], True)
+            default_on = not (from_orcid and t.get("source") == "umls")
+            t["on"] = prior_on.get(t["id"], t.get("on", default_on))
 
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
@@ -481,6 +509,29 @@ def delete_draft(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _row_get(row: sqlite3.Row, key: str, default=None):
+    """``row[key]`` tolerant of a column that predates the row's schema."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def list_draft_seeds(
+    conn: sqlite3.Connection, *, user_id: int, slug: str
+) -> list[dict]:
+    """Seeds of a draft or profile in the ``VaultDoc`` shape.
+
+    ``GET /api/vault/docs?tag=`` only lists papers the current user
+    uploaded, so seeds imported from OpenAlex (no upload, no PDF) never
+    appear there. This reads ``profile_seeds`` directly.
+    """
+    from .orcid_import import list_seed_docs
+
+    row = _require_profile(conn, user_id, slug)
+    return list_seed_docs(conn, int(row["id"]), slug)
 
 
 def _require_draft(
@@ -807,6 +858,26 @@ def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
             _umls_input_text(row["title"], row["abstract"], row["body_text"]),
         )
         done += 1
+
+
+def _try_apply_rp_signals(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    topic_filters: dict,
+) -> dict:
+    """Best-effort: a stored Researcher Profile's expertise / not_interests
+    switch concepts on/off (see ``rp_profile_import.apply_rp_signals``).
+    Returns ``topic_filters`` unchanged on any failure."""
+    try:
+        from ..settings import get_settings
+        from . import rp_profile_import
+
+        return rp_profile_import.apply_rp_signals_from_meta(
+            conn, get_settings(), profile_id=profile_id, topic_filters=topic_filters,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wizard.rp_signals_failed", profile_id=profile_id, error=str(exc))
+        return topic_filters
 
 
 def _try_merge_umls_topics(

@@ -26,6 +26,8 @@ carrying a live HTTP session.
 
 from __future__ import annotations
 
+import re
+
 import time
 
 import structlog
@@ -88,6 +90,42 @@ class _Deduper:
         return True
 
 
+# Works that OpenAlex types as ``article`` but that are not papers at
+# all: data-portal exports (Atlas of Living Australia / GBIF "Occurrence
+# download data"), Figshare supplement deposits, journal-front-matter
+# corrections. They carry generic data-management topics, so a
+# topic-filtered fetch finds them, and with no abstract the selector
+# scores them from the title alone, which lands them at the top of the
+# feed. Matched against the lowercased, whitespace-collapsed title.
+JUNK_TITLE_RE = re.compile(
+    r"^("
+    r"occurrence download\b|"
+    r"additional file \d+\b|"
+    r"supplementa(ry|l) (material|data|information|file|table|figure|text|method)s?\b|"
+    r"supporting information\b|"
+    r"data from:|"
+    r"(figure|fig\.?|table) s?\d+\b|"
+    r"(erratum|corrigendum|correction|retraction)\b( to| for| notice)?:?"
+    r")",
+)
+
+
+def junk_reason(work: dict, *, require_abstract: bool = True) -> str | None:
+    """Why an OpenAlex work should not become a candidate, or ``None``.
+
+    Reasons: ``"junk_title"`` for the patterns in :data:`JUNK_TITLE_RE`,
+    ``"no_abstract"`` when ``require_abstract`` is on and the work has no
+    ``abstract_inverted_index`` (nothing for the reranker or the card to
+    show, and a title-only embedding scores unreliably).
+    """
+    title = " ".join((work.get("title") or work.get("display_name") or "").split()).lower()
+    if not title or JUNK_TITLE_RE.match(title):
+        return "junk_title"
+    if require_abstract and not work.get("abstract_inverted_index"):
+        return "no_abstract"
+    return None
+
+
 # Per-topic quota gathering. Each enabled topic gets its own OpenAlex
 # query and contributes at most this many papers, so a single prolific
 # topic can no longer fill the whole batch and starve the rest.
@@ -114,6 +152,7 @@ class OpenAlexGatherer:
         min_results: int = DEFAULT_MIN_RESULTS,
         per_topic_quota: int = DEFAULT_PER_TOPIC_QUOTA,
         per_topic_oversample: int = DEFAULT_PER_TOPIC_OVERSAMPLE,
+        require_abstract: bool = True,
     ):
         # mailto is required for the polite pool at fetch time. We accept
         # None at construction so the non-invoking compliance tests can
@@ -129,6 +168,9 @@ class OpenAlexGatherer:
         self.per_topic_quota = per_topic_quota
         self.per_topic_oversample = per_topic_oversample
         self._last_cost: dict = {"wall_seconds": 0.0, "api_calls": 0}
+        self.require_abstract = require_abstract
+        #: drop counts from the most recent fetch, keyed by junk reason
+        self.last_dropped: dict[str, int] = {}
         # Populated by fetch() so the scheduler can persist tier_used and
         # the wizard can show "filter that actually ran".
         self.last_tier_used: str | None = None
@@ -162,6 +204,7 @@ class OpenAlexGatherer:
         """
         client = self._resolve_client()
         t0 = time.time()
+        self.last_dropped = {}
         calls_before = client.api_calls
 
         self.last_source_topics = {}
@@ -252,10 +295,7 @@ class OpenAlexGatherer:
             works = client.paginate_filter(
                 filter_str, limit=per_topic * self.per_topic_oversample,
             )
-            pools[tid] = [
-                client.paper_from_work(w, source="openalex_gatherer")
-                for w in works
-            ]
+            pools[tid] = self._papers_from_works(client, works, profile_name=profile.name)
             log.info(
                 "openalex_gatherer.topic_fetch",
                 profile=profile.name, topic=tid, n=len(pools[tid]),
@@ -355,10 +395,7 @@ class OpenAlexGatherer:
                 profile=profile.name, tier=name, filter=filter_str, since=since,
             )
             works = client.paginate_filter(filter_str, limit=limit)
-            papers = [
-                client.paper_from_work(w, source="openalex_gatherer")
-                for w in works
-            ]
+            papers = self._papers_from_works(client, works, profile_name=profile.name)
             new_count = 0
             for p in papers:
                 if not seen_ids.take(p):
@@ -400,6 +437,19 @@ class OpenAlexGatherer:
 
     # ------------------------------------------------------------------
 
+    def _papers_from_works(self, client, works: list[dict], *, profile_name: str) -> list[Paper]:
+        """``paper_from_work`` over ``works`` minus the ones :func:`junk_reason` rejects."""
+        out: list[Paper] = []
+        for w in works:
+            reason = junk_reason(w, require_abstract=self.require_abstract)
+            if reason:
+                self.last_dropped[reason] = self.last_dropped.get(reason, 0) + 1
+                continue
+            out.append(client.paper_from_work(w, source="openalex_gatherer"))
+        if self.last_dropped:
+            log.info("openalex_gatherer.junk_dropped", profile=profile_name, **self.last_dropped)
+        return out
+
     def diagnostics(self) -> dict:
         return {
             "status": "ready" if self.mailto else "unconfigured",
@@ -410,6 +460,8 @@ class OpenAlexGatherer:
             "top_topics_n": self.top_topics_n,
             "top_subfields_n": self.top_subfields_n,
             "min_results": self.min_results,
+            "require_abstract": self.require_abstract,
+            "last_dropped": dict(self.last_dropped),
             "last_tier_used": self.last_tier_used,
             "last_filter_str": self.last_filter_str,
             **self._last_cost,
@@ -425,6 +477,7 @@ class OpenAlexGatherer:
             "top_topics_n": self.top_topics_n,
             "top_subfields_n": self.top_subfields_n,
             "min_results": self.min_results,
+            "require_abstract": self.require_abstract,
         }
 
     @classmethod
@@ -438,6 +491,7 @@ class OpenAlexGatherer:
             ),
             top_topics_n=config.get("top_topics_n", DEFAULT_TOP_TOPICS_N),
             top_subfields_n=config.get("top_subfields_n", DEFAULT_TOP_SUBFIELDS_N),
+            require_abstract=config.get("require_abstract", True),
             min_results=config.get("min_results", DEFAULT_MIN_RESULTS),
         )
 

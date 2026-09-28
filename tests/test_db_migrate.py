@@ -39,6 +39,10 @@ EXPECTED_VERSIONS = [
     "0012_umls",
     "0013_reranker",
     "0014_candidate_source_topic",
+    "0015_orcid",
+    "0016_rp_profile",
+    "0017_orcid_works",
+    "0018_researchers",
 ]
 
 

@@ -22,7 +22,7 @@ from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
 
 from .logging import configure_logging
-from .routers import chat, health, profiles, radar, users, vault
+from .routers import chat, health, profiles, radar, researchers, users, vault
 from .settings import get_settings
 
 
@@ -51,6 +51,21 @@ async def lifespan(app: FastAPI):
             log.info("migrations.applied", versions=applied)
         else:
             log.info("migrations.up_to_date")
+        # APScheduler's jobstore is in-memory: a job interrupted by a
+        # restart is simply gone, but its gather_runs row would stay
+        # open and the wizard would poll it forever. Close them.
+        orphaned = conn.execute(
+            """
+            UPDATE gather_runs
+               SET finished_at = datetime('now'),
+                   error = 'server restarted before the run finished',
+                   current_step = 'done'
+             WHERE finished_at IS NULL
+            """
+        ).rowcount
+        conn.commit()
+        if orphaned:
+            log.warning("gather_runs.orphans_closed", n=orphaned)
     finally:
         conn.close()
 
@@ -165,6 +180,7 @@ def create_app() -> FastAPI:
     app.include_router(vault.router, prefix="/api/vault", tags=["vault"])
     app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
     app.include_router(users.router, prefix="/api/users", tags=["users"])
+    app.include_router(researchers.router, prefix="/api/researchers", tags=["researchers"])
 
     # Top-level liveness for load-balancer / docker healthcheck use.
     @app.get("/health", include_in_schema=False)

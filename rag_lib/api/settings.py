@@ -69,6 +69,31 @@ class Settings(BaseSettings):
     # Keep symmetric with RADAR_DEFAULT_EMBEDDING_MODEL so operators can
     # swap defaults without code changes.
     RADAR_DEFAULT_SELECTOR: str = "centroid"
+    # "From ORCID" wizard path. RP-format profile files are written under
+    # RADAR_RP_PROFILES_DIR/<user_id>/<slug>/ as a by-product of the import;
+    # in the conda deployment point this at /bigtemp (the /p share is full).
+    RADAR_RP_PROFILES_DIR: Path = Path("data/rp_profiles")
+    # Lead-author works attached as seeds, newest first.
+    RADAR_ORCID_MAX_SEEDS: int = 40
+    # Weighted OpenAlex topics kept from the researcher's corpus.
+    RADAR_ORCID_TOPIC_TOP_K: int = 15
+    # "From Profile" wizard path: a Researcher Profile's ``expertise`` and
+    # ``not_interests`` phrases are embedded (same model + topic index as the
+    # UMLS mapper) and matched to OpenAlex topics. mxbai cosines are
+    # compressed (everything lands in 0.65-0.86 on a real profile), so the
+    # floors below were set on Nathan Sheffield's profile (2026-09-22):
+    # - an expertise phrase may switch ON up to TOP_K concepts the corpus
+    #   already surfaced when the cosine is >= EXPERTISE_MIN_SIM;
+    # - it may ADD one concept the corpus never surfaced only when its best
+    #   hit is >= EXPERTISE_ADD_MIN_SIM (each added concept is a new
+    #   OpenAlex query at gather time, so this floor is deliberately high);
+    # - a not_interests phrase switches OFF only its single best hit, and
+    #   only at >= NOT_INTEREST_MIN_SIM. When both signals hit one concept
+    #   the higher cosine wins.
+    RADAR_RP_EXPERTISE_MIN_SIM: float = 0.65
+    RADAR_RP_EXPERTISE_ADD_MIN_SIM: float = 0.78
+    RADAR_RP_NOT_INTEREST_MIN_SIM: float = 0.70
+    RADAR_RP_EXPERTISE_TOP_K: int = 3
     RADAR_CORS_ORIGINS: list[str] = ["*"]
     RADAR_LOG_JSON: bool = True
     # Optional path to a log file. When set, every record (request lines,

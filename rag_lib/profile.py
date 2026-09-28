@@ -234,6 +234,8 @@ class Profile:
         papers: list[Paper],
         *,
         top_k_each: int = 8,
+        weights: list[float] | None = None,
+        top_k_topics: int | None = None,
     ) -> dict:
         """Count OpenAlex topic assignments across a seed corpus and
         return the top IDs at each level of the hierarchy.
@@ -242,7 +244,17 @@ class Profile:
         ``topics[]`` once. When a paper lacks topic data (e.g., a CSV
         fallback that never resolved on OpenAlex), it contributes nothing
         and is skipped silently.
+
+        ``weights`` (parallel to ``papers``, default 1.0 each) scales one
+        paper's contribution — the ORCID importer counts lead-author works
+        twice and dataset deposits not at all. ``top_k_topics`` overrides
+        ``top_k_each`` for the ``topics`` level only. Reported ``count``
+        values are the rounded weighted sums.
         """
+        if weights is None:
+            weights = [1.0] * len(papers)
+        if len(weights) != len(papers):
+            raise ValueError("weights must be parallel to papers")
         topics: Counter = Counter()
         subfields: Counter = Counter()
         fields: Counter = Counter()
@@ -252,35 +264,35 @@ class Profile:
         field_names: dict[str, str] = {}
         domain_names: dict[str, str] = {}
 
-        def _tally(t):
-            if not t:
+        def _tally(t, w: float = 1.0):
+            if not t or w <= 0:
                 return
             if t.id:
-                topics[t.id] += 1
+                topics[t.id] += w
                 topic_names.setdefault(t.id, t.display_name)
             if t.subfield and t.subfield.id:
-                subfields[t.subfield.id] += 1
+                subfields[t.subfield.id] += w
                 subfield_names.setdefault(t.subfield.id, t.subfield.display_name)
             if t.field and t.field.id:
-                fields[t.field.id] += 1
+                fields[t.field.id] += w
                 field_names.setdefault(t.field.id, t.field.display_name)
             if t.domain and t.domain.id:
-                domains[t.domain.id] += 1
+                domains[t.domain.id] += w
                 domain_names.setdefault(t.domain.id, t.domain.display_name)
 
-        for p in papers:
-            _tally(p.primary_topic)
+        for p, w in zip(papers, weights):
+            _tally(p.primary_topic, w)
             for t in p.topics:
-                _tally(t)
+                _tally(t, w)
 
-        def _top(counter, names):
+        def _top(counter, names, k=top_k_each):
             return [
-                {"id": tid, "display_name": names.get(tid, ""), "count": n}
-                for tid, n in counter.most_common(top_k_each)
+                {"id": tid, "display_name": names.get(tid, ""), "count": int(round(n))}
+                for tid, n in counter.most_common(k)
             ]
 
         return {
-            "topics": _top(topics, topic_names),
+            "topics": _top(topics, topic_names, top_k_topics or top_k_each),
             "subfields": _top(subfields, subfield_names),
             "fields": _top(fields, field_names),
             "domains": _top(domains, domain_names),
