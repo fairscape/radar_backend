@@ -25,6 +25,7 @@ set -uo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin:${PATH:-}
 
 DEPLOY=/bigtemp/nkw3mr/radar_deployment
+LOCKFILE="$DEPLOY/.radar.lock"
 SRC=/p/realai/lei/radar_deployment
 CLOUDFLARED=/p/realai/BioXplorer/LLama-BioXplorer/cloudflared
 LOGS="$DEPLOY/logs"
@@ -74,7 +75,11 @@ start_ollama() {
 	# embeddings stayed dead. Same reasoning as the backend's kill-session.
 	pkill -f "[o]llama serve" 2>/dev/null && sleep 2
 	log "starting ollama"
-	nohup "$DEPLOY/start_ollama.sh" >>"$LOGS/ollama.log" 2>&1 &
+	# 9>&-: see the lock comment at the bottom. A daemon that inherits the
+	# lock descriptor holds the lock for as long as it lives, so every
+	# spawn of something long-lived in this file closes it -- ollama, the
+	# tmux server, caddy and cloudflared all needed it.
+	nohup "$DEPLOY/start_ollama.sh" >>"$LOGS/ollama.log" 2>&1 9>&- &
 	for _ in $(seq 1 20); do
 		ollama_up && return 0
 		sleep 1
@@ -87,7 +92,10 @@ start_backend() {
 	backend_up && return 0
 	log "starting backend (SciSpacy UMLS index load takes ~4 min)"
 	tmux kill-session -t "$SESSION" 2>/dev/null
-	tmux new-session -d -s "$SESSION" "$SRC/scripts/background_setup/start_backend.sh" || {
+	# 9>&- so the tmux server does not inherit the lock: it outlives this
+	# script, and on 2026-09-28 it held the lock for an hour, silently
+	# turning every watchdog tick and every restart into a no-op.
+	tmux new-session -d -s "$SESSION" "$SRC/scripts/background_setup/start_backend.sh" 9>&- || {
 		log "tmux refused to start the backend session"
 		return 1
 	}
@@ -115,7 +123,12 @@ start_caddy() {
 	done
 	sleep 2
 	log "starting caddy"
-	(cd "$DEPLOY" && "$DEPLOY/bin/caddy" start --config Caddyfile >>"$LOGS/caddy-stdout.log" 2>&1)
+	# 9>&- on the subshell, so neither `caddy start` nor the `caddy run`
+	# child it spawns inherits the lock. Caddy was assumed exempt here on
+	# the theory that Go passes only the files it names; the warning below
+	# named the `caddy run --pingback` child holding the lock within
+	# seconds of the next restart.
+	(cd "$DEPLOY" && "$DEPLOY/bin/caddy" start --config Caddyfile >>"$LOGS/caddy-stdout.log" 2>&1) 9>&-
 	for _ in $(seq 1 15); do
 		caddy_up && return 0
 		sleep 1
@@ -136,7 +149,7 @@ start_tunnel() {
 	fi
 	log "starting cloudflared tunnel"
 	nohup "$CLOUDFLARED" tunnel --config "$DEPLOY/cloudflared-config.yml" run \
-		>>"$LOGS/tunnel.log" 2>&1 &
+		>>"$LOGS/tunnel.log" 2>&1 9>&- &
 	sleep 5
 	tunnel_up || {
 		log "tunnel did not stay up — see $LOGS/tunnel.log"
@@ -254,12 +267,49 @@ do_watchdog() {
 # tick -- which then started another, indefinitely, turning a slow start
 # into a permanent outage. @reboot start racing the first tick is the same
 # collision. status and logs are read-only and do not need the lock.
+# Who actually holds the lock, as "<pid> <cmdline>", or nothing if no one
+# does. Asked of the kernel rather than tracked in a file, because a pid
+# written into the lock file goes stale exactly when it matters -- on a kill
+# -9 or a leak -- and this only runs on the failure path.
+lock_holder() {
+	local proc fd target
+	for proc in /proc/[0-9]*; do
+		for fd in "$proc"/fd/*; do
+			target=$(readlink "$fd" 2>/dev/null) || continue
+			if [ "$target" = "$LOCKFILE" ]; then
+				echo "${proc#/proc/} $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null)"
+				return 0
+			fi
+		done
+	done
+	return 1
+}
+
 case "${1:-status}" in
 start | stop | restart | watchdog)
-	exec 9>"$DEPLOY/.radar.lock"
+	exec 9>"$LOCKFILE"
 	if ! flock -n 9; then
-		# Not an error: the other holder is doing the work.
-		[ "${1:-}" = "watchdog" ] || log "another radar.sh is running; skipping"
+		holder=$(lock_holder || true)
+		case "$holder" in
+		*radar.sh*)
+			# Not an error: the other holder is doing the work.
+			[ "${1:-}" = "watchdog" ] || log "another radar.sh is running; skipping"
+			;;
+		*)
+			# The holder is not a radar.sh, so the descriptor leaked into a
+			# daemon that outlived the run which took it -- and then every
+			# start, stop, restart and watchdog tick skips for as long as
+			# that daemon lives. It happened on 2026-09-28 (the tmux server,
+			# before the 9>&- above) and nothing said so for an hour,
+			# because the watchdog's skip was deliberately quiet. This one
+			# is never quiet, watchdog included: a dead watchdog is exactly
+			# the failure nobody notices.
+			log "WARN: $LOCKFILE is held by something that is not radar.sh" \
+				"-- ${holder:-holder unknown}. Every start/stop/restart/watchdog" \
+				"will skip until it exits. The descriptor leaked at spawn;" \
+				"close it with 9>&- there."
+			;;
+		esac
 		exit 0
 	fi
 	;;
