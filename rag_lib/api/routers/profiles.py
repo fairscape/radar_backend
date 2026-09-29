@@ -151,6 +151,8 @@ def list_drafts(
     in another browser, or after site data was cleared, can be resumed or
     discarded instead of accumulating invisibly.
     """
+    from rag_lib.db.repos import profiles as profiles_repo
+
     rows = profiles_repo.list_drafts_for_user(db, int(user["id"]))
     return [
         DraftSummary(
