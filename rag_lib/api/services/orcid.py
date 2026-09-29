@@ -242,13 +242,51 @@ def _mark_duplicates(summaries: list[dict[str, Any]]) -> int:
     return n
 
 
+def _group_duplicates(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move each redundant copy directly under the copy it duplicates.
+
+    The sort above is by year, so a preprint and its published version --
+    the commonest duplicate pair by far -- land in different year blocks,
+    measured up to 79 rows apart in a 156-row list. Each one is ticked off
+    and labelled, but the user scrolling the list meets a title they
+    already passed and reads the list as full of duplicates. Adjacency is
+    what makes a pair legible as one paper in two versions.
+
+    Only the order changes: every row survives, the kept copies stay in
+    their year/citation order, and nothing is hidden or unticked here.
+    """
+    children: dict[str, list[dict[str, Any]]] = {}
+    for s in summaries:
+        parent = s.get("duplicate_of")
+        if parent:
+            children.setdefault(parent, []).append(s)
+
+    out: list[dict[str, Any]] = []
+    for s in summaries:
+        if s.get("duplicate_of"):
+            continue  # emitted under its parent
+        out.append(s)
+        out.extend(children.pop(s["openalex_id"], ()))
+
+    # A duplicate whose parent is not in the list would otherwise vanish.
+    # _mark_duplicates cannot produce one, but losing a row silently is
+    # worse than an odd position, so anything left over goes at the end.
+    for orphans in children.values():
+        out.extend(orphans)
+
+    assert len(out) == len(summaries), "reordering must not drop rows"
+    return out
+
+
 def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
                check_registry: bool = True) -> dict[str, Any]:
     """Every OpenAlex work carrying ``orcid`` in its authorships.
 
     Newest first, then most cited, so the list a user is about to prune
-    starts with what they most likely still care about. ``client`` only
-    needs ``paginate_filter``.
+    starts with what they most likely still care about -- except that a
+    duplicate copy sits directly under the copy it duplicates rather than
+    in its own year, so the pair reads as one paper. ``client`` only needs
+    ``paginate_filter``.
 
     Two annotations ride along, both advisory and both leaving the work in
     the list: ``claimed`` says whether the person's own ORCID record lists
@@ -284,6 +322,8 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
                 n_unknown += 1
 
     n_dup = _mark_duplicates(summaries)
+    if n_dup:
+        summaries = _group_duplicates(summaries)
 
     for s in summaries:
         s.pop("has_abstract", None)

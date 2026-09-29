@@ -19,6 +19,9 @@ from rag_lib.db.repos import users as users_repo
 from tests.fake_openalex_client import canned_openalex_work
 from tests.test_prosopia_import import StubOpenAlex
 
+#: The user the db fixture seeds; the identity these tests authenticate as.
+SEEDED_USER = "demo@example.com"
+
 
 ORCID = "0000-0002-1103-3882"
 OTHER = "0000-0001-5643-4068"
@@ -82,7 +85,7 @@ def env(tmp_path, monkeypatch):
 
     conn = connect(db)
     apply_migrations(conn)
-    users_repo.upsert(conn, "demo@example.com")
+    users_repo.upsert(conn, SEEDED_USER)
     conn.close()
 
     yield db
@@ -104,6 +107,11 @@ def _request(app, method, path, **kwargs) -> httpx.Response:
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test",
+                # Every route here is behind get_current_user, which reads
+                # the identity Caddy injects. Sent as a client default so a
+                # single test can still override or drop it; without it the
+                # whole file 401s before reaching what it means to assert.
+                headers={"X-User-Email": SEEDED_USER},
             ) as client:
                 return await client.request(method, path, **kwargs)
 
@@ -137,6 +145,80 @@ def test_list_works_reads_the_name_off_the_authorships_and_sorts_newest_first():
     assert top["doi"] == "10.1/three"
     assert top["authors"] == ["Justin C. Niestroy", "Someone Else"]
     assert top["author_position"] == "first"
+
+
+#: A preprint and its published version: the same paper, a year apart, so
+#: the newest-first sort would put them in different year blocks. The title
+#: has to survive ``title_key``, which returns "" below MIN_TITLE_KEY_LEN
+#: (30 alphanumerics) so that every paper called "Editorial" does not
+#: collapse into one -- a short title never dedupes by title at all.
+#: The case differs on purpose: that is the kind of difference between two
+#: copies that normalizing away is the point of.
+PREPRINT_PAIR = WORKS + [
+    _work("W4", "10.1/four",
+          "Fast, memory-efficient genomic interval tokenizers", 2025, cited=40),
+    _work("W5", None,
+          "Fast, Memory-Efficient Genomic Interval Tokenizers", 2024, cited=2),
+]
+
+
+def test_list_works_keeps_one_copy_of_a_paper_and_points_the_rest_at_it():
+    """A preprint and its published version must not both become seeds.
+
+    Both stay in the list -- the rule is a heuristic and the user is
+    looking at it -- but only one is left for the picker to tick, so the
+    centroid does not count the paper twice.
+    """
+    works = list_works(ORCID, StubOrcidOpenAlex(PREPRINT_PAIR))["works"]
+    by_id = {w["openalex_id"]: w for w in works}
+    assert len(works) == 5, "no row may be dropped"
+
+    # W4 is kept over W5: it has a DOI and more citations.
+    assert by_id["W4"]["duplicate_of"] is None
+    assert by_id["W5"]["duplicate_of"] == "W4"
+    assert [w["openalex_id"] for w in works if w["duplicate_of"] is None] == [
+        "W3", "W2", "W4", "W1",
+    ]
+
+
+def test_list_works_puts_a_duplicate_directly_under_the_copy_it_duplicates():
+    """Adjacency, not just a label, is what makes the pair legible.
+
+    Sorted by year alone, W5 (2024) would land next to W1 (2024) and a
+    whole year block away from the W4 (2025) it duplicates. The user
+    scrolling past it meets a title they already saw and reads the list as
+    full of duplicates -- which is exactly the report this guards.
+    """
+    works = list_works(ORCID, StubOrcidOpenAlex(PREPRINT_PAIR))["works"]
+    order = [w["openalex_id"] for w in works]
+    assert order == ["W3", "W2", "W4", "W5", "W1"]
+    assert order.index("W5") == order.index("W4") + 1
+
+
+def test_grouping_keeps_a_duplicate_whose_original_is_missing():
+    """The orphan branch: an unreachable parent must not swallow the row.
+
+    _mark_duplicates cannot produce this -- it only ever points at a copy
+    it just chose from the same list -- so this calls the reordering
+    directly. Without the trailing loop the row is silently dropped, and a
+    paper vanishing from the picker is far worse than one sitting in an odd
+    place.
+    """
+    from rag_lib.api.services.orcid import _group_duplicates
+
+    rows = [
+        {"openalex_id": "W1", "duplicate_of": None},
+        {"openalex_id": "W2", "duplicate_of": "W_NOT_HERE"},
+        {"openalex_id": "W3", "duplicate_of": None},
+    ]
+    out = _group_duplicates(rows)
+    assert [r["openalex_id"] for r in out] == ["W1", "W3", "W2"]
+
+
+def test_list_works_leaves_the_order_alone_when_nothing_is_duplicated():
+    works = list_works(ORCID, StubOrcidOpenAlex(WORKS))["works"]
+    assert [w["openalex_id"] for w in works] == ["W3", "W2", "W1"]
+    assert all(w["duplicate_of"] is None for w in works)
 
 
 def test_list_works_for_an_orcid_with_nothing_has_no_name():
