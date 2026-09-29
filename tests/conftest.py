@@ -19,6 +19,39 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_env_file(monkeypatch):
+    """Keep the deployment's own ``.env`` out of the test suite.
+
+    ``Settings.model_config`` names ``env_file=".env"``, resolved against
+    the cwd -- and the cwd for a test run is the repository root, which is
+    exactly where the running deployment keeps its ``.env``. So the suite
+    silently inherits production configuration. Measured on 2026-09-28:
+    that file's ``RADAR_REQUIRE_AUTH=true`` turned 76 tests red with 401s,
+    for a suite that was 104/573 failing until the file was accounted for
+    and 28/573 after. Nothing in the failure pointed at the cause.
+
+    Tests configure themselves through monkeypatched environment
+    variables, which still win; this only removes the file nobody asked
+    for. Real environment variables are left alone, so `RADAR_...=x pytest`
+    keeps working as an override.
+    """
+    from rag_lib.api import settings as settings_module
+
+    def _drop_cached_settings() -> None:
+        # A test may have replaced get_settings with a plain function, which
+        # has no cache to clear -- test_umls_gate does exactly that, and an
+        # unguarded call turned its teardown into an error.
+        clear = getattr(settings_module.get_settings, "cache_clear", None)
+        if clear is not None:
+            clear()
+
+    monkeypatch.setitem(settings_module.Settings.model_config, "env_file", None)
+    _drop_cached_settings()
+    yield
+    _drop_cached_settings()
+
+
+@pytest.fixture(autouse=True)
 def _no_orcid_registry(request, monkeypatch):
     """Make ``fetch_claimed`` return None unless a test opts out.
 
