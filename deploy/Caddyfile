@@ -1,0 +1,84 @@
+# RADAR single-origin front door.
+#
+# Everything the browser touches comes from this one port, so the SPA's
+# relative /api/... calls are same-origin: no CORS, no hard-coded backend
+# host, one tunnel. The backend stays on loopback and is never published.
+{
+	# Loopback-only admin socket. Off would be marginally tighter, but it
+	# also disables `caddy reload`/`stop`, which makes every config change
+	# a kill-and-restart.
+	admin localhost:2019
+	auto_https off
+}
+
+# Loopback only. cloudflared connects to http://localhost:8080, so nothing
+# else ever needs to reach this. Bound to *:8080 it was reachable from the
+# campus network, and because the identity header below is copied from a
+# request header, anyone who could reach it could name themselves:
+#
+#   curl -H 'Cf-Access-Authenticated-User-Email: someone@example.com' \
+#        http://128.143.71.92:8080/api/users/me     -> 200, as that person
+#
+# Cloudflare Access, the tunnel and the email allowlist were all bypassed.
+http://:8080 {
+	# `bind`, not a host in the site address: Caddy treats the host there as
+	# a request matcher and still listens on every interface (measured -- the
+	# admin API reported listen [":8080"]). Only this restricts the socket.
+	bind 127.0.0.1
+
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000 {
+			# The backend treats X-User-Email as the identity, with no
+			# signature behind it, so the client must never get to choose
+			# it. This overwrites whatever the browser sent with the
+			# address Cloudflare Access verified; with Access absent it
+			# resolves empty and the backend 401s (RADAR_REQUIRE_AUTH).
+			# Don't add a `header_up -X-User-Email` alongside this: Caddy
+			# applies deletes after sets, so it would undo the line below.
+			# This is the whole identity mechanism: the backend trusts
+			# X-User-Email with nothing behind it, so the value has to
+			# come from the tunnel and nowhere else. The loopback bind
+			# above is what makes that true -- a client that can reach
+			# this port can simply send the Cf-Access header and be
+			# whoever it likes. Stripping the client's copy here does
+			# not help: Caddy runs request_header before reverse_proxy
+			# reads the placeholder, so the delete would erase the real
+			# identity too (measured: every request 401s).
+			header_up X-User-Email {http.request.header.Cf-Access-Authenticated-User-Email}
+
+			# Every /api response is private to one identity, and the
+			# backend sets no cache headers at all. Without this the
+			# browser heuristically caches GETs, so signing in as a
+			# second person on the same browser replays the first
+			# person's profiles out of cache -- which is exactly what
+			# happened on 2026-08-28. no-store, not no-cache: the
+			# response must never touch disk.
+			header_down Cache-Control "no-store"
+
+			# Gathers and reranking can run for minutes; don't cut them off.
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	handle {
+		root * /p/realai/lei/radar_deployment/radar_frontend/dist
+		# The SPA shell must be revalidated on every load: asset names are
+		# content-hashed, but index.html is not, and browsers heuristically
+		# cached it (users kept the old bundle after a deploy on 2026-09-06).
+		# no-cache = may store, must revalidate (ETag/Last-Modified), so a
+		# fresh deploy shows up on plain reload.
+		@shell not path /assets/*
+		header @shell Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output file /bigtemp/nkw3mr/radar_deployment/logs/caddy.log
+	}
+}

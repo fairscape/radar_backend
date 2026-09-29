@@ -1,0 +1,13 @@
+# Cloudflare Tunnel for RADAR.
+#
+# One ingress rule: everything goes to Caddy on :8080, which serves the
+# SPA and proxies /api to the backend on :8000. Keeping the split inside
+# Caddy (not here) means the browser stays same-origin and the backend
+# never needs to be published.
+tunnel: f2d6db27-82e9-480e-8fd6-6528a922acf3
+credentials-file: /u/nkw3mr/.cloudflared/f2d6db27-82e9-480e-8fd6-6528a922acf3.json
+
+ingress:
+  - hostname: radar.bioxplorer.org
+    service: http://localhost:8080
+  - service: http_status:404

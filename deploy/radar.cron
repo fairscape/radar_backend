@@ -1,0 +1,12 @@
+# RADAR (https://radar.bioxplorer.org)
+# Managed by /p/realai/lei/radar_deployment/radar.sh and backup.sh
+
+# Restart anything that stopped answering. Silent when all is well.
+*/5 * * * * /p/realai/lei/radar_deployment/radar.sh watchdog >> /bigtemp/nkw3mr/radar_deployment/logs/watchdog.log 2>&1
+
+# Bring the stack back after a machine reboot.
+@reboot /p/realai/lei/radar_deployment/radar.sh start >> /bigtemp/nkw3mr/radar_deployment/logs/boot.log 2>&1
+
+# Snapshot the database every hour. The working copy is on this machine's
+# local disk, which is fast but not durable; this is what carries it to R2.
+7 * * * * /p/realai/lei/radar_deployment/backup.sh >> /bigtemp/nkw3mr/radar_deployment/logs/backup.log 2>&1
