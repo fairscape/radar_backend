@@ -21,6 +21,7 @@ from ..schemas import (
     Draft,
     DraftCoherence,
     DraftCreateRequest,
+    DraftSummary,
     DraftDryRun,
     DraftDryRunRequest,
     DraftDryRunStart,
@@ -135,6 +136,38 @@ def get_wizard_options(
     )
 
 
+@router.get("/drafts", response_model=list[DraftSummary])
+def list_drafts(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[DraftSummary]:
+    """The current user's unfinished drafts, newest first.
+
+    Declared before ``/{key}`` so the literal path wins -- FastAPI matches
+    in declaration order, and ``/{key}`` would otherwise swallow this as a
+    profile named "drafts".
+
+    The wizard calls this on entry when it has no local draft, so one left
+    in another browser, or after site data was cleared, can be resumed or
+    discarded instead of accumulating invisibly.
+    """
+    rows = profiles_repo.list_drafts_for_user(db, int(user["id"]))
+    return [
+        DraftSummary(
+            slug=r["slug"], name=r["name"],
+            created_at=r["created_at"], updated_at=r["updated_at"],
+            n_seeds=int(r["n_seeds"] or 0),
+            orcid=r["orcid"],
+            researcher_name=r["researcher_name"],
+            researcher_source=r["researcher_source"],
+            phase=r["phase"],
+            import_run_id=(int(r["import_run_id"])
+                           if r["import_run_id"] is not None else None),
+        )
+        for r in rows
+    ]
+
+
 @router.post("/draft", response_model=Draft)
 def create_draft(
     body: DraftCreateRequest,
@@ -177,6 +210,13 @@ def draft_coherence(
         return wizard_service.compute_draft_coherence(
             db, user_id=int(user["id"]), slug=slug,
         )
+    except wizard_service.ImportInProgress as exc:
+        # 409, not an empty coherence result: the caller must poll the
+        # import rather than treat this draft as one with no seeds.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),

@@ -29,9 +29,12 @@ from typing import Any
 
 import structlog
 
+from ...db.repos import gather_runs as gather_runs_repo
 from ...db.repos import profiles as profiles_repo
 from ...db.repos import researchers as researchers_repo
 from ...openalex_client import OpenAlexClient
+from ...orcid_registry import ClaimedWorks, fetch_claimed
+from ...paper import title_key
 from ...prosopia_seeds import normalize_doi
 from . import wizard as wizard_service
 from .prosopia import ImportPlan
@@ -42,6 +45,8 @@ log = structlog.get_logger("rag_lib.api.services.orcid")
 
 __all__ = [
     "MAX_WORKS",
+    "ClaimedWorks",
+    "ImportAlreadyRunning",
     "WorkRecord",
     "WorksNotFound",
     "list_works",
@@ -62,6 +67,31 @@ _OPENALEX_PREFIX = "https://openalex.org/"
 
 class WorksNotFound(LookupError):
     """None of the requested works belong to this ORCID."""
+
+
+class ImportAlreadyRunning(RuntimeError):
+    """This user already has an unfinished import of this person.
+
+    Carries where to watch it. Starting a second import would embed the
+    same papers twice on the same GPU and leave two half-built drafts for
+    one researcher; the useful answer to "import this ORCID" when it is
+    already happening is the run that is happening.
+
+    What this does NOT catch: the run row is opened by the router after
+    ``prepare_import`` returns, and ``prepare_import`` spends seconds in
+    OpenAlex pagination first, so two requests arriving inside that window
+    both pass the check and both build a draft (``create_draft``
+    de-duplicates the name with a numeric suffix, so neither fails).
+    Closing that needs the uniqueness enforced where the run row is
+    written, not in a SELECT beforehand. This guard is for the common
+    case -- a user returning to a tab and clicking import again while the
+    previous one is still embedding -- not for a double submit.
+    """
+
+    def __init__(self, slug: str, run_id: int):
+        super().__init__(f"an import of this ORCID is already running ({slug})")
+        self.slug = slug
+        self.run_id = run_id
 
 
 def normalize_orcid(raw: str | None) -> str | None:
@@ -141,23 +171,126 @@ def _summary(work: dict, orcid: str) -> dict[str, Any]:
         "authors": names[:3],
         "n_authors": len(names) or None,
         "author_position": mine.get("author_position"),
+        # Filled in by list_works, which has the registry and the whole
+        # list to compare against; a single work cannot answer either.
+        "claimed": None,
+        "duplicate_of": None,
     }
 
 
-def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS) -> dict[str, Any]:
+def _dedupe_key(s: dict[str, Any]) -> str:
+    """What makes two summaries the same paper.
+
+    Title first: a preprint and its version of record share a title but
+    almost never a DOI, and collapsing them is the whole point. The DOI
+    and the id are only fallbacks for a work whose title normalizes away
+    to nothing.
+    """
+    return title_key(s.get("title")) or (s.get("doi") or "").lower() \
+        or f"oa:{s['openalex_id']}"
+
+
+def _version_rank(s: dict[str, Any]) -> tuple:
+    """Which copy of one paper to keep.
+
+    ``claimed`` outranks everything else, and that ordering is the whole
+    reason the registry is read before this runs. A bioRxiv preprint often
+    has a DOI, an abstract and -- because it has been out longer -- more
+    citations than its version of record, so on completeness alone the
+    preprint wins. If the author's record claims the published version and
+    not the preprint, keeping the preprint leaves the kept copy marked
+    unclaimed and the claimed copy marked a duplicate, and a picker that
+    pre-ticks "not a duplicate AND not unclaimed" then ticks neither: the
+    two annotations cancel and the paper disappears from the default
+    selection entirely.
+
+    ``None`` (unknown) sorts between claimed and unclaimed, so an
+    unreadable registry never demotes a copy below one the registry
+    positively rejected.
+    """
+    claimed = s.get("claimed")
+    claim_rank = 2 if claimed is True else (0 if claimed is False else 1)
+    return (claim_rank,
+            1 if s.get("doi") else 0,
+            1 if s.get("has_abstract") else 0,
+            s.get("cited_by_count") or 0)
+
+
+def _mark_duplicates(summaries: list[dict[str, Any]]) -> int:
+    """Point every redundant copy at the one kept. Returns how many.
+
+    Left in the list rather than dropped. The rule is a heuristic -- two
+    genuinely different papers can share a normalized title -- and the
+    user is right there looking at the list, so the honest move is to
+    untick the copy and say why.
+
+    Without this a preprint and its published version both become seeds,
+    and the same paper counts twice in the centroid the selector fits.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    for s in summaries:
+        k = _dedupe_key(s)
+        prev = best.get(k)
+        if prev is None or _version_rank(s) > _version_rank(prev):
+            best[k] = s
+    n = 0
+    for s in summaries:
+        keep = best[_dedupe_key(s)]
+        if keep is not s:
+            s["duplicate_of"] = keep["openalex_id"]
+            n += 1
+    return n
+
+
+def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
+               check_registry: bool = True) -> dict[str, Any]:
     """Every OpenAlex work carrying ``orcid`` in its authorships.
 
     Newest first, then most cited, so the list a user is about to prune
     starts with what they most likely still care about. ``client`` only
     needs ``paginate_filter``.
+
+    Two annotations ride along, both advisory and both leaving the work in
+    the list: ``claimed`` says whether the person's own ORCID record lists
+    it (``None`` when the registry could not be read at all), and
+    ``duplicate_of`` names the copy kept when several rows are one paper.
+    The picker starts those unticked; nothing is hidden.
+
+    ``check_registry=False`` skips the one extra HTTP call, for tests and
+    for callers that have already decided.
     """
     works = client.paginate_filter(f"author.orcid:{orcid}", limit=limit) or []
     summaries = [_summary(w, orcid) for w in works]
+    # abstract presence only feeds _version_rank, so it is read off the
+    # raw work here rather than carried in the response.
+    for s, w in zip(summaries, works):
+        s["has_abstract"] = bool(w.get("abstract_inverted_index"))
     summaries = [s for s in summaries if s["openalex_id"] and s["title"]]
     summaries.sort(
         key=lambda s: (-(s["year"] or 0), -(s["cited_by_count"] or 0), s["title"]),
     )
-    log.info("orcid.list_works", orcid=orcid, n=len(summaries))
+
+    # Registry first: _version_rank reads `claimed`, so marking duplicates
+    # before this would decide which copy to keep without the strongest
+    # signal available.
+    registry: ClaimedWorks | None = fetch_claimed(orcid) if check_registry else None
+    n_unclaimed = n_unknown = 0
+    if registry is not None:
+        for s in summaries:
+            s["claimed"] = registry.matches(s.get("doi"), s.get("title"))
+            if s["claimed"] is False:
+                n_unclaimed += 1
+            elif s["claimed"] is None:
+                n_unknown += 1
+
+    n_dup = _mark_duplicates(summaries)
+
+    for s in summaries:
+        s.pop("has_abstract", None)
+
+    log.info("orcid.list_works", orcid=orcid, n=len(summaries),
+             n_duplicates=n_dup, n_unclaimed=n_unclaimed,
+             n_claim_unknown=n_unknown, registry_read=registry is not None)
     return {"orcid": orcid, "name": _author_name(works, orcid), "works": summaries}
 
 
@@ -186,8 +319,20 @@ def prepare_import(
     if not wanted:
         raise ValueError("select at least one work to import")
 
+    # Before anything is created: a second import of the same person would
+    # re-embed the same papers on the same GPU and leave two half-built
+    # drafts behind. Checked here rather than in the router so the CLI and
+    # the test path get it too.
+    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=oid)
+    if inflight is not None:
+        raise ImportAlreadyRunning(inflight["slug"], int(inflight["run_id"]))
+
     client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
-    listing = list_works(oid, client)
+    # check_registry=False: records_for reads only id/title/doi/year/venue,
+    # so the annotations would be an uncached HTTP round trip to
+    # pub.orcid.org inside this POST for an answer nobody reads. The user
+    # already saw them on the listing this selection came from.
+    listing = list_works(oid, client, check_registry=False)
     records = records_for(listing, wanted)
     if not records:
         raise WorksNotFound(f"none of the selected works are by ORCID {oid}")

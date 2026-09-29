@@ -15,6 +15,13 @@ import re
 import sqlite3
 from typing import Any
 
+from .gather_runs import IMPORT_TIERS
+
+
+#: Slugs the profiles router claims as literal paths, declared before
+#: ``/{key}``. Keep in step with routers/profiles.py.
+RESERVED_SLUGS = frozenset({"drafts", "draft", "wizard"})
+
 
 def slugify(name: str) -> str:
     """Profile slug: lowercase, alnum + dashes, collapse runs.
@@ -28,7 +35,14 @@ def slugify(name: str) -> str:
     # which rewrites both spaces and underscores as hyphens.
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("-")
-    return s or "profile"
+    s = s or "profile"
+    # The profile routes are /api/profiles/{key}, and a few literal paths
+    # are declared ahead of it so they win. A profile whose slug is one of
+    # those is reachable through every sub-path (/detail, /runs, PATCH...)
+    # but not through GET /api/profiles/{slug} itself, which looks like a
+    # random failure. Suffix instead of rejecting: the name the user typed
+    # is fine, only the slug collides.
+    return f"{s}-profile" if s in RESERVED_SLUGS else s
 
 
 def get(conn: sqlite3.Connection, profile_id: int) -> sqlite3.Row | None:
@@ -77,6 +91,63 @@ def list_for_user(
     return conn.execute(
         "SELECT * FROM profiles WHERE user_id = ? AND is_draft = 0 ORDER BY id",
         (user_id,),
+    ).fetchall()
+
+
+def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
+    """The user's unfinished drafts, newest first, with enough to resume one.
+
+    This is what lets a draft survive a cleared browser or another machine:
+    the wizard asks here on entry instead of trusting sessionStorage, so a
+    half-built interest can be resumed or discarded rather than
+    accumulating invisibly.
+
+    ``phase`` says what the draft is waiting for, which decides where
+    resuming lands:
+      ``importing``  an import run is still open -- show progress, not seeds
+      ``failed``     the last import ended with an error and attached
+                     nothing; resuming at the pick step would hide that,
+                     so it gets its own state and ``import_error``
+      ``seeded``     seeds are attached; the coherence step is next
+      ``empty``      nothing attached yet; the upload/pick step is next
+    """
+    tiers = ",".join("?" * len(IMPORT_TIERS))
+    return conn.execute(
+        f"""
+        SELECT p.id, p.slug, p.name, p.created_at, p.updated_at,
+               r.orcid        AS orcid,
+               r.name         AS researcher_name,
+               r.source       AS researcher_source,
+               (SELECT COUNT(*) FROM profile_seeds s WHERE s.profile_id = p.id)
+                 AS n_seeds,
+               (SELECT MAX(g.id) FROM gather_runs g
+                 WHERE g.profile_id = p.id
+                   AND g.tier_used IN ({tiers})
+                   AND g.finished_at IS NULL) AS import_run_id,
+               CASE
+                 WHEN EXISTS (SELECT 1 FROM gather_runs g
+                               WHERE g.profile_id = p.id
+                                 AND g.tier_used IN ({tiers})
+                                 AND g.finished_at IS NULL) THEN 'importing'
+                 WHEN EXISTS (SELECT 1 FROM profile_seeds s
+                               WHERE s.profile_id = p.id) THEN 'seeded'
+                 WHEN EXISTS (SELECT 1 FROM gather_runs g
+                               WHERE g.profile_id = p.id
+                                 AND g.tier_used IN ({tiers})
+                                 AND g.error IS NOT NULL) THEN 'failed'
+                 ELSE 'empty'
+               END AS phase,
+               (SELECT g.error FROM gather_runs g
+                 WHERE g.profile_id = p.id
+                   AND g.tier_used IN ({tiers})
+                   AND g.error IS NOT NULL
+                 ORDER BY g.id DESC LIMIT 1) AS import_error
+          FROM profiles p
+          LEFT JOIN researchers r ON r.id = p.researcher_id
+         WHERE p.user_id = ? AND p.is_draft = 1
+         ORDER BY p.id DESC
+        """,
+        (*IMPORT_TIERS, *IMPORT_TIERS, *IMPORT_TIERS, *IMPORT_TIERS, user_id),
     ).fetchall()
 
 

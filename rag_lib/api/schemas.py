@@ -361,6 +361,32 @@ class Draft(_Model):
     name: str
 
 
+class DraftSummary(_Model):
+    """One unfinished draft, as the wizard's resume prompt shows it."""
+
+    slug: str
+    name: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    n_seeds: int = 0
+    #: From the researcher the draft was started from, when it had one.
+    orcid: str | None = None
+    researcher_name: str | None = None
+    researcher_source: str | None = None
+    #: What the draft is waiting for, and so where resuming should land:
+    #: ``importing`` (a run is still open -- show progress, not an empty
+    #: seed list), ``seeded`` (go to the coherence step), ``empty`` (go to
+    #: the upload/pick step).
+    phase: Literal["importing", "failed", "seeded", "empty"] = "empty"
+    #: The open import's run id, for polling. Null unless phase=importing.
+    import_run_id: int | None = None
+    #: Why the last import failed. Set only when phase="failed" -- a draft
+    #: whose import died attached nothing, so without this it is
+    #: indistinguishable from one nobody ever imported into, and the wizard
+    #: would resume it at the manual pick step and never mention the error.
+    import_error: str | None = None
+
+
 class DraftCreateRequest(_Model):
     name: str
     # Plugin keys. Both default to ``None`` so the router can fall back
@@ -429,6 +455,16 @@ class OrcidWork(_Model):
     authors: list[str] = []
     n_authors: int | None = None
     author_position: str | None = None
+    #: Does the person's own ORCID record list this work? ``None`` means the
+    #: registry could not be read or has nothing to compare against -- it is
+    #: NOT a "no". A consumer must test ``claimed is False``, never
+    #: ``!claimed``: in JSON both null and false are falsy, and treating
+    #: "we never asked" as "not yours" unticks a researcher's whole corpus.
+    claimed: bool | None = None
+    #: The openalex_id of the copy kept when several rows are one paper
+    #: (a preprint and its version of record). The redundant copy stays in
+    #: the list, unticked, rather than being hidden.
+    duplicate_of: str | None = None
 
 
 class OrcidWorksResponse(_Model):
@@ -469,6 +505,13 @@ class ProsopiaImportStart(_Model):
     # Null for a researcher import, which creates no draft.
     draft_slug: str | None = None
     run_id: int
+    #: True when nothing was started: an import of this person was already
+    #: in flight, so ``run_id`` points at that one and ``draft_slug`` at the
+    #: draft it is filling. This request's selection was NOT applied --
+    #: without the flag a client cannot tell that apart from a fresh start
+    #: and would show "importing your 40 works" for someone else's 80.
+    already_running: bool = False
+
 
 
 class ProsopiaImportResult(_Model):

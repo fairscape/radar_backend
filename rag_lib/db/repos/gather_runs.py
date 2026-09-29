@@ -157,3 +157,89 @@ def recent_for_researcher(
         """,
         (researcher_id, limit),
     ).fetchall()
+
+
+#: tier_used values an import writes. Lives here because it is a domain of
+#: this module's own column; the three routers that pass them
+#: (routers/prosopia.py, routers/researchers.py) each hold one literal.
+IMPORT_TIERS = ("orcid_import", "prosopia_import", "researcher_import")
+
+#: How long a run may go without progress before it stops counting as in
+#: flight. `finished_at IS NULL` alone is not liveness: the job closes the
+#: row on exception, but a killed process cannot -- and this deployment's
+#: cron watchdog restarts uvicorn every time it stops answering, mid-import
+#: included. Without a cutoff one crashed import would answer every later
+#: import of that person with a dead run id, forever, and the drafts list
+#: would report `importing` for a job that will never move again.
+#:
+#: The import job ticks progress per paper (services/prosopia.run_import),
+#: so 30 minutes is far longer than any real gap while still bounded.
+STALE_IMPORT_MINUTES = 30
+
+_INFLIGHT_PREDICATE = """
+        g.finished_at IS NULL
+    AND COALESCE(g.progress_updated_at, g.started_at)
+          > datetime('now', ?)
+"""
+
+
+def _stale_cutoff() -> str:
+    return f"-{STALE_IMPORT_MINUTES} minutes"
+
+
+def has_unfinished_import(conn: sqlite3.Connection, profile_id: int) -> bool:
+    """Is an import still running for this draft?
+
+    The wizard's later steps read ``profile_seeds``, which an import fills
+    at the end -- so mid-import a draft looks identical to an empty one.
+    Asking this is how the difference gets told.
+    """
+    placeholders = ",".join("?" * len(IMPORT_TIERS))
+    return conn.execute(
+        f"""
+        SELECT 1 FROM gather_runs g
+         WHERE g.profile_id = ? AND g.tier_used IN ({placeholders})
+           AND {_INFLIGHT_PREDICATE}
+         LIMIT 1
+        """,
+        (profile_id, *IMPORT_TIERS, _stale_cutoff()),
+    ).fetchone() is not None
+
+
+def find_inflight_import(
+    conn: sqlite3.Connection, user_id: int, *, orcid: str,
+) -> sqlite3.Row | None:
+    """An import of this person already in flight for this user, or None.
+
+    Keyed on ``researchers.orcid`` rather than on ``(source, key)``,
+    because the same person can be in flight under either source: a
+    Prosopia profile and a bare ORCID resolve and embed the same papers,
+    so letting one through while the other runs is the duplicate work this
+    exists to prevent.
+
+    ``LEFT JOIN profiles`` on purpose. A researcher import creates no draft
+    (``services/researchers.prepare_researcher_import`` returns a plan with
+    no ``profile_id``), so an inner join silently dropped every
+    ``researcher_import`` row and the tier in ``IMPORT_TIERS`` was
+    unreachable. Ownership then comes from the profile when there is one
+    and from the run itself when there is not.
+
+    ``slug`` is NULL for a researcher import; a caller that wants to point
+    the user somewhere must handle that.
+    """
+    placeholders = ",".join("?" * len(IMPORT_TIERS))
+    return conn.execute(
+        f"""
+        SELECT p.slug AS slug, g.id AS run_id, g.tier_used AS tier_used
+          FROM gather_runs g
+          JOIN researchers r ON r.id = g.researcher_id
+          LEFT JOIN profiles p ON p.id = g.profile_id
+         WHERE r.orcid = ?
+           AND (p.user_id = ? OR (p.id IS NULL AND g.user_id = ?))
+           AND g.tier_used IN ({placeholders})
+           AND {_INFLIGHT_PREDICATE}
+         ORDER BY g.id DESC
+         LIMIT 1
+        """,
+        (orcid, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
+    ).fetchone()

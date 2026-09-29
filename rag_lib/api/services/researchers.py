@@ -210,7 +210,9 @@ def prepare_researcher_import(
             if not wanted:
                 raise ValueError("select at least one work to import")
         client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
-        listing = orcid_service.list_works(oid, client)
+        # No registry call: this path builds an import plan and never
+        # looks at claimed / duplicate_of. See orcid.prepare_import.
+        listing = orcid_service.list_works(oid, client, check_registry=False)
         records = orcid_service.records_for(listing, wanted)
         if wanted is not None and not records:
             raise orcid_service.WorksNotFound(

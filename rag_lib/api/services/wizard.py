@@ -41,6 +41,7 @@ from ...coherence import coherence as coherence_compute
 from ...db import encode_vector
 from ...db.repos import (
     embeddings as embeddings_repo,
+    gather_runs as gather_runs_repo,
     papers as papers_repo,
     profiles as profiles_repo,
     schedules as schedules_repo,
@@ -160,6 +161,18 @@ def _unique_slug(
 # ---------------------------------------------------------------------------
 
 
+class ImportInProgress(RuntimeError):
+    """The draft's seeds are still being imported.
+
+    Distinct from "this draft has no seeds": the wizard should show the
+    import's progress and poll, not offer the manual pick step.
+    """
+
+    def __init__(self, slug: str):
+        super().__init__(f"an import is still filling draft '{slug}'")
+        self.slug = slug
+
+
 def compute_draft_coherence(
     conn: sqlite3.Connection, *, user_id: int, slug: str
 ) -> DraftCoherence:
@@ -170,6 +183,14 @@ def compute_draft_coherence(
     ids, vecs = _seed_embeddings_with_ids(conn, profile_id, embedding_model)
     bins = profiles_repo.coherence_bins(conn, profile_id)
     if not vecs:
+        # No seeds has two causes that look identical here and must not read
+        # the same to the user: nothing was ever attached, or an import is
+        # still resolving and embedding (it writes profile_seeds at the end,
+        # so a draft mid-import is byte-for-byte an empty one). Saying "no
+        # seed papers yet" while 82 are being embedded invites the user to
+        # start adding them by hand.
+        if gather_runs_repo.has_unfinished_import(conn, profile_id):
+            raise ImportInProgress(slug)
         conn.execute(
             """
             UPDATE profiles SET

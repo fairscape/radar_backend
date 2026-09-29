@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+
+import structlog
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -43,6 +45,8 @@ from ..schemas import (
     ProsopiaWorksResponse,
 )
 from ..settings import Settings
+
+log = structlog.get_logger("rag_lib.api.routers.prosopia")
 
 router = APIRouter()
 
@@ -285,6 +289,12 @@ def import_orcid(
     reads any import run, whichever route started it). 400 for a bad
     ORCID or an empty selection, 404 when none of the selected works are
     the author's, 502 when OpenAlex could not be read.
+
+    One 200 does not mean a start: when an import of this person is
+    already in flight the response carries ``already_running=True`` and
+    points at that run, and *this* request's selection is discarded. The
+    client has to say so rather than report progress for a selection the
+    server never saw.
     """
     from ..services import orcid as orcid_service
 
@@ -299,6 +309,14 @@ def import_orcid(
             embedding_model=body.embedding_model,
             openalex_client=openalex_client,
         )
+    except orcid_service.ImportAlreadyRunning as exc:
+        # Not an error: the user asked for an import that is already
+        # running, so hand back the run they can poll instead of starting
+        # a duplicate. Same response shape, so the client polls as usual.
+        log.info("orcid.import_already_running",
+                 user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
+        return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id,
+                                   already_running=True)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
