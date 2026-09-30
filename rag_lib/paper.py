@@ -183,5 +183,15 @@ def title_key(title: str | None) -> str:
     ``strip().lower()`` alone, as the persistence layer used to, let those
     pairs through while collapsing every paper titled "Editorial" into one.
     """
-    key = "".join(c for c in (title or "").lower() if c.isalnum())
+    key = normalize_title(title)
     return key if len(key) >= MIN_TITLE_KEY_LEN else ""
+
+
+def normalize_title(title: str | None) -> str:
+    """Lowercase alphanumerics of a title, with no length floor.
+
+    The normalization ``title_key`` applies, for a caller that brings its
+    own evidence for short titles instead of trusting the title alone.
+    Kept as the one definition so the two can never drift apart.
+    """
+    return "".join(c for c in (title or "").lower() if c.isalnum())

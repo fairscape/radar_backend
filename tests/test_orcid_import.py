@@ -215,6 +215,81 @@ def test_grouping_keeps_a_duplicate_whose_original_is_missing():
     assert [r["openalex_id"] for r in out] == ["W1", "W3", "W2"]
 
 
+def _typed(oid, doi, title, year, typ, *, authors=("Sadnan Al Manir", "Clark, Timothy")):
+    w = _work(oid, doi, title, year)
+    w["type"] = typ
+    w["authorships"] = [
+        {"author": {"display_name": a, "orcid": f"https://orcid.org/{ORCID}" if i == 0 else None},
+         "author_position": "first" if i == 0 else "last"}
+        for i, a in enumerate(authors)
+    ]
+    return w
+
+
+def test_a_short_title_merges_when_year_and_authors_agree():
+    """A Zenodo concept DOI and version DOI: title too short to trust alone.
+
+    "EVI: Evidence Graph Ontology v1.0" is 27 alphanumerics, under
+    MIN_TITLE_KEY_LEN, so title_key refuses it and the two copies -- DOIs
+    ...527 and ...528 -- used to be listed twice.
+    """
+    works = list_works(ORCID, StubOrcidOpenAlex([
+        _typed("W1", "10.5281/zenodo.7903528", "EVI: Evidence Graph Ontology v1.0", 2023, "dataset"),
+        _typed("W2", "10.5281/zenodo.7903527", "EVI: Evidence Graph Ontology v1.0", 2023, "dataset"),
+    ]))["works"]
+    assert sorted(w["duplicate_of"] is None for w in works) == [False, True]
+
+
+def test_a_short_title_alone_is_not_enough():
+    """Same short title and a versioned type, but a different year or author."""
+    works = list_works(ORCID, StubOrcidOpenAlex([
+        _typed("W1", "10.5281/zenodo.1", "Test ROCrate", 2020, "dataset"),
+        _typed("W2", "10.5281/zenodo.2", "Test ROCrate", 2021, "dataset"),
+        _typed("W3", "10.5281/zenodo.3", "Test ROCrate", 2021, "dataset", authors=("Someone Else",)),
+    ]))["works"]
+    assert all(w["duplicate_of"] is None for w in works)
+
+
+def test_an_editors_editorials_stay_apart_even_in_one_year():
+    """The reason the floor exists: every "Editorial" is not one paper.
+
+    One author, one year, the same one-word title -- identical on every
+    field a summary has. Only the type says these are separate pieces.
+    """
+    works = list_works(ORCID, StubOrcidOpenAlex([
+        _typed("W1", "10.1/e1", "Editorial", 2021, "editorial", authors=("Jane Smith",)),
+        _typed("W2", "10.1/e2", "Editorial", 2021, "editorial", authors=("Jane Smith",)),
+    ]))["works"]
+    assert all(w["duplicate_of"] is None for w in works)
+
+
+def test_a_tool_and_the_preprint_about_it_stay_apart():
+    """Same short title, year and authors, both mergeable types -- but a
+    software release and the preprint describing it are two works."""
+    works = list_works(ORCID, StubOrcidOpenAlex([
+        _typed("W1", "10.5281/zenodo.9", "scTools", 2023, "software"),
+        _typed("W2", "10.1101/2023.01.01.1", "scTools", 2023, "preprint"),
+    ]))["works"]
+    assert all(w["duplicate_of"] is None for w in works)
+
+
+def test_chapters_sharing_a_truncated_book_title_stay_apart():
+    """Two chapters of one book, both titled with the book's name.
+
+    Measured on a real record: pages 3-27 and 254-270 of "Coexisting with
+    Large Carnivores", same year, same two authors in either order --
+    nothing in a summary separates them, so chapters never merge on a
+    short title.
+    """
+    works = list_works(ORCID, StubOrcidOpenAlex([
+        _typed("W1", "10.2307/jj.41003712.4", "Coexisting with Large Carnivores:", 2013,
+               "book-chapter", authors=("Tim W. Clark", "Murray B. Rutherford")),
+        _typed("W2", "10.2307/jj.41003712.11", "Coexisting with Large Carnivores:", 2013,
+               "book-chapter", authors=("Murray B. Rutherford", "Tim W. Clark")),
+    ]))["works"]
+    assert all(w["duplicate_of"] is None for w in works)
+
+
 def test_list_works_leaves_the_order_alone_when_nothing_is_duplicated():
     works = list_works(ORCID, StubOrcidOpenAlex(WORKS))["works"]
     assert [w["openalex_id"] for w in works] == ["W3", "W2", "W1"]

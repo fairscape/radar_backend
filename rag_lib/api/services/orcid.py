@@ -34,7 +34,7 @@ from ...db.repos import profiles as profiles_repo
 from ...db.repos import researchers as researchers_repo
 from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, fetch_claimed
-from ...paper import title_key
+from ...paper import normalize_title, title_key
 from ...prosopia_seeds import normalize_doi
 from . import wizard as wizard_service
 from .prosopia import ImportPlan
@@ -182,12 +182,72 @@ def _dedupe_key(s: dict[str, Any]) -> str:
     """What makes two summaries the same paper.
 
     Title first: a preprint and its version of record share a title but
-    almost never a DOI, and collapsing them is the whole point. The DOI
-    and the id are only fallbacks for a work whose title normalizes away
-    to nothing.
+    almost never a DOI, and collapsing them is the whole point. A title
+    too short to trust alone gets a second chance with more evidence (see
+    _short_title_key). The DOI and the id are only fallbacks after that.
     """
-    return title_key(s.get("title")) or (s.get("doi") or "").lower() \
-        or f"oa:{s['openalex_id']}"
+    return title_key(s.get("title")) or _short_title_key(s) \
+        or (s.get("doi") or "").lower() or f"oa:{s['openalex_id']}"
+
+
+# The types a short title may merge in: the ones that come in versions under
+# one name. An allowlist, not a denylist, because the failure runs the other
+# way: short titles are where unrelated works collide. Two chapters of one
+# book carry the book's title ("Coexisting with Large Carnivores:", pages
+# 3-27 and 254-270, same year, same two authors), and an editor writes
+# several "Editorial"s a year -- same title, year and author, different
+# pieces. Nothing in a summary tells those apart. What does come in
+# versions is a Zenodo deposit (concept DOI and version DOI) or a preprint
+# revision, so only those merge on a short title; everything else waits for
+# a title long enough to trust or a shared DOI.
+_SHORT_TITLE_MERGEABLE = frozenset({"dataset", "software", "preprint"})
+
+
+def _surname(name: str) -> str:
+    """"Clark, Timothy" and "Tim W. Clark" both -> "clark"."""
+    name = (name or "").strip()
+    if "," in name:
+        name = name.split(",", 1)[0]
+    else:
+        parts = name.split()
+        name = parts[-1] if parts else ""
+    return normalize_title(name)
+
+
+def _short_title_key(s: dict[str, Any]) -> str:
+    """A dedupe key for a title below MIN_TITLE_KEY_LEN, or "".
+
+    title_key refuses short titles so that every "Editorial" does not
+    collapse into one, and those rows then fell through to the DOI. But the
+    commonest short-title duplicate is a Zenodo record's concept DOI and
+    version DOI -- "EVI: Evidence Graph Ontology v1.0" as 10.5281/zenodo.
+    7903527 and .7903528 -- which never share a DOI, so they were listed
+    twice. The title is not enough on its own; it is enough together with
+    the same year, the same authors and a type that comes in versions (see
+    _SHORT_TITLE_MERGEABLE for why the type matters as much as the rest).
+
+    ``authors`` is capped at three names in a summary, so the key takes
+    those surnames as a set plus the full count: copies that list the same
+    first three people in another order still meet, and anything less
+    certain is left unmerged.
+    """
+    if s.get("type") not in _SHORT_TITLE_MERGEABLE:
+        return ""
+    title = normalize_title(s.get("title"))
+    year = s.get("year")
+    authors = [a for a in (s.get("authors") or []) if a]
+    if not title or year is None or not authors:
+        return ""
+    names = ",".join(sorted(_surname(a) for a in authors))
+    # The type is part of the key, not only a gate: versions of one work
+    # share a type (two Zenodo releases are both datasets, two revisions
+    # both preprints), while a tool and the preprint describing it --
+    # "scTools" the software and "scTools" the paper, same year, same
+    # people -- are different works. Merged, the preprint could be marked
+    # the software's duplicate, and with the software unticked as a
+    # non-paper the paper would drop out of the default seeds entirely.
+    return (f"short:{s.get('type')}|{title}|{year}|{names}"
+            f"|{s.get('n_authors') or len(authors)}")
 
 
 def _version_rank(s: dict[str, Any]) -> tuple:
@@ -252,8 +312,14 @@ def _group_duplicates(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     already passed and reads the list as full of duplicates. Adjacency is
     what makes a pair legible as one paper in two versions.
 
+    The picker has since stopped showing copies in its main list (it
+    collapses them behind a disclosure), so this order is no longer what
+    the main list looks like. It still orders that disclosure -- each
+    original's copies together, originals in year order -- and it is what a
+    reader of the raw JSON sees.
+
     Only the order changes: every row survives, the kept copies stay in
-    their year/citation order, and nothing is hidden or unticked here.
+    their year/citation order, and nothing is dropped or unticked here.
     """
     children: dict[str, list[dict[str, Any]]] = {}
     for s in summaries:
@@ -292,7 +358,9 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
     the list: ``claimed`` says whether the person's own ORCID record lists
     it (``None`` when the registry could not be read at all), and
     ``duplicate_of`` names the copy kept when several rows are one paper.
-    The picker starts those unticked; nothing is hidden.
+    This response drops nothing; what a client does with the annotations
+    is its own business (the picker starts unclaimed works unticked and
+    collapses duplicate copies behind a "show them" disclosure).
 
     ``check_registry=False`` skips the one extra HTTP call, for tests and
     for callers that have already decided.
