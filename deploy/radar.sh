@@ -268,19 +268,25 @@ do_watchdog() {
 # into a permanent outage. @reboot start racing the first tick is the same
 # collision. status and logs are read-only and do not need the lock.
 # Who actually holds the lock, as "<pid> <cmdline>", or nothing if no one
-# does. Asked of the kernel rather than tracked in a file, because a pid
-# written into the lock file goes stale exactly when it matters -- on a kill
-# -9 or a leak -- and this only runs on the failure path.
+# else does. Asked of the kernel rather than tracked in a file, because a
+# pid written into the lock file goes stale exactly when it matters -- on a
+# kill -9 or a leak -- and this only runs on the failure path.
+#
+# Call it as $(exec 9>&-; lock_holder): the calling script holds fd 9 on
+# the lock too, and so does every subshell and child it forks. The first
+# version scanned /proc and returned the first match, which could be the
+# caller itself -- whose cmdline contains "radar.sh", so a daemon that had
+# leaked the lock was reported as "another radar.sh is running" and the
+# warning below never fired. Which process came first depended on pid
+# string order. Now the subshell closes fd 9 before looking (so neither it
+# nor the find it runs is a match), and $$ -- the caller, even inside the
+# subshell -- is skipped.
 lock_holder() {
-	local proc fd target
-	for proc in /proc/[0-9]*; do
-		for fd in "$proc"/fd/*; do
-			target=$(readlink "$fd" 2>/dev/null) || continue
-			if [ "$target" = "$LOCKFILE" ]; then
-				echo "${proc#/proc/} $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null)"
-				return 0
-			fi
-		done
+	local pid
+	for pid in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$LOCKFILE" 2>/dev/null | cut -d/ -f3 | sort -un); do
+		[ "$pid" = "$$" ] && continue
+		echo "$pid $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+		return 0
 	done
 	return 1
 }
@@ -289,7 +295,7 @@ case "${1:-status}" in
 start | stop | restart | watchdog)
 	exec 9>"$LOCKFILE"
 	if ! flock -n 9; then
-		holder=$(lock_holder || true)
+		holder=$(exec 9>&-; lock_holder || true)
 		case "$holder" in
 		*radar.sh*)
 			# Not an error: the other holder is doing the work.
