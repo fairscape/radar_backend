@@ -121,9 +121,20 @@ do_backup() {
 		# A tenth is generous: it tolerates a deliberate cleanup while still
 		# catching an empty or half-written database.
 		if [ "${prev_rows:-0}" -gt 0 ] && [ "$rows" -lt $((prev_rows / 10)) ]; then
-			log "FAILED: snapshot has $rows papers+profiles, previous had $prev_rows -- refusing to keep it or prune anything"
-			rm -f "$tmp"
-			return 1
+			# A deliberate wipe trips this on every run from then on, not
+			# just once: the newest trusted snapshot stays the pre-wipe one,
+			# so without a way to say "yes, on purpose" the backups stop for
+			# good (2026-09-29, clearing test data). ACCEPT_SHRINK=1 keeps
+			# this one snapshot anyway; it becomes the newest, and so the
+			# baseline the next run compares against. An env var rather
+			# than a flag so cron can never pass it by accident.
+			if [ "${ACCEPT_SHRINK:-0}" = 1 ]; then
+				log "ACCEPT_SHRINK: keeping a snapshot of $rows papers+profiles (previous had $prev_rows) as the new baseline"
+			else
+				log "FAILED: snapshot has $rows papers+profiles, previous had $prev_rows -- refusing to keep it or prune anything (ACCEPT_SHRINK=1 if the shrink was deliberate)"
+				rm -f "$tmp"
+				return 1
+			fi
 		fi
 	fi
 
