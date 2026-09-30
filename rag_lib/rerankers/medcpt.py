@@ -54,6 +54,20 @@ from ..scoring import attach_percentile
 _model_cache: dict[tuple[str, str], tuple] = {}
 _model_lock = Lock()
 
+# One lock per cached tokenizer, keyed like _model_cache and held around
+# every call into it. A fast tokenizer is one Rust object shared by every
+# thread in the process, and a call whose
+# truncation/padding differs from the previous call's mutates it in place
+# (`enable_truncation` / `no_padding` take a mutable borrow). Two threads
+# doing that at once raise "RuntimeError: Already borrowed". The scheduler
+# runs up to ten profiles on a thread pool, so from 2026-08-23 to 2026-09-29
+# this failed 21 nightly reranks -- profile 13 alone lost seven. Reproduced
+# with 8 threads: 2374 errors unlocked, 0 locked. Only the tokenizer is
+# serialized; the forward pass is not, and dominates the cost. Per model
+# rather than one module-wide lock, because two cached models have two
+# separate tokenizers and nothing to contend over.
+_tokenizer_locks: dict[tuple[str, str], Lock] = {}
+
 
 def _batch_span(values: list[float]) -> tuple[float, float]:
     """Offset and span for a batch min-max: ``(x - lo) / span`` -> [0, 1].
@@ -433,29 +447,17 @@ class MedCPTReranker:
         for start in range(0, len(pairs), self.batch_size):
             batch = pairs[start: start + self.batch_size]
             with torch.no_grad():
-                encoded = tokenizer(
-                    batch,
-                    truncation=True,
-                    padding=True,
-                    return_tensors="pt",
-                    max_length=512,
-                )
-                # [rerank-probe] 临时诊断 — 确认输入后整块删除。必须放在
-                # 下面那行搬到 GPU 之前，encoded 这时还是 BatchEncoding。
-                if start == 0:
-                    _q, _a = batch[0]
-                    _nq = len(tokenizer(_q)["input_ids"])
-                    _na = len(tokenizer(_a)["input_ids"])
-                    _kept = len(encoded["input_ids"][0])
-                    print("[rerank] " + "=" * 70, flush=True)
-                    print(f"[rerank] {len(queries)} queries x {len(articles)} articles "
-                          f"= {len(pairs)} pairs, batch_size={self.batch_size}", flush=True)
-                    print(f"[rerank] pair0 截断前: query {_nq} tok + article {_na} tok "
-                          f"= {_nq + _na}；配对预算 512，实际保留 {_kept}", flush=True)
-                    print(f"[rerank] pair0 模型实际看到的（[SEP] 分隔 query / article）:",
-                          flush=True)
-                    print(tokenizer.decode(encoded["input_ids"][0]), flush=True)
-                    print("[rerank] " + "=" * 70, flush=True)
+                # setdefault is atomic under the GIL, so two first callers
+                # still end up with one lock -- and it does not depend on
+                # _load_model having run, which a test may have stubbed.
+                with _tokenizer_locks.setdefault((self.model_id, self.device), Lock()):
+                    encoded = tokenizer(
+                        batch,
+                        truncation=True,
+                        padding=True,
+                        return_tensors="pt",
+                        max_length=512,
+                    )
                 if device != "cpu":
                     encoded = {k: v.to(device) for k, v in encoded.items()}
                 logits = model(**encoded).logits.squeeze(dim=1)

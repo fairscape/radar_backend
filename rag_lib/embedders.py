@@ -107,6 +107,17 @@ SPECTER2_ADAPTER = "allenai/specter2"
 
 
 _specter2_model = None  # lazy-loaded; reused across calls
+# Load once even when the first calls arrive together: without this, two
+# threads that both see None each load the model onto the GPU and one copy
+# is thrown away.
+_specter2_load_lock = threading.Lock()
+# Every call into the shared tokenizer. Today every caller passes the same
+# truncation/padding, so the Rust tokenizer is never mutated after the first
+# call and concurrent use happens to be safe -- which is the only reason
+# this never raised the "Already borrowed" that MedCPT's reranker hit 21
+# times. That is a property of the call sites, not of the code, and the
+# first call still mutates. See _tokenizer_lock in rerankers/medcpt.py.
+_specter2_tokenizer_lock = threading.Lock()
 
 
 def _load_specter2():
@@ -120,6 +131,13 @@ def _load_specter2():
     global _specter2_model
     if _specter2_model is not None:
         return _specter2_model
+    with _specter2_load_lock:
+        if _specter2_model is None:
+            _specter2_model = _load_specter2_unlocked()
+    return _specter2_model
+
+
+def _load_specter2_unlocked():
     try:
         from adapters import AutoAdapterModel  # type: ignore
         from transformers import AutoTokenizer  # type: ignore
@@ -141,8 +159,7 @@ def _load_specter2():
                        set_active=True)
     model.eval()
     model.to(device)
-    _specter2_model = (tokenizer, model, device)
-    return _specter2_model
+    return (tokenizer, model, device)
 
 
 def specter2_embed(text: str) -> list[float]:
@@ -151,13 +168,14 @@ def specter2_embed(text: str) -> list[float]:
     import torch  # type: ignore — lazy
 
     tokenizer, model, device = _load_specter2()
-    inputs = tokenizer(
-        text,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-        max_length=512,
-    )
+    with _specter2_tokenizer_lock:
+        inputs = tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         out = model(**inputs)
