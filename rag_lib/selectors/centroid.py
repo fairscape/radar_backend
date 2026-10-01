@@ -109,6 +109,10 @@ class CentroidSelector:
                 if embedder is None:
                     embedder = get_embedder(key)
                 v = embedder(build_embedding_input(p))
+                # Keep it on the paper: the gather persists ``p.embeddings``
+                # (db_store.store_papers), so a refit can re-score stored
+                # candidates without embedding them again (scoring/rescore.py).
+                p.embeddings[key] = [float(x) for x in v]
             vec = np.asarray(v, dtype=float)
             score_raw = _cosine(self._centroid, vec)
             n = np.linalg.norm(vec) + 1e-12

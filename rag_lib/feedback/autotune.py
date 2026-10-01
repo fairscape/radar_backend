@@ -101,4 +101,6 @@ def apply_recommended(
         return {"old": old, "new": new, "n_events": n_events, "applied": False}
 
     profiles_repo.update_threshold(db, profile_id, new)
+    from rag_lib.scheduler.jobs import rescore_pool  # the feed's pool moved
+    rescore_pool(db, profile_id)
     return {"old": old, "new": new, "n_events": n_events, "applied": True}

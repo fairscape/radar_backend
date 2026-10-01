@@ -111,6 +111,12 @@ class Paper:
     local_path: str | None = None
     source: str = "unknown"
     added: str | None = None  # ISO-8601 UTC timestamp of ingest
+    # Author display names, in byline order. Gathered papers lost them at
+    # the OpenAlex -> Paper step, so every feed card read "Unknown authors"
+    # while the raw work had the byline all along.
+    authors: list[str] = field(default_factory=list)
+    # ISO date from OpenAlex. Same loss: cards fell back to "<year>-01-01".
+    publication_date: str | None = None
     pdf_url: str | None = None
     oa_status: str | None = None
 
@@ -132,6 +138,8 @@ class Paper:
             "local_path": self.local_path,
             "source": self.source,
             "added": self.added,
+            "authors": list(self.authors),
+            "publication_date": self.publication_date,
             "pdf_url": self.pdf_url,
             "oa_status": self.oa_status,
         }
@@ -155,6 +163,8 @@ class Paper:
             local_path=d.get("local_path"),
             source=d.get("source") or "unknown",
             added=d.get("added"),
+            authors=list(d.get("authors") or []),
+            publication_date=d.get("publication_date"),
             pdf_url=d.get("pdf_url"),
             oa_status=d.get("oa_status"),
         )

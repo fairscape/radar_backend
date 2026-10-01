@@ -56,6 +56,7 @@ from ..schemas import (
     Card,
     DraftCoherence,
     DraftDryRun,
+    DryRunPaper,
     LeastSimilarPair,
     SeedSimilarity,
     SweepRow,
@@ -304,6 +305,22 @@ def aggregate_draft_topics(
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
+    # Topics we've never seen start on.
+    topic_filters = _aggregate_topics(conn, profile_id, new_on=True)
+
+    conn.execute(
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(topic_filters), profile_id),
+    )
+    conn.commit()
+    return topic_filters
+
+
+def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool) -> dict:
+    """The seeds' aggregated topics, carrying forward prior on/off states.
+
+    Writes nothing. ``new_on`` is the state of a topic not seen before.
+    """
     prior_on = _prior_topic_states(conn, profile_id)
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
@@ -312,17 +329,53 @@ def aggregate_draft_topics(
     # that vault.upload() stored and merge novel ones into the filters.
     topic_filters = _try_merge_umls_topics(conn, profile_id, topic_filters)
 
-    # Carry forward prior on/off state; topics we've never seen start on.
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
-            t["on"] = prior_on.get(t["id"], True)
+            t["on"] = prior_on.get(t["id"], new_on)
+    return topic_filters
 
+
+def preview_topics(conn: sqlite3.Connection, *, user_id: int, slug: str) -> tuple[dict, set[str]]:
+    """Topics for editing a saved interest, without changing it.
+
+    ``aggregate_draft_topics`` (behind ``recompute-topics``) writes as it
+    reads and switches every newly found topic *on* -- right for a draft,
+    but on a live interest it widened the next scan before the user had
+    seen the list. Here a new topic starts off, and nothing is written
+    until ``save_topics``. Returns the filters and the ids that are new.
+    """
+    row = _require_profile(conn, user_id, slug)
+    profile_id = int(row["id"])
+    prior = set(_prior_topic_states(conn, profile_id))
+    topic_filters = _aggregate_topics(conn, profile_id, new_on=False)
+    new = {t["id"] for t in topic_filters.get("topics") or [] if t.get("id") and t["id"] not in prior}
+    return topic_filters, new
+
+
+def save_topics(
+    conn: sqlite3.Connection, *, user_id: int, slug: str, selected_topic_ids: list[str],
+) -> dict:
+    """Switch an interest's topics on or off: exactly ``selected_topic_ids`` on.
+
+    Re-aggregates first, so a topic the seeds gained since the last
+    aggregation can be switched on. Raises ``ValueError`` when topics exist
+    but none would be on -- a scan needs at least one. Papers already found
+    through a topic switched off stay; it only narrows the next scans.
+    """
+    row = _require_profile(conn, user_id, slug)
+    profile_id = int(row["id"])
+    full = _aggregate_topics(conn, profile_id, new_on=False)
+    ids = {t["id"] for t in full.get("topics") or [] if t.get("id")}
+    selected = set(selected_topic_ids) & ids
+    if ids and not selected:
+        raise ValueError("switch on at least one topic: a scan searches by them")
+    pruned = _prune_topic_filters(full, selected)
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(topic_filters), profile_id),
+        (json.dumps(pruned), profile_id),
     )
     conn.commit()
-    return topic_filters
+    return pruned
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +542,16 @@ def compute_dry_run_for_profile(
     # selector's cosine here — the dry run does not rerank — but read
     # ``score_raw`` when present so this stays true if it ever does.
     scores = [round(float(e[2].get("score_raw", e[0])), 4) for e in ranked]
+    papers = sorted(
+        (
+            DryRunPaper(
+                id=e[1].openalex_id or "", title=e[1].title or "",
+                venue=e[1].venue or "", year=e[1].year, score=sc,
+            )
+            for e, sc in zip(ranked, scores)
+        ),
+        key=lambda p: p.score, reverse=True,
+    )
 
     band = None
     try:
@@ -501,7 +564,7 @@ def compute_dry_run_for_profile(
     rng = calibration.score_range(scores, band)
 
     return DraftDryRun(
-        sweep=sweep, preview=preview, scores=scores,
+        sweep=sweep, preview=preview, scores=scores, papers=papers,
         suggested_threshold=suggested,
         seed_similarity=_seed_similarity_schema(band),
         score_range=list(rng) if rng else None,
@@ -597,10 +660,167 @@ def remove_draft_seed(
     """Drop one seed from a draft, e.g. the off-topic half of the least-alike pair.
 
     Raises ``LookupError`` when the draft doesn't exist; returns False
-    when the paper was not one of its seeds.
+    when the paper was not one of its seeds. Kept for the draft-only
+    route; ``remove_seed`` is the general form.
     """
-    row = _require_draft(conn, user_id, slug)
-    return profiles_repo.detach_seed(conn, int(row["id"]), openalex_id) > 0
+    _require_draft(conn, user_id, slug)
+    return remove_seed(conn, user_id=user_id, slug=slug, openalex_id=openalex_id)
+
+
+# ---------------------------------------------------------------------------
+# Seeds of any profile, and re-fitting a live one
+# ---------------------------------------------------------------------------
+
+
+def _as_seed_id(conn: sqlite3.Connection, profile_id: int, openalex_id: str) -> str | None:
+    """The stored form of ``openalex_id`` among this profile's seeds, or None.
+
+    Seeds are stored as https://openalex.org/W… (or a synthetic
+    ``prosopia:``/``local:`` id), and a caller may send the bare W-id.
+    Both name the same seed.
+    """
+    seeds = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    oa = (openalex_id or "").strip()
+    if oa in seeds:
+        return oa
+    if oa.startswith("W") and f"https://openalex.org/{oa}" in seeds:
+        return f"https://openalex.org/{oa}"
+    return None
+
+
+def embed_missing(
+    conn: sqlite3.Connection, embedding_model: str, openalex_ids: list[str],
+) -> int:
+    """Embed those of ``openalex_ids`` that have no vector under this model.
+
+    A seed without a vector is silently left out of the fit -- the
+    selector only sees papers it can place -- so anything that adds a
+    seed has to make sure it has one. Uploads and imports embed as they
+    store; a paper attached from the feed does not, because candidates
+    are scored without their vectors being kept (449 of 449 had none on
+    2026-10-01). Same input text as every other path. Returns how many
+    were embedded.
+    """
+    from ...embed import build_embedding_input
+    from ...embedders import get_embedder
+
+    embedder = None
+    n = 0
+    for oa_id in openalex_ids:
+        if embeddings_repo.has(conn, oa_id, embedding_model):
+            continue
+        prow = papers_repo.get_by_openalex_id(conn, oa_id)
+        if prow is None:
+            continue
+        if embedder is None:
+            embedder = get_embedder(embedding_model)
+        paper = Paper(
+            doi=prow["doi"], openalex_id=prow["openalex_id"],
+            title=prow["title"] or "", abstract=prow["abstract"] or "",
+            year=prow["year"], venue=prow["venue"], body_text=prow["body_text"],
+        )
+        embeddings_repo.upsert(conn, oa_id, embedding_model,
+                               embedder(build_embedding_input(paper)))
+        n += 1
+    if n:
+        log.info("seeds.embedded_missing", model=embedding_model, n=n)
+    return n
+
+
+def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
+    """Re-fit a live profile's selector on the seeds it has now.
+
+    The fitted half of ``commit_draft``. Until this existed the scheduler
+    kept scoring with the centroid fitted at commit -- it reuses the
+    persisted selector -- so seeds added to or removed from a live
+    interest changed nothing in its feed, and ``POST /{key}/refit``
+    returned a fixed placeholder string. Threshold and topics are left
+    alone: they are the user's choices, not a function of the seeds.
+
+    Raises ``LookupError`` for an unknown profile and ``ValueError`` for
+    a draft (fitted at commit) or a profile with no embedded seed.
+    """
+    row = profiles_repo.get_by_slug(conn, user_id, slug)
+    if row is None:
+        raise LookupError(f"profile '{slug}' not found for current user")
+    if row["is_draft"]:
+        raise ValueError(f"'{slug}' is a draft; it is fitted when it is committed")
+    t0 = time.monotonic()
+    profile_id = int(row["id"])
+    embed_missing(conn, row["embedding_model"],
+                  profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    profile = _load_profile(conn, row,
+                            topic_filters=profiles_repo.topic_filters(conn, profile_id))
+    embedded = [p for p in profile.papers if profile.embedding_model in p.embeddings]
+    if not embedded:
+        raise ValueError(f"'{slug}' has no embedded seed papers to fit")
+    selector = _new_selector_for_draft(row, profile, threshold=row["threshold"])
+    selector.fit(profile)
+    sel_cfg = selector.config()
+    diag = sel_cfg.get("diagnostics_snapshot") or {}
+    centroid_list = sel_cfg.get("centroid")
+    profiles_repo.update_fit(
+        conn,
+        profile_id,
+        centroid=encode_vector(centroid_list) if centroid_list else None,
+        selector_config=sel_cfg,
+        coherence_median=diag.get("coherence_median"),
+        coherence_iqr=diag.get("coherence_iqr"),
+        coherence_bimodal=diag.get("coherence_bimodal"),
+        n_seed=len(profile.papers),
+    )
+    try:
+        band = calibration.seed_similarity_band(
+            profile.seed_embeddings(profile.embedding_model)
+        )
+    except ValueError:
+        band = None
+    profiles_repo.update_seed_similarity(conn, profile_id, band)
+    # The stored candidates were scored against the old seeds; without this
+    # a new seed changed nothing in the feed until the next morning's scan.
+    from rag_lib.scoring.rescore import rescore_candidates
+    rescored = rescore_candidates(conn, profile_id)
+    elapsed = round(time.monotonic() - t0, 2)
+    log.info("profile.refit", slug=slug, n_seeds=len(profile.papers),
+             n_embedded=len(embedded), elapsed_s=elapsed, **rescored)
+    return {"n_seeds": len(profile.papers), "n_embedded": len(embedded),
+            "elapsed_s": elapsed, **rescored}
+
+
+def remove_seed(
+    conn: sqlite3.Connection, *, user_id: int, slug: str, openalex_id: str
+) -> bool:
+    """Drop one seed from a draft or a live profile.
+
+    Raises ``LookupError`` for an unknown profile and ``ValueError`` when
+    it would leave a live interest with no seed (there would be nothing to
+    fit). Returns False when the paper was not one of its seeds. A live
+    profile is re-fitted at once, so its next scan scores against the
+    seeds it actually has.
+    """
+    row = profiles_repo.get_by_slug(conn, user_id, slug)
+    if row is None:
+        raise LookupError(f"profile '{slug}' not found for current user")
+    profile_id = int(row["id"])
+    stored = _as_seed_id(conn, profile_id, openalex_id)
+    if stored is None:
+        return False
+    if not row["is_draft"]:
+        # Checked before anything is written. detach_seed commits at once,
+        # so a refit that then failed -- the remaining seeds all lacking a
+        # vector, say -- used to answer an error with the seed already
+        # gone and the old centroid still in use. Counting seeds was not
+        # enough: what the fit needs is an *embedded* one.
+        remaining = [s for s in profiles_repo.list_seed_openalex_ids(conn, profile_id) if s != stored]
+        if not remaining:
+            raise ValueError("an interest needs at least one seed; add another before removing this one")
+        embed_missing(conn, row["embedding_model"], remaining)
+        if not any(embeddings_repo.has(conn, s, row["embedding_model"]) for s in remaining):
+            raise ValueError("none of the remaining seeds can be placed (no vector); add one that can before removing this one")
+    profiles_repo.detach_seed(conn, profile_id, stored)
+    if not row["is_draft"]:
+        refit_profile(conn, user_id=user_id, slug=slug)
+    return True
 
 
 # ---------------------------------------------------------------------------

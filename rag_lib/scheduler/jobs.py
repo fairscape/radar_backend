@@ -30,6 +30,7 @@ from ..gatherers.openalex import OpenAlexGatherer
 from ..openalex_tiers import enabled_topic_ids
 from ..paper import Paper
 from ..persistence.db_store import dedup_and_insert_candidates
+from ..scoring.pool import KEEP_ALL, passes, rescore_profile_pool
 from ..profile import Profile
 from ..radar import _days_ago_iso
 from ..selector import Selector
@@ -225,6 +226,26 @@ def _is_fit_payload(cfg: dict) -> bool:
     )
 
 
+def rescore_pool(conn, profile_id: int, settings=None, *, reranker=None) -> int:
+    """``rescore_profile_pool`` with the interest's own reranker weights.
+
+    For every caller that changes the pool or its threshold: the gather,
+    the CLI gather, and a threshold edit. Building the reranker only reads
+    its config; the model loads on first use.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+    if reranker is None:
+        prow = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        reranker = _build_reranker(prow, settings)
+    return rescore_profile_pool(
+        conn, profile_id,
+        alpha=float(getattr(reranker, "alpha", getattr(settings, "RADAR_RERANKER_ALPHA", 0.4))),
+        beta=float(getattr(reranker, "beta", getattr(settings, "RADAR_RERANKER_BETA", 0.6))),
+    )
+
+
 def _build_reranker(profile_row, settings):
     """Construct a reranker from profile config or global settings.
 
@@ -359,9 +380,16 @@ def gather_for_profile(
                 message=f"Embedding {len(candidates)} candidates",
             )
             with embed_progress(reporter.make_embed_tick(len(candidates))):
-                ranked = selector.select(
-                    candidates, profile, threshold=profile.threshold,
-                )
+                scored = selector.select(candidates, profile, threshold=KEEP_ALL)
+            # Keep the papers below the threshold too. They used to be
+            # dropped here, so the pool held only what cleared the threshold
+            # of the day: lowering it later showed nothing new, and the
+            # threshold histogram could only ever say "100% pass". They are
+            # stored but kept out of the feed (candidates.PASSES), and are
+            # not reranked -- the cross-encoder costs per paper, and a scan
+            # fetches ~5x more than passes.
+            ranked = [e for e in scored if passes(e[2].get("score_raw", e[0]), profile.threshold)]
+            below = [e for e in scored if not passes(e[2].get("score_raw", e[0]), profile.threshold)]
             # --- Reranker stage ---
             reranker = _build_reranker(profile_row, settings)
             if reranker.name != "noop" and ranked:
@@ -417,17 +445,25 @@ def gather_for_profile(
             tier_label = getattr(gatherer, "last_tier_used", None) or tier
             reporter.step(
                 "persisting",
-                total=len(ranked),
-                message=f"Saving {len(ranked)} ranked candidates",
+                total=len(ranked) + len(below),
+                message=f"Saving {len(ranked)} candidates above the threshold and {len(below)} below",
             )
+            # Passing papers first: the in-batch title dedup keeps the first
+            # copy, and only they count as new -- the run's "new" is what
+            # reached the feed.
             n_new, n_redup = dedup_and_insert_candidates(
                 conn,
                 profile_id=profile_id,
                 gather_run_id=run_id,
-                ranked=ranked,
+                ranked=ranked + below,
                 tier_used=tier_label,
                 source_topics=getattr(gatherer, "last_source_topics", None),
+                n_counted=len(ranked),
             )
+            # The blend and percentile just written are relative to this
+            # batch only; the feed ranks the whole pool. Put every row back
+            # on one scale (see scoring/pool.py for what went wrong).
+            rescore_pool(conn, profile_id, settings, reranker=reranker)
             api_calls = gatherer.cost().get("api_calls", 0)
             gather_runs_repo.finish(
                 conn,
@@ -613,6 +649,12 @@ def import_prosopia_profile(
                 draft_slug=plan.draft_slug, drafted=result["drafted"],
                 resolved_by=result["resolved_by"],
             )
+            # After finish(), not before: the draft is usable now, and this
+            # can take a few seconds a paper. Doing it here means wizard
+            # step 3 -- usually opened minutes later -- finds the seeds
+            # already extracted instead of fitting what it can into its
+            # 30-second budget. Anything left is the periodic job's.
+            _backfill_import_umls(conn, settings, plan)
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
             gather_runs_repo.finish(
@@ -629,4 +671,47 @@ def import_prosopia_profile(
         conn.close()
 
 
-__all__ = ["gather_for_profile", "dry_run_for_draft", "import_prosopia_profile"]
+def _backfill_import_umls(conn, settings, plan) -> None:
+    """UMLS for the papers one import brought in. Best-effort."""
+    from ..api.services.vault import backfill_seed_umls
+
+    try:
+        if plan.profile_id is not None:
+            ids = profiles_repo.list_seed_openalex_ids(conn, int(plan.profile_id))
+        elif plan.researcher_id is not None:
+            ids = [r[0] for r in conn.execute(
+                "SELECT openalex_id FROM researcher_papers WHERE researcher_id = ?",
+                (int(plan.researcher_id),),
+            )]
+        else:
+            return
+        backfill_seed_umls(conn, settings, openalex_ids=ids, limit=max(1, len(ids)))
+    except Exception:  # noqa: BLE001 -- the import itself already succeeded
+        log.exception("prosopia_import.umls_backfill_failed", slug=plan.slug)
+
+
+def backfill_seed_umls_job(settings: Any | None = None) -> int:
+    """Periodic: extract UMLS for seeds that have never been extracted.
+
+    The safety net under every path a seed can arrive by -- an import
+    whose thread died, a paper added from the vault or the feed, an
+    upload whose extraction failed, step 3 running out of budget. Before
+    it existed nothing ever came back for them. Bounded per run.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+    from ..api.services.vault import backfill_seed_umls
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        return backfill_seed_umls(conn, settings, limit=40)
+    except Exception:  # noqa: BLE001 -- next run tries again
+        log.exception("scheduler.umls_backfill_failed")
+        return 0
+    finally:
+        conn.close()
+
+
+__all__ = ["gather_for_profile", "dry_run_for_draft", "import_prosopia_profile",
+           "backfill_seed_umls_job"]

@@ -357,6 +357,13 @@ class OpenAlexClient:
             added=added,
             pdf_url=slim.get("pdf_url"),
             oa_status=slim.get("oa_status"),
+            # Straight from the raw work: slim_work does not carry them.
+            authors=[
+                (a.get("author") or {}).get("display_name")
+                for a in (work.get("authorships") or [])
+                if (a.get("author") or {}).get("display_name")
+            ],
+            publication_date=work.get("publication_date"),
         )
 
 

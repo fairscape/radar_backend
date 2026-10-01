@@ -25,6 +25,7 @@ from researcher_profiles import PaperRecord
 
 from rag_lib.api import settings as settings_module
 from rag_lib.db import apply_migrations, connect
+from rag_lib.db.repos import papers as papers_repo
 from rag_lib.db.repos import users as users_repo
 from rag_lib.openalex_client import OpenAlexClient
 from rag_lib.paper import Paper
@@ -534,7 +535,10 @@ def test_start_returns_the_draft_slug_and_a_run_id(env):
     body = resp.json()
     assert body["draft_slug"] == "nathan-c-sheffield"
     assert isinstance(body["run_id"], int)
-    assert set(body) == {"draft_slug", "run_id"}
+    # already_running was added when a second import of the same person
+    # began joining the first instead of starting another.
+    assert set(body) == {"draft_slug", "run_id", "already_running"}
+    assert body["already_running"] is False
 
     # The draft is real before the job runs — that is the point of doing
     # the Prosopia read inline.
@@ -807,5 +811,56 @@ def test_the_job_body_records_a_failure_on_the_run_row(env):
         assert row["finished_at"]
         assert "no-such-embedder" in row["error"]
         assert row["result_json"] is None
+    finally:
+        conn.close()
+
+
+def test_an_import_does_not_take_over_another_users_upload(env):
+    """User A uploaded a PDF; user B imports a profile listing the same
+    paper. The import used to stamp B as its uploader, moving A's file out
+    of A's vault and into B's."""
+    from rag_lib.db.repos import vault as vault_repo
+
+    conn = connect(env)
+    a = int(users_repo.upsert(conn, "a@example.com")["id"])
+    papers_repo.upsert(conn, {
+        "openalex_id": "https://openalex.org/W4415881950", "title": "Atacformer",
+        "source": "user_pdf", "uploaded_by_user_id": a, "local_path": "/vault/a/atacformer.pdf",
+    })
+    conn.close()
+
+    app = _app(StubProsopia(_stub_profile()), _stub_openalex())
+    assert _start(app, ref="sheffield-nathan").status_code == 200
+
+    conn = connect(env)
+    try:
+        owner = conn.execute(
+            "SELECT uploaded_by_user_id FROM papers WHERE openalex_id = ?",
+            ("https://openalex.org/W4415881950",),
+        ).fetchone()[0]
+        assert owner == a
+        b = int(conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0])
+        a_ids = {r["openalex_id"] for r in vault_repo.list_for_user(conn, a)}
+        b_ids = {r["openalex_id"] for r in vault_repo.list_for_user(conn, b)}
+        assert "https://openalex.org/W4415881950" in a_ids      # still A's upload
+        assert "https://openalex.org/W4415881950" in b_ids      # and in B's vault via the researcher
+    finally:
+        conn.close()
+
+
+def test_imported_papers_count_in_the_vault_stats_and_tags(env):
+    """Imports no longer stamp uploaded_by_user_id; the stats and tag counts
+    read that column alone, so a list of imported papers sat under '0 docs'."""
+    from rag_lib.db.repos import vault as vault_repo
+
+    app = _app(StubProsopia(_stub_profile()), _stub_openalex())
+    draft_slug = _start(app, ref="sheffield-nathan").json()["draft_slug"]
+    conn = connect(env)
+    try:
+        uid = int(conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0])
+        listed = len(vault_repo.list_for_user(conn, uid))
+        assert listed > 0
+        assert vault_repo.stats_for_user(conn, uid)["docs"] == listed
+        assert vault_repo.tag_counts_for_user(conn, uid).get(draft_slug, 0) > 0
     finally:
         conn.close()

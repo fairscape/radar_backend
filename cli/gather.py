@@ -290,6 +290,13 @@ def main() -> int:
             ranked=ranked,
             tier_used=tier_used,
         )
+        # Same as the scheduler: the values just written are per-batch,
+        # the feed ranks the whole pool (rag_lib/scoring/pool.py).
+        # The profile's own reranker weights, as the scheduler uses -- a
+        # per-profile override would otherwise be undone by a CLI gather.
+        from rag_lib.scheduler.jobs import rescore_pool
+
+        rescore_pool(db_state["conn"], db_state["profile_id"])
         gather_runs_repo.finish(
             db_state["conn"], db_state["run_id"],
             n_fetched=len(candidates),

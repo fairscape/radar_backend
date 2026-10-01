@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import sqlite3
 
+# A candidate is in the feed when it clears its interest's threshold. Gathers
+# store the papers below it too, so a lowered threshold can show them; every
+# read that means "the feed" applies this. Needs ``pc`` and ``pr`` (profiles).
+# Same rule as ``scoring.pool.passes``.
+PASSES = "(pc.score_raw IS NULL OR pr.threshold IS NULL OR pc.score_raw >= pr.threshold)"
+
 
 def insert_dedup(
     conn: sqlite3.Connection,
@@ -65,7 +71,10 @@ def insert_dedup(
           score_raw          = excluded.score_raw,
           score_max_seed     = excluded.score_max_seed,
           score_pct          = excluded.score_pct,
-          score_reranker_raw = excluded.score_reranker_raw,
+          -- A paper reranked once and now below the threshold is not
+          -- reranked again; keep its logit for if the threshold drops.
+          score_reranker_raw = COALESCE(excluded.score_reranker_raw,
+                                        profile_candidates.score_reranker_raw),
           score_reranker_norm= excluded.score_reranker_norm,
           score_blended      = excluded.score_blended,
           tier_used          = excluded.tier_used,
@@ -190,11 +199,13 @@ def unshown_for_profile(
     before the reranker was enabled.
     """
     return conn.execute(
-        """
+        f"""
         SELECT pc.*, p.title, p.doi, p.abstract, p.year, p.venue
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
+          AND {PASSES}
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
@@ -233,6 +244,27 @@ def scores_for_profile(
         (profile_id,),
     ).fetchall()
     return [float(r["s"]) for r in rows]
+
+
+def scored_papers_for_profile(
+    conn: sqlite3.Connection, profile_id: int
+) -> list[sqlite3.Row]:
+    """Every stored candidate, in the feed or not, best first, with its title.
+
+    The list beside the threshold slider: the score is the one the
+    threshold compares (``score_raw``, as ``scores_for_profile``).
+    """
+    return conn.execute(
+        """
+        SELECT pc.openalex_id, COALESCE(pc.score_raw, pc.score) AS s,
+               p.title, p.venue, p.year
+        FROM profile_candidates pc
+        JOIN papers p USING (openalex_id)
+        WHERE pc.profile_id = ?
+        ORDER BY s DESC
+        """,
+        (profile_id,),
+    ).fetchall()
 
 
 def mark_shown_bulk(
@@ -305,7 +337,7 @@ def top_for_profile(
     ever changes, and keeps the two read paths from silently diverging.
     """
     return conn.execute(
-        """
+        f"""
         SELECT
           pc.profile_id, pc.openalex_id, pc.score, pc.tier_used,
           pc.fetched_at, pc.shown_at, pc.dismissed_at, pc.saved_at,
@@ -313,10 +345,12 @@ def top_for_profile(
           pc.score_reranker_raw, pc.score_reranker_norm,
           pc.sourced_by_topic_id,
           p.title, p.doi, p.abstract, p.year, p.venue,
-          p.publication_date, p.topics_json
+          p.publication_date, p.topics_json, p.authors_json
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
+          AND {PASSES}
         ORDER BY COALESCE(pc.score_blended, pc.score) DESC
         LIMIT ?
         """,
@@ -341,24 +375,26 @@ def topic_yield_for_profile(
     recent window. Rows predating migration 0014 carry no attribution
     and are excluded.
     """
-    where = ["profile_id = ?", "sourced_by_topic_id IS NOT NULL"]
+    # What reached the feed: a topic is judged by papers above the threshold.
+    where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES]
     params: list = [profile_id]
     if since:
-        where.append("fetched_at >= ?")
+        where.append("pc.fetched_at >= ?")
         params.append(since)
 
     return conn.execute(
         f"""
         SELECT
-          sourced_by_topic_id           AS topic_id,
-          COUNT(*)                      AS n_candidates,
-          SUM(saved_at IS NOT NULL)     AS n_saved,
-          SUM(dismissed_at IS NOT NULL) AS n_dismissed,
-          SUM(shown_at IS NOT NULL)     AS n_shown,
-          MAX(fetched_at)               AS last_fetched_at
-        FROM profile_candidates
+          pc.sourced_by_topic_id           AS topic_id,
+          COUNT(*)                         AS n_candidates,
+          SUM(pc.saved_at IS NOT NULL)     AS n_saved,
+          SUM(pc.dismissed_at IS NOT NULL) AS n_dismissed,
+          SUM(pc.shown_at IS NOT NULL)     AS n_shown,
+          MAX(pc.fetched_at)               AS last_fetched_at
+        FROM profile_candidates pc
+        JOIN profiles pr ON pr.id = pc.profile_id
         WHERE {' AND '.join(where)}
-        GROUP BY sourced_by_topic_id
+        GROUP BY pc.sourced_by_topic_id
         ORDER BY n_candidates DESC
         """,
         params,

@@ -227,6 +227,45 @@ def commit_draft(
     conn.commit()
 
 
+def update_fit(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    *,
+    centroid: bytes | None,
+    selector_config: dict | None,
+    coherence_median: float | None,
+    coherence_iqr: float | None,
+    coherence_bimodal: bool | None,
+    n_seed: int,
+) -> None:
+    """Persist a re-fit of a live profile's selector on its current seeds.
+
+    The fitted half of ``commit_draft``: it leaves ``is_draft``, the
+    threshold and the topic filters alone, because those are the user's
+    choices and a change of seeds is not a reason to undo them.
+    """
+    sel_json = json.dumps(selector_config) if selector_config is not None else None
+    bimodal_int = (
+        None if coherence_bimodal is None else (1 if coherence_bimodal else 0)
+    )
+    conn.execute(
+        """
+        UPDATE profiles SET
+          centroid             = ?,
+          selector_config_json = ?,
+          coherence_median     = ?,
+          coherence_iqr        = ?,
+          coherence_bimodal    = ?,
+          n_seed               = ?,
+          updated_at           = datetime('now')
+        WHERE id = ?
+        """,
+        (centroid, sel_json, coherence_median, coherence_iqr, bimodal_int,
+         n_seed, profile_id),
+    )
+    conn.commit()
+
+
 def delete(conn: sqlite3.Connection, profile_id: int) -> None:
     """Hard-delete a profile. ``profile_seeds`` rows go via ON DELETE CASCADE."""
     conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))

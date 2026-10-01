@@ -124,6 +124,16 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           FROM papers p
           WHERE p.uploaded_by_user_id = ?
           UNION
+          -- A researcher's imported papers, as list_for_user counts them.
+          -- Imports used to stamp uploaded_by_user_id, which is how they
+          -- got counted; they no longer do (it moved other users' uploads),
+          -- and without this the list showed 82 papers under "0 docs".
+          SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
+          FROM papers p
+          JOIN researcher_papers rp ON rp.openalex_id = p.openalex_id
+          JOIN researchers r        ON r.id = rp.researcher_id
+          WHERE r.user_id = ?
+          UNION
           SELECT p.openalex_id, p.n_pages, p.first_seen_at, pc.saved_at AS event_at
           FROM papers p
           JOIN profile_candidates pc ON pc.openalex_id = p.openalex_id
@@ -143,7 +153,7 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           MAX(last_event)           AS last_ingest
         FROM deduped
         """,
-        (user_id, user_id),
+        (user_id, user_id, user_id),
     ).fetchone()
     return {
         "docs": int(row["docs"]),
@@ -169,7 +179,14 @@ def tag_counts_for_user(
           JOIN profiles pr ON pr.id = ps.profile_id
           JOIN papers   p  ON p.openalex_id = ps.openalex_id
           WHERE pr.user_id = ?
-            AND p.uploaded_by_user_id = ?
+            AND (
+              p.uploaded_by_user_id = ?
+              OR EXISTS (
+                SELECT 1 FROM researcher_papers rp
+                JOIN researchers r ON r.id = rp.researcher_id
+                WHERE rp.openalex_id = p.openalex_id AND r.user_id = ?
+              )
+            )
           UNION
           SELECT pr.slug AS slug, pc.openalex_id AS openalex_id
           FROM profile_candidates pc
@@ -181,7 +198,7 @@ def tag_counts_for_user(
         FROM vault_in_profile
         GROUP BY slug
         """,
-        (user_id, user_id, user_id),
+        (user_id, user_id, user_id, user_id),
     ).fetchall()
     return {r["slug"]: int(r["n"]) for r in rows}
 

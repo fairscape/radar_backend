@@ -514,3 +514,155 @@ def test_source_topic_attribution_is_not_rewritten_on_resurface(
         assert got == "T-first"
     finally:
         conn.close()
+
+
+def test_two_gathers_leave_one_pool_on_one_scale(monkeypatch, db_path, settings, profile_id):
+    """Each gather's best paper used to keep its batch's top percentile
+    (1.0) and blend; the feed then ranked both batches together. After the
+    second gather the pool must have exactly one top row."""
+    _patch_dependencies(monkeypatch, [_candidate_paper("W300"), _candidate_paper("W301")])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+    _patch_dependencies(monkeypatch, [_candidate_paper("W400"), _candidate_paper("W401")])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+
+    conn = connect(db_path)
+    try:
+        pcts = [r[0] for r in conn.execute(
+            "SELECT score_pct FROM profile_candidates WHERE profile_id = ?", (profile_id,))]
+    finally:
+        conn.close()
+    assert len(pcts) == 4
+    assert pcts.count(1.0) == 1, pcts
+    assert sorted(pcts) == [0.0, 1 / 3, 2 / 3, 1.0]
+
+
+def test_runner_registers_the_umls_backfill_sweep(db_path, settings, profile_id):
+    from rag_lib.scheduler import build_scheduler, start, stop
+
+    scheduler = build_scheduler(settings)
+    try:
+        start(scheduler, settings)
+        job = scheduler.get_job("umls-backfill")
+        assert job is not None
+        # A naive datetime.now() is local time, which the UTC scheduler read
+        # as UTC: on an EDT host the first run landed ~4 hours in the past.
+        from datetime import datetime, timedelta, timezone
+
+        ahead = job.next_run_time - datetime.now(timezone.utc)
+        assert timedelta(0) < ahead <= timedelta(minutes=5), ahead
+    finally:
+        stop(scheduler)
+
+
+def test_a_gather_stores_authors_and_date_and_never_blanks_an_import(
+    monkeypatch, db_path, settings, profile_id,
+):
+    """Every feed card read 'Unknown authors' and a date of <year>-01-01:
+    Paper had neither field, so both were lost at OpenAlex -> Paper."""
+    from rag_lib.db.repos import papers as papers_repo
+
+    conn = connect(db_path)
+    papers_repo.upsert(conn, {"openalex_id": "W501", "title": "imported", "source": "prosopia",
+                              "authors": ["Imported Author"]})
+    conn.close()
+
+    fresh = _candidate_paper("W500")
+    fresh.authors = ["Ada Lovelace", "Alan Turing"]
+    fresh.publication_date = "2026-04-15"
+    known = _candidate_paper("W501")          # gathered again, no byline this time
+    _patch_dependencies(monkeypatch, [fresh, known])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+
+    conn = connect(db_path)
+    try:
+        rows = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT openalex_id, authors_json, publication_date FROM papers WHERE openalex_id IN ('W500','W501')")}
+    finally:
+        conn.close()
+    assert rows["W500"] == ('["Ada Lovelace", "Alan Turing"]', "2026-04-15")
+    assert rows["W501"][0] == '["Imported Author"]'
+
+
+def test_an_unknown_timezone_is_invalid_not_an_exception():
+    """ZoneInfoNotFoundError is a KeyError; caught as anything else it escaped,
+    and a stored bad tz made start() raise -- the backend would not boot."""
+    from rag_lib.scheduler.runner import register_gather_job, valid_cron
+
+    assert valid_cron("0 4 * * *", "Bad/Zone") is not None
+
+    class NoJobs:
+        def add_job(self, *a, **k):
+            raise AssertionError("must not register")
+
+    assert register_gather_job(NoJobs(), user_id=1, profile_id=1, cron="0 4 * * *", tz="Bad/Zone") is False
+
+
+def test_a_gather_keeps_the_papers_below_the_threshold_out_of_the_feed(
+    monkeypatch, db_path, settings, profile_id,
+):
+    """Gathers used to drop every paper below the threshold, so lowering it
+    later showed nothing new. They are kept now, but not in the feed, not
+    in the pool's percentiles, and not counted as the run's new papers."""
+    from rag_lib.db.repos import candidates as candidates_repo
+    from rag_lib.scoring.pool import passes
+
+    conn = connect(db_path)
+    # In the selector config too, as every committed interest has it: a
+    # selector rebuilt from config falls back to it when select() is given
+    # threshold=None, which silently kept dropping these papers.
+    conn.execute(
+        "UPDATE profiles SET threshold = 1.01, "
+        "selector_config_json = json_set(selector_config_json, '$.threshold', 1.01) WHERE id = ?",
+        (profile_id,))
+    conn.commit()
+    conn.close()
+    ids = ["W600", "W601", "W602", "W603"]
+    _patch_dependencies(monkeypatch, [_candidate_paper(i) for i in ids])
+    run_id = scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT openalex_id, score_raw, score_pct FROM profile_candidates WHERE profile_id = ?",
+            (profile_id,)).fetchall()
+        assert sorted(r[0] for r in rows) == ids          # all stored ...
+        assert all(r[2] is None for r in rows)            # ... none ranked
+        assert candidates_repo.top_for_profile(conn, profile_id) == []
+        run = conn.execute("SELECT n_new, n_fetched FROM gather_runs WHERE id = ?", (run_id,)).fetchone()
+        assert (run[0], run[1]) == (0, 4)
+
+        # Lower the threshold to the middle score: exactly the papers at or
+        # above it reach the feed, and the percentiles cover only them.
+        raws = sorted(r[1] for r in rows)
+        mid = raws[2]
+        conn.execute("UPDATE profiles SET threshold = ? WHERE id = ?", (mid, profile_id))
+        conn.commit()
+        scheduler_jobs.rescore_pool(conn, profile_id, settings)
+        feed = {r["openalex_id"] for r in candidates_repo.top_for_profile(conn, profile_id)}
+        assert feed == {r[0] for r in rows if passes(r[1], mid)} and len(feed) == 2
+        pcts = dict(conn.execute(
+            "SELECT openalex_id, score_pct FROM profile_candidates WHERE profile_id = ?", (profile_id,)).fetchall())
+        assert sorted(pcts[i] for i in feed) == [0.0, 1.0]
+        assert all(pcts[i] is None for i in ids if i not in feed)
+    finally:
+        conn.close()
+
+
+def test_a_gather_stores_the_vectors_it_computes(monkeypatch, db_path, settings, profile_id):
+    """Candidate vectors were computed and thrown away, so re-scoring stored
+    candidates after a refit would have meant embedding them all again."""
+    from rag_lib.db.repos import embeddings as embeddings_repo
+    from rag_lib.selectors import centroid as centroid_mod
+
+    fresh = _candidate_paper("W700")
+    fresh.embeddings = {}                             # arrives without a vector, as from OpenAlex
+    monkeypatch.setattr(centroid_mod, "get_embedder", lambda key: (lambda text: [0.3] * 8))
+    _patch_dependencies(monkeypatch, [fresh])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+
+    conn = connect(db_path)
+    try:
+        vec = embeddings_repo.get(conn, "W700", "specter2")
+    finally:
+        conn.close()
+    assert vec is not None and np.allclose(vec, [0.3] * 8)

@@ -233,6 +233,14 @@ def test_dry_run_with_fixture_gatherer(app, tmp_path):
     # Preview cards have the wizard's slug as the profile field.
     if result["preview"]:
         assert result["preview"][0]["profile"] == slug
+    # ``papers`` lists every scored paper best first, with the same score
+    # the slider compares against: the wizard shows which papers a
+    # threshold lets in, and the top-10 preview can't (it never changes).
+    papers = result["papers"]
+    assert len(papers) == len(result["scores"]) > 0
+    assert sorted(p["score"] for p in papers) == sorted(result["scores"])
+    assert [p["score"] for p in papers] == sorted((p["score"] for p in papers), reverse=True)
+    assert all(p["id"] and p["title"] for p in papers)
 
 
 def test_commit_draft_flips_is_draft_and_lists_profile(app, tmp_path):

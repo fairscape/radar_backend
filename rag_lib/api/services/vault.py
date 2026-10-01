@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -389,11 +390,22 @@ def _chunk_count_for_paper(
 def _attach_to_profile(
     conn: sqlite3.Connection, user_id: int, profile_slug: str, openalex_id: str
 ) -> None:
-    """Idempotent profile_seeds upsert; silently no-ops if the slug is unknown."""
+    """Idempotent profile_seeds upsert; silently no-ops if the slug is unknown.
+
+    A live interest is re-fitted when this adds a seed, same as
+    ``POST /{key}/seeds``: the Seeds tab's PDF drop zone lands here, and
+    without it an uploaded seed was listed but never scored against.
+    """
     profile = profiles_repo.get_by_slug(conn, user_id, profile_slug)
     if profile is None:
         return
     profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id)
+    # Even when the seed was already there: re-uploading the PDF is then how
+    # a refit that failed after an earlier attach gets another go.
+    if not profile["is_draft"]:
+        from . import wizard as wizard_service
+
+        wizard_service.refit_profile(conn, user_id=user_id, slug=profile_slug)
 
 
 def _enrich_via_openalex(
@@ -455,12 +467,114 @@ def _authors_from_work(work: dict) -> list[str]:
     return out
 
 
+# One extraction at a time across the process. The spaCy pipeline and its
+# UMLS linker are one shared object, and extraction now runs from request
+# threads (upload, wizard step 3), the import thread and the scheduler's
+# seed backfill at once; nothing documents that pipeline as safe for
+# concurrent calls, and the cost of serializing is only latency.
+_UMLS_LOCK = threading.Lock()
+
+# When each paper's extraction last failed in this process. The sweep takes
+# the first ``limit`` NULL rows; a paper that keeps failing stays NULL, so
+# without this the same 40 were retried every 15 minutes and nothing behind
+# them was ever reached. Skipped for a while, not until a restart: the
+# backend runs for weeks, and a failure is usually an outage (the topic
+# embedder down) that ends long before then.
+_UMLS_FAILED: dict[str, float] = {}
+_UMLS_RETRY_AFTER_S = 6 * 3600
+
+
+def _recently_failed(openalex_id: str) -> bool:
+    at = _UMLS_FAILED.get(openalex_id)
+    return at is not None and time.monotonic() - at < _UMLS_RETRY_AFTER_S
+
+
 def _try_extract_umls(
     conn: sqlite3.Connection,
     settings: Any,
     openalex_id: str,
     text: str,
-) -> None:
+    *,
+    force: bool = False,
+) -> bool:
+    """Best-effort UMLS extraction for one paper, serialized. True if stored.
+
+    Callers choose what to extract (``umls_concepts_json IS NULL``) before
+    they hold the lock, so the import thread, the periodic sweep and step 3
+    could each pick the same paper and run the linker on it again. Checked
+    once more under the lock; ``force`` (the backfill script's re-extract)
+    skips that.
+    """
+    with _UMLS_LOCK:
+        if not force:
+            row = conn.execute(
+                "SELECT umls_concepts_json FROM papers WHERE openalex_id = ?", (openalex_id,),
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                return True
+        return _try_extract_umls_unlocked(conn, settings, openalex_id, text)
+
+
+def backfill_seed_umls(
+    conn: sqlite3.Connection,
+    settings: Any,
+    *,
+    openalex_ids: list[str] | None = None,
+    limit: int = 40,
+) -> int:
+    """Extract UMLS for seed papers that have never been extracted.
+
+    Seeds used to be extracted only when wizard step 3 opened, within a
+    30-second budget, the rest "picked up the next time step 3 is opened"
+    -- which never happens once the interest is committed. On 2026-09-30
+    an 82-seed import got 6 and kept 76 empty for good. This runs from
+    the import thread (``openalex_ids`` = that import's seeds) and from a
+    periodic scheduler job (all seeds), at most ``limit`` papers a call,
+    through the same extraction as every other path. Returns how many
+    were attempted.
+    """
+    if not settings.RADAR_UMLS_ENABLED:
+        return 0
+    if openalex_ids is not None:
+        if not openalex_ids:
+            return 0
+        marks = ",".join("?" for _ in openalex_ids)
+        rows = conn.execute(
+            f"SELECT openalex_id, title, abstract, body_text FROM papers "
+            f"WHERE umls_concepts_json IS NULL AND openalex_id IN ({marks}) LIMIT ?",
+            (*openalex_ids, limit + len(_UMLS_FAILED)),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT p.openalex_id, p.title, p.abstract, p.body_text FROM papers p
+            WHERE p.umls_concepts_json IS NULL
+              AND EXISTS (SELECT 1 FROM profile_seeds s WHERE s.openalex_id = p.openalex_id)
+            LIMIT ?
+            """,
+            (limit + len(_UMLS_FAILED),),
+        ).fetchall()
+    rows = [r for r in rows if not _recently_failed(r["openalex_id"])][:limit]
+    n_failed = 0
+    for r in rows:
+        if _try_extract_umls(conn, settings, r["openalex_id"],
+                             _umls_input_text(r["title"], r["abstract"], r["body_text"])):
+            _UMLS_FAILED.pop(r["openalex_id"], None)
+        else:
+            _UMLS_FAILED[r["openalex_id"]] = time.monotonic()
+            n_failed += 1
+    if rows:
+        log.info("vault.umls_backfill", n=len(rows), n_failed=n_failed,
+                 scoped=openalex_ids is not None)
+    return len(rows)
+
+
+def _try_extract_umls_unlocked(
+    conn: sqlite3.Connection,
+    settings: Any,
+    openalex_id: str,
+    text: str,
+) -> bool:
     """Best-effort UMLS extraction + topic mapping for a paper.
 
     Extracts UMLS concepts from the paper text, maps them to OpenAlex
@@ -469,9 +583,17 @@ def _try_extract_umls(
     """
     try:
         if not settings.RADAR_UMLS_ENABLED:
-            return
+            return False
         if not text or not text.strip():
-            return
+            # Nothing to read is a result, not a failure: without the
+            # marker the backfill picked the same empty papers every run.
+            conn.execute(
+                "UPDATE papers SET umls_concepts_json = '[]', "
+                "umls_mapped_topics_json = NULL WHERE openalex_id = ?",
+                (openalex_id,),
+            )
+            conn.commit()
+            return True
 
         from ...umls.extractor import extract_umls_concepts
         from ...umls.topic_mapper import map_concepts_to_topics
@@ -490,7 +612,17 @@ def _try_extract_umls(
         )
 
         if not concepts:
-            return
+            # "Looked, found nothing" is stored as [] rather than left NULL.
+            # NULL is what every caller reads as "not extracted yet", so a
+            # paper with no biomedical concept was re-run each time step 3
+            # opened -- and would be re-run by the backfill on every pass.
+            conn.execute(
+                "UPDATE papers SET umls_concepts_json = '[]', "
+                "umls_mapped_topics_json = NULL WHERE openalex_id = ?",
+                (openalex_id,),
+            )
+            conn.commit()
+            return True
 
         concepts_json = json.dumps([c.to_dict() for c in concepts])
 
@@ -503,25 +635,6 @@ def _try_extract_umls(
             cache_dir=cache_dir,
         )
         mapped_json = json.dumps([m.to_dict() for m in mapped]) if mapped else None
-
-        # [umls-probe] 临时诊断 — 确认后整块删除。阶段 2：概念名 -> topic。
-        # 这里没有任何上限，min_similarity 是唯一的闸门，所以出来多少条本身
-        # 就是在说这个闸门有没有起作用。
-        print(f"[umls] 阶段2 {openalex_id}", flush=True)
-        print(f"[umls]   {len(concepts)} 个概念 -> {len(mapped)} 个 topic "
-              f"(min_similarity={settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY}, "
-              f"embedder={settings.RADAR_UMLS_EMBEDDING_MODEL})", flush=True)
-        if mapped:
-            _sims = [m.similarity for m in mapped]
-            print(f"[umls]   相似度范围 {min(_sims):.3f} - {max(_sims):.3f}"
-                  f"   -> min_similarity "
-                  f"{'一个都没滤掉' if min(_sims) > settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY else '过滤了一些'}",
-                  flush=True)
-            for _m in mapped[:15]:
-                print(f"[umls]   {_m.similarity:.4f}  {_m.display_name[:44]:46s}"
-                      f"<- {_m.source_name[:30]}", flush=True)
-            if len(mapped) > 15:
-                print(f"[umls]   ...另外 {len(mapped) - 15} 个", flush=True)
 
         conn.execute(
             "UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? "
@@ -536,6 +649,7 @@ def _try_extract_umls(
             n_concepts=len(concepts),
             n_mapped=len(mapped),
         )
+        return True
     except Exception as exc:
         log.warning(
             "vault.umls_extraction_skipped",
@@ -543,3 +657,4 @@ def _try_extract_umls(
             reason=type(exc).__name__,
             detail=str(exc)[:200],
         )
+        return False

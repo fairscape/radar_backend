@@ -193,8 +193,12 @@ def user_owns_papers(
     """The subset of ``openalex_ids`` the user may use as seeds.
 
     A paper is the user's if they uploaded it, if it came in with one of
-    their researchers, or if it is already a seed of one of their
-    interests. Anything else is another user's business.
+    their researchers, if it is already a seed of one of their
+    interests, or if it is a candidate in one of their interests -- a
+    paper Radar put in their feed, saved or not. That last one is what
+    lets a feed paper become a seed, and what stops a paper saved from
+    the feed (listed in the vault) being refused when picked as a seed.
+    Anything else is another user's business.
     """
     if not openalex_ids:
         return set()
@@ -216,9 +220,14 @@ def user_owns_papers(
               JOIN profiles pr ON pr.id = ps.profile_id
               WHERE ps.openalex_id = p.openalex_id AND pr.user_id = ?
             )
+            OR EXISTS (
+              SELECT 1 FROM profile_candidates pc
+              JOIN profiles pr ON pr.id = pc.profile_id
+              WHERE pc.openalex_id = p.openalex_id AND pr.user_id = ?
+            )
           )
         """,
-        (*openalex_ids, user_id, user_id, user_id),
+        (*openalex_ids, user_id, user_id, user_id, user_id),
     ).fetchall()
     return {r["openalex_id"] for r in rows}
 

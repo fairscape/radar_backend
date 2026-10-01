@@ -34,6 +34,12 @@ class CardActionRequest(BaseModel):
     """
 
     card_id: str
+    # The interest the card was shown under (its ``profile`` slug). Without
+    # it the server picks the interest that fetched the paper most recently,
+    # which need not be the one on screen -- and since save is a toggle, a
+    # click could un-save the paper in another interest. Optional only for
+    # older clients.
+    profile: str | None = None
 from ..services import radar as radar_service
 from ..settings import Settings, get_settings
 
@@ -60,6 +66,7 @@ def _log_feedback_for(
     user_id: int,
     card_id: str,
     action: str,
+    profile: str | None = None,
 ) -> None:
     """Append a feedback event for a card transition.
 
@@ -68,7 +75,7 @@ def _log_feedback_for(
     fresh from the DB so the score / selector / doi reflect what the
     user actually saw.
     """
-    ctx = radar_service.card_feedback_context(db, user_id, card_id)
+    ctx = radar_service.card_feedback_context(db, user_id, card_id, profile_slug=profile)
     if ctx is None:
         return
     log_event(
@@ -95,14 +102,14 @@ def save_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    res = radar_service.save(db, int(user["id"]), body.card_id)
+    res = radar_service.save(db, int(user["id"]), body.card_id, profile_slug=body.profile)
     if res is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"card '{body.card_id}' not found for current user",
         )
     if res.state == "saved":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved")
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile)
     return res
 
 
@@ -113,12 +120,12 @@ def dismiss_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    res = radar_service.dismiss(db, int(user["id"]), body.card_id)
+    res = radar_service.dismiss(db, int(user["id"]), body.card_id, profile_slug=body.profile)
     if res is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"card '{body.card_id}' not found for current user",
         )
     if res.state == "dismissed":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed")
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile)
     return res

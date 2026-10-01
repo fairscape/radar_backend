@@ -31,6 +31,7 @@ and never touch the network.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Iterable
@@ -240,6 +241,45 @@ def prefetch_works(
 # ----------------------------------------------------------------------
 
 
+# Wait before the one retry. Module-level so tests can zero it.
+_ID_RETRY_DELAY: float = 1.0
+
+
+def _retryable(exc: Exception) -> bool:
+    """A server-side hiccup (5xx) -- worth one more try.
+
+    Not a 429: OpenAlexClient deliberately makes a single attempt there,
+    because retrying burns quota and extends the cooldown. Not a timeout:
+    each one is up to 30 s, and 82 records x 3 attempts turned an import
+    of minutes into hours while rate-limited.
+    """
+    import requests
+
+    resp = getattr(exc, "response", None)
+    return isinstance(exc, requests.HTTPError) and resp is not None and resp.status_code >= 500
+
+
+def _get_work_retrying(client: Any, oa_id: str) -> tuple[dict | None, bool]:
+    """``(work, unreachable)`` for an explicit OpenAlex id.
+
+    ``get_work`` returns None for a 404 -- the id is wrong, and the other
+    rungs may still find the paper -- and raises otherwise. A 5xx is
+    retried once; anything that still raises reports the id unreachable,
+    which keeps the record off the title rung (see resolve_seed).
+    """
+    for attempt in (1, 2):
+        try:
+            return client.get_work(oa_id), False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("prosopia.get_work_failed", openalex_id=oa_id, attempt=attempt,
+                        reason=type(exc).__name__, detail=str(exc)[:200])
+            if attempt == 1 and _retryable(exc):
+                time.sleep(_ID_RETRY_DELAY)
+                continue
+            break
+    return None, True
+
+
 def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     """Run one lookup; a failed rung drops to the next rather than dying.
 
@@ -285,10 +325,11 @@ def resolve_seed(
     rung = "none"
 
     oa_id = _normalize_openalex_id(record.openalex_id)
+    id_unreachable = False
     if oa_id:
         work = (cache.by_id.get(oa_id) if cache else None)
         if work is None:
-            work = _call(client.get_work, oa_id)
+            work, id_unreachable = _get_work_retrying(client, oa_id)
         if work is not None:
             rung = "work_id"
 
@@ -308,7 +349,14 @@ def resolve_seed(
             if work is not None:
                 rung = "pmcid"
 
-    if work is None:
+    # Not when the record names a work we merely failed to reach. The id is
+    # what the user ticked -- often the version of record, its preprint
+    # left unticked as a duplicate -- and a title search lands on whichever
+    # copy ranks first, so a transient 429 on get_work used to seed exactly
+    # the copy the user excluded. A DOI or PMCID still identifies the work;
+    # a shared title does not. Unresolved, the record falls to "none" and
+    # keeps its own identity.
+    if work is None and not id_unreachable:
         title = (record.name or "").strip()
         if title:
             hits = _call(

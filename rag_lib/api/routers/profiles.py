@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from datetime import datetime, timezone
@@ -41,6 +42,7 @@ from ..schemas import (
     Schedule,
     ScheduleUpdate,
     Topic,
+    TopicSelection,
     TopicYield,
     TopicYieldResponse,
     WizardOption,
@@ -49,6 +51,8 @@ from ..schemas import (
 from ..services import profiles as profiles_service
 from ..services import wizard as wizard_service
 from ..settings import Settings
+
+log = structlog.get_logger("rag_lib.api.routers.profiles")
 
 router = APIRouter()
 
@@ -434,7 +438,13 @@ def delete_draft(
     return {"ok": True}
 
 
-@router.delete("/draft/{slug}/seeds/{openalex_id}")
+# ``:path`` because a seed id is usually https://openalex.org/W…: the client
+# percent-encodes the slashes, the server decodes them before routing, and a
+# plain ``{openalex_id}`` segment then never matched -- every OpenAlex-
+# resolved seed (99 of 100 on 2026-10-01) answered 404 "Not Found" and could
+# not be removed. New clients use DELETE /{key}/seeds?openalex_id=, which
+# keeps the id out of the path altogether.
+@router.delete("/draft/{slug}/seeds/{openalex_id:path}")
 def remove_draft_seed(
     slug: str,
     openalex_id: str,
@@ -472,28 +482,104 @@ def add_draft_seeds(
     from ..services import researchers as researchers_service
 
     try:
-        attached, rejected = researchers_service.attach_seeds(
+        attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=slug, openalex_ids=body.openalex_ids,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return DraftSeedsResponse(attached=attached, rejected=rejected)
+    return DraftSeedsResponse(attached=attached, rejected=rejected, rescored=rescored)
+
+
+@router.post("/{key}/seeds", response_model=DraftSeedsResponse)
+def add_seeds(
+    key: str,
+    body: DraftSeedsRequest,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> DraftSeedsResponse:
+    """Attach papers the user already has as seeds of a draft or a live interest.
+
+    Same contract as ``POST /draft/{slug}/seeds``, for any of the user's
+    interests. Papers without a vector are embedded; a live interest is
+    re-fitted so its next scan scores against these seeds.
+    """
+    from ..services import researchers as researchers_service
+
+    try:
+        attached, rejected, rescored = researchers_service.attach_seeds(
+            db, user_id=int(user["id"]), slug=key, openalex_ids=body.openalex_ids,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return DraftSeedsResponse(attached=attached, rejected=rejected, rescored=rescored)
+
+
+@router.delete("/{key}/seeds")
+def remove_seed(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    openalex_id: str = Query(..., min_length=1),
+) -> dict:
+    """Remove one seed from a draft or a live interest.
+
+    The id is a query parameter, not a path segment: seed ids contain
+    slashes. 404 when it is not a seed, 409 when it is a live interest's
+    last one. A live interest is re-fitted on the seeds that remain.
+    """
+    try:
+        removed = wizard_service.remove_seed(
+            db, user_id=int(user["id"]), slug=key, openalex_id=openalex_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"'{openalex_id}' is not a seed of '{key}'",
+        )
+    return {"ok": True}
 
 
 @router.post("", response_model=Profile)
 def commit_draft(
     body: CommitDraftRequest,
+    request: Request,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> Profile:
     """Commit a wizard draft → live profile.
 
-    Flips ``is_draft=0``, fits the CentroidSelector, and registers a
-    schedule so the next scheduler boot picks the profile up. The
-    schedule defaults to daily 04:00 UTC; override via ``cron`` / ``tz``.
+    Flips ``is_draft=0``, fits the CentroidSelector, stores a schedule and
+    registers its job with the running scheduler. The schedule defaults to
+    daily 04:00 UTC; override via ``cron`` / ``tz``.
+
+    The job used to be left for "the next scheduler boot": the schedule row
+    was written but nothing was registered, so a new interest got no
+    nightly scan until the backend happened to restart.
     """
+    from rag_lib.scheduler.runner import valid_cron
+
+    # Before anything is written: the commit flips the draft live, so a cron
+    # that failed afterwards answered 500 to a commit that had happened, and
+    # the wizard's retry then got 404.
+    if body.cron is not None or body.tz is not None:
+        from rag_lib.db.repos.schedules import DEFAULT_CRON, DEFAULT_TZ
+
+        # Either alone is checked, with the default standing in for the
+        # other: a tz sent without a cron used to skip the check entirely.
+        problem = valid_cron(body.cron or DEFAULT_CRON, body.tz or DEFAULT_TZ)
+        if problem is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"invalid schedule (cron={body.cron!r}, tz={body.tz!r}): {problem}",
+            )
     try:
         wizard_service.commit_draft(
             db,
@@ -508,6 +594,20 @@ def commit_draft(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    # Not Depends(get_scheduler): that 503s when the scheduler is off, and a
+    # commit must succeed either way -- the row is there for the next boot.
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        from rag_lib.db.repos import schedules as schedules_repo
+        from rag_lib.scheduler import runner
+
+        profile_id = _resolve_profile_id(db, int(user["id"]), body.slug)
+        sched = schedules_repo.get(db, profile_id)
+        if sched is not None and sched["enabled"]:
+            runner.register_gather_job(
+                scheduler, user_id=int(user["id"]), profile_id=profile_id,
+                cron=sched["cron"], tz=sched["tz"], slug=body.slug,
+            )
     profile = profiles_service.get_profile(db, int(user["id"]), body.slug)
     if profile is None:
         # Should be unreachable — commit just flipped the row to live.
@@ -561,6 +661,10 @@ def update_profile(
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
     profiles_repo.update_threshold(db, profile_id, float(body.threshold))
+    # The threshold decides which stored papers are in the feed, so the
+    # pool the feed ranks (and its percentiles) changes with it.
+    from rag_lib.scheduler.jobs import rescore_pool
+    rescore_pool(db, profile_id)
     updated = profiles_service.get_profile(db, int(user["id"]), key)
     if updated is None:
         raise HTTPException(
@@ -588,6 +692,59 @@ def recompute_coherence(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+
+
+def _topics_out(topic_filters: dict, new: set[str] | None = None) -> list[Topic]:
+    out: list[Topic] = []
+    for entry in (topic_filters.get("topics") or []):
+        tid = entry.get("id") or ""
+        if not tid:
+            continue
+        out.append(Topic(
+            id=tid,
+            name=entry.get("display_name") or "",
+            count=int(entry.get("count") or 0),
+            on=bool(entry.get("on", True)),
+            source=entry.get("source"),
+            new=(tid in new) if new is not None else None,
+        ))
+    return out
+
+
+@router.get("/{key}/topics/preview", response_model=list[Topic])
+def preview_topics(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[Topic]:
+    """The interest's topics re-aggregated from its seeds, with the current
+    on/off states; topics the seeds gained since are off and marked ``new``.
+    Writes nothing (``recompute-topics`` writes, and switches new ones on)."""
+    try:
+        topic_filters, new = wizard_service.preview_topics(db, user_id=int(user["id"]), slug=key)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return _topics_out(topic_filters, new)
+
+
+@router.put("/{key}/topics", response_model=list[Topic])
+def save_topics(
+    key: str,
+    body: TopicSelection,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[Topic]:
+    """Switch the interest's topics: exactly ``selected_topic_ids`` on. 409
+    when that would leave none on. Takes effect from the next scan."""
+    try:
+        topic_filters = wizard_service.save_topics(
+            db, user_id=int(user["id"]), slug=key, selected_topic_ids=body.selected_topic_ids,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return _topics_out(topic_filters)
 
 
 @router.post("/{key}/recompute-topics", response_model=list[Topic])
@@ -626,22 +783,23 @@ def refit_profile(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     autotune: int = Query(default=0, ge=0, le=1),
 ) -> RefitResponse:
-    """Re-fit the selector for the given profile.
+    """Re-fit the selector for the given profile on its current seeds.
 
-    Phase 5 returns a placeholder ``cost`` string so the UI gets the
-    expected shape. Phase 11 (wizard) will replace the body with a real
-    selector.fit call followed by ``store_profile_from_object``.
+    This used to return a fixed placeholder (``"0.00 s · 0 vecs"``) and fit
+    nothing, while the scheduler kept scoring with the centroid fitted at
+    commit. It now runs ``wizard.refit_profile``. 404 for an unknown
+    profile, 400 for a draft or a profile with no embedded seed.
 
     ``?autotune=1`` (Phase 8) runs ``feedback.autotune.apply_recommended``
     after the refit and reports the new threshold inline in ``cost``.
     """
-    profile = profiles_service.get_profile(db, int(user["id"]), key)
-    if profile is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"profile '{key}' not found for current user",
-        )
-    cost = "0.00 s · 0 vecs"
+    try:
+        fit = wizard_service.refit_profile(db, user_id=int(user["id"]), slug=key)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    cost = f"{fit['elapsed_s']:.2f} s · {fit['n_embedded']} vecs"
     if autotune:
         from rag_lib.feedback.autotune import apply_recommended
 
@@ -683,7 +841,14 @@ def dry_run_profile(
     if row is None:
         return DryRunResponse(ok=True, key=key, n=0, scores=[])
     profile_id = int(row["id"])
+    from rag_lib.api.schemas import DryRunPaper
+
     scores = candidates_repo.scores_for_profile(db, profile_id)
+    papers = [
+        DryRunPaper(id=r["openalex_id"], title=r["title"] or "", venue=r["venue"] or "",
+                    year=r["year"], score=round(float(r["s"]), 4))
+        for r in candidates_repo.scored_papers_for_profile(db, profile_id)
+    ]
     from rag_lib import calibration
     from rag_lib.api.mappers import _col
     from rag_lib.api.schemas import SeedSimilarity
@@ -698,7 +863,7 @@ def dry_run_profile(
         }
     rng = calibration.score_range(scores, band)
     return DryRunResponse(
-        ok=True, key=key, n=len(scores), scores=scores,
+        ok=True, key=key, n=len(scores), scores=scores, papers=papers,
         suggested_threshold=calibration.suggest_threshold(
             band["min"] if band else None, scores,
         ) if scores or band else None,
@@ -848,19 +1013,24 @@ def update_schedule(
     from apscheduler.triggers.cron import CronTrigger
 
     from rag_lib.db.repos import schedules as schedules_repo
-    from rag_lib.scheduler.jobs import gather_for_profile
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
 
-    if body.cron is not None:
-        try:
-            CronTrigger.from_crontab(body.cron, timezone=body.tz or "UTC")
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"invalid cron '{body.cron}': {exc}",
-            ) from exc
+    # Validate what the row will hold, not just the field that was sent: a
+    # tz-only change used to skip validation, be stored, and then make
+    # register_gather_job raise -- a 500 after the write, and a backend that
+    # would not boot with that row in place.
+    from rag_lib.scheduler.runner import valid_cron
 
+    current = schedules_repo.get(db, profile_id)
+    eff_cron = body.cron or (current["cron"] if current else schedules_repo.DEFAULT_CRON)
+    eff_tz = body.tz or (current["tz"] if current else schedules_repo.DEFAULT_TZ)
+    problem = valid_cron(eff_cron, eff_tz)
+    if problem is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid schedule (cron={eff_cron!r}, tz={eff_tz!r}): {problem}",
+        )
     row = schedules_repo.upsert(
         db,
         profile_id=profile_id,
@@ -871,13 +1041,11 @@ def update_schedule(
 
     job_id = f"gather:{profile_id}"
     if row["enabled"]:
-        scheduler.add_job(
-            gather_for_profile,
-            trigger=CronTrigger.from_crontab(row["cron"], timezone=row["tz"]),
-            args=[int(user["id"]), profile_id],
-            id=job_id,
-            replace_existing=True,
-            max_instances=1,
+        from rag_lib.scheduler import runner
+
+        runner.register_gather_job(
+            scheduler, user_id=int(user["id"]), profile_id=profile_id,
+            cron=row["cron"], tz=row["tz"], slug=key,
         )
     else:
         try:
@@ -949,13 +1117,17 @@ def reranker_comparison(
     # and every paper the reranker pushed out of the top ``limit`` is
     # absent — the one direction ``max_rank_down`` is supposed to show.
     all_rows = db.execute(
-        """
+        f"""
         SELECT pc.openalex_id, pc.score_raw, pc.score_blended,
                p.title
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND pc.score_blended IS NOT NULL
+          AND {candidates_repo.PASSES}
+          -- "Was reranked" is the reranker's own score, not the blend: the
+          -- pool rescore gives every row a blend once any row is reranked.
+          AND pc.score_reranker_raw IS NOT NULL
           AND pc.score_raw IS NOT NULL
         """,
         (profile_id,),

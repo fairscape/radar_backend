@@ -386,7 +386,7 @@ def test_stored_papers_can_be_attached_to_a_plain_draft(env):
         ]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"attached": 2, "rejected": ["https://openalex.org/W-not-mine"]}
+    assert resp.json() == {"attached": 2, "rejected": ["https://openalex.org/W-not-mine"], "rescored": None}
     assert _count(env, "SELECT n_seed FROM profiles WHERE slug = ?", slug) == 2
 
     assert _request(app, "POST", f"/api/profiles/draft/{slug}/seeds", json={"openalex_ids": []}).status_code == 400

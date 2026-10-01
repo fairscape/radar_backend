@@ -328,8 +328,14 @@ def run_import(
 
         resolved_by[resolution.rung] += 1
 
+        # No uploaded_by_user_id: an import does not upload anything. The
+        # papers row is shared by every user, and upsert keeps the newest
+        # non-null owner, so stamping the importer here moved another
+        # user's uploaded PDF -- local file, extracted text and all -- out
+        # of their vault and into the importer's. The importer's claim is
+        # the researcher_papers link written below, which the vault list
+        # and the seed ownership check both already read.
         row = dict(resolution.paper)
-        row["uploaded_by_user_id"] = plan.user_id
         papers_repo.upsert(conn, row)
 
         # A paper already embedded under this model (by an earlier

@@ -193,6 +193,17 @@ def _read_minutes(abstract: str | None) -> int:
     return max(2, round(words / 200))
 
 
+def _decode_authors(raw: str | None) -> list[str]:
+    """``authors_json`` -> names; anything malformed reads as no authors."""
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [n for n in names if isinstance(n, str) and n] if isinstance(names, list) else []
+
+
 def candidate_row_to_card(
     row: sqlite3.Row,
     *,
@@ -234,7 +245,9 @@ def candidate_row_to_card(
     return Card(
         id=row["openalex_id"],
         title=row["title"] or "",
-        authors=[],  # papers table doesn't carry authors today; Phase 6+ enriches.
+        # Read, not hardcoded []: papers carry authors_json (imports always
+        # did; gathers do since Paper grew an authors field).
+        authors=_decode_authors(_col(row, "authors_json")),
         venue=row["venue"] or "",
         date=pub_date,
         doi=row["doi"],

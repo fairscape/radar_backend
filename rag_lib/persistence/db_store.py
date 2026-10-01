@@ -92,7 +92,10 @@ def _paper_dict_for_repo(paper: Paper) -> dict:
         "abstract": d.get("abstract"),
         "year": d.get("year"),
         "venue": d.get("venue"),
-        "publication_date": None,  # Paper has no publication_date field today
+        "publication_date": d.get("publication_date"),
+        # A list; papers.upsert encodes it, and writes nothing for an empty
+        # one, so a gather never blanks a byline an import already stored.
+        "authors": d.get("authors") or [],
         "primary_topic": d.get("primary_topic"),
         "topics": d.get("topics") or [],
         "source": d.get("source") or "unknown",
@@ -200,8 +203,13 @@ def dedup_and_insert_candidates(
     ranked: list[tuple],
     tier_used: str | None = None,
     source_topics: dict[str, str] | None = None,
+    n_counted: int | None = None,
 ) -> tuple[int, int]:
     """Persist ranked gather results and dedup against prior candidates.
+
+    ``n_counted``: only the first that many entries count toward the
+    returned ``(n_new, n_redup)`` -- the gather stores the papers below the
+    threshold after the passing ones, and those never reach the feed.
 
     ``ranked`` accepts either the legacy 2-tuple shape ``(score, Paper)``
     or the Phase 3 3-tuple ``(score, Paper, breakdown)`` where
@@ -278,7 +286,9 @@ def dedup_and_insert_candidates(
                 score_blended=_breakdown_float(breakdown, "score_blended"),
                 sourced_by_topic_id=(source_topics or {}).get(paper.openalex_id),
             )
-            if added:
+            if n_counted is not None and i >= n_counted:
+                pass
+            elif added:
                 n_new += 1
             else:
                 n_redup += 1

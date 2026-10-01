@@ -151,12 +151,15 @@ def daily(
             # Two copies of this rule had already drifted apart once.
             if bucket is not None and card.bucket != bucket:
                 continue
+            state: CardState | None = (
+                "saved" if crow["saved_at"] else
+                "dismissed" if crow["dismissed_at"] else None
+            )
+            card.state = state
             cards.append(card)
             shown_ids.append(card.id)
-            if crow["saved_at"]:
-                states[card.id] = "saved"
-            elif crow["dismissed_at"]:
-                states[card.id] = "dismissed"
+            if state is not None:
+                states[card.id] = state
 
         # Stamp shown_at for the cards we're returning from this profile.
         # Held open deliberately: one commit for all profiles, below.
@@ -182,14 +185,29 @@ def daily(
 
 
 def _resolve_card(
-    conn: sqlite3.Connection, user_id: int, card_id: str
+    conn: sqlite3.Connection, user_id: int, card_id: str,
+    profile_slug: str | None = None,
 ) -> tuple[int, str] | None:
     """Find ``(profile_id, openalex_id)`` for a card belonging to this user.
 
-    Cards are addressed by their ``openalex_id``. The same paper can be
-    a candidate in multiple profiles; we resolve to the most recently
-    fetched row owned by this user so a save lands somewhere sensible.
+    A card is one paper in one interest, so with ``profile_slug`` the row
+    is that interest's and nothing else. Without it -- older clients --
+    the paper alone is ambiguous when two interests gathered it, and this
+    falls back to the most recently fetched row: a save could then land
+    on an interest that was not on screen, and since save toggles, un-save
+    a paper there.
     """
+    if profile_slug:
+        row = conn.execute(
+            """
+            SELECT pc.profile_id, pc.openalex_id
+            FROM profile_candidates pc
+            JOIN profiles p ON p.id = pc.profile_id
+            WHERE p.user_id = ? AND pc.openalex_id = ? AND p.slug = ?
+            """,
+            (user_id, card_id, profile_slug),
+        ).fetchone()
+        return None if row is None else (int(row["profile_id"]), row["openalex_id"])
     row = conn.execute(
         """
         SELECT pc.profile_id, pc.openalex_id
@@ -207,9 +225,10 @@ def _resolve_card(
 
 
 def save(
-    conn: sqlite3.Connection, user_id: int, card_id: str
+    conn: sqlite3.Connection, user_id: int, card_id: str,
+    profile_slug: str | None = None,
 ) -> CardActionResponse | None:
-    resolved = _resolve_card(conn, user_id, card_id)
+    resolved = _resolve_card(conn, user_id, card_id, profile_slug)
     if resolved is None:
         return None
     profile_id, openalex_id = resolved
@@ -218,9 +237,10 @@ def save(
 
 
 def dismiss(
-    conn: sqlite3.Connection, user_id: int, card_id: str
+    conn: sqlite3.Connection, user_id: int, card_id: str,
+    profile_slug: str | None = None,
 ) -> CardActionResponse | None:
-    resolved = _resolve_card(conn, user_id, card_id)
+    resolved = _resolve_card(conn, user_id, card_id, profile_slug)
     if resolved is None:
         return None
     profile_id, openalex_id = resolved
@@ -229,7 +249,8 @@ def dismiss(
 
 
 def card_feedback_context(
-    conn: sqlite3.Connection, user_id: int, card_id: str
+    conn: sqlite3.Connection, user_id: int, card_id: str,
+    profile_slug: str | None = None,
 ) -> dict | None:
     """Look up everything ``feedback.log_event`` needs for a card.
 
@@ -250,10 +271,11 @@ def card_feedback_context(
         JOIN profiles pr   ON pr.id = pc.profile_id
         JOIN papers   p    USING (openalex_id)
         WHERE pr.user_id = ? AND pc.openalex_id = ?
+          AND (? IS NULL OR pr.slug = ?)
         ORDER BY pc.fetched_at DESC
         LIMIT 1
         """,
-        (user_id, card_id),
+        (user_id, card_id, profile_slug, profile_slug),
     ).fetchone()
     if row is None:
         return None

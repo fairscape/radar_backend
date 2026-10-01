@@ -394,25 +394,48 @@ def attach_seeds(
     user_id: int,
     slug: str,
     openalex_ids: list[str],
-) -> tuple[int, list[str]]:
-    """Add already-stored papers to a draft as seeds.
+) -> tuple[int, list[str], int | None]:
+    """Add already-stored papers to a draft or a live profile as seeds.
 
-    Only papers the user owns (uploaded, imported with a researcher, or
-    already a seed elsewhere) are attached; the rest are returned as
-    ``rejected``. Raises ``LookupError`` when the draft does not exist.
+    Returns ``(attached, rejected, rescored)``: ``rescored`` is how many
+    stored candidates a live interest's refit re-scored, None for a draft.
+
+    Only papers the user owns (uploaded, imported with a researcher, a
+    seed elsewhere, or a candidate in one of their interests) are
+    attached; the rest are returned as ``rejected``. Raises
+    ``LookupError`` when the profile does not exist.
+
+    Any attached paper without a vector is embedded here: the fit leaves
+    out a seed it cannot place, and a paper taken from the feed has none.
+    A live profile is then re-fitted, so the seeds it scores against are
+    the seeds it shows.
     """
     row = profiles_repo.get_by_slug(conn, user_id, slug)
-    if row is None or not row["is_draft"]:
-        raise LookupError(f"draft '{slug}' not found for current user")
+    if row is None:
+        raise LookupError(f"interest '{slug}' not found for current user")
     wanted = [i.strip() for i in openalex_ids if (i or "").strip()]
     if not wanted:
         raise ValueError("select at least one paper")
     owned = researchers_repo.user_owns_papers(conn, user_id, wanted)
     attached = 0
     rejected: list[str] = []
+    accepted: list[str] = []
     for openalex_id in wanted:
         if openalex_id in owned:
             attached += profiles_repo.attach_seed(conn, int(row["id"]), openalex_id)
+            accepted.append(openalex_id)
         else:
             rejected.append(openalex_id)
-    return attached, rejected
+    if accepted:
+        # Over every accepted id, not just the newly attached ones: the
+        # seed row commits before this runs, so if embedding or the refit
+        # failed, a retry found the seed "already attached", did nothing,
+        # and the interest kept scoring against the old centroid. Both
+        # steps are idempotent, so running them again is the repair.
+        from . import wizard as wizard_service
+
+        wizard_service.embed_missing(conn, row["embedding_model"], accepted)
+        if not row["is_draft"]:
+            fit = wizard_service.refit_profile(conn, user_id=user_id, slug=slug)
+            return attached, rejected, fit.get("n_rescored")
+    return attached, rejected, None

@@ -97,7 +97,11 @@ class Card(_Model):
     centroidCos: float
     noveltyDelta: float
     mins: int
-
+    # This card's own state, for the interest named in ``profile``. The
+    # response-level ``states`` dict is keyed by paper id alone, so when one
+    # paper is a candidate in two interests it held whichever was iterated
+    # last -- a card could show another interest's "Saved".
+    state: CardState | None = None
 
 class VaultDoc(_Model):
     id: str
@@ -124,6 +128,14 @@ class Topic(_Model):
     count: int
     on: bool
     source: str | None = None
+    # Found by the seeds since the topics were last saved (topic preview only).
+    new: bool | None = None
+
+
+class TopicSelection(_Model):
+    """Body of ``PUT /api/profiles/{key}/topics``: the topics to leave on."""
+
+    selected_topic_ids: list[str] = Field(default_factory=list)
 
 
 class SweepRow(_Model):
@@ -279,6 +291,16 @@ class SeedSimilarity(_Model):
     max: float
 
 
+class DryRunPaper(_Model):
+    """One trial-scan paper, just enough to list it beside the threshold slider."""
+
+    id: str
+    title: str
+    venue: str = ""
+    year: int | None = None
+    score: float
+
+
 class DryRunResponse(_Model):
     ok: bool = True
     key: str
@@ -291,6 +313,8 @@ class DryRunResponse(_Model):
     seed_similarity: SeedSimilarity | None = None
     # [lo, hi] the slider should span: observed scores + seed band.
     score_range: list[float] | None = None
+    # Every stored candidate, best first -- above and below the threshold.
+    papers: list[DryRunPaper] = Field(default_factory=list)
 
 
 class GatherRun(_Model):
@@ -688,6 +712,9 @@ class DraftSeedsResponse(_Model):
     attached: int
     # Ids that were not the user's to use; nothing was attached for these.
     rejected: list[str] = Field(default_factory=list)
+    # Stored candidates a live interest's refit re-scored against the new
+    # seeds; None for a draft (nothing stored yet).
+    rescored: int | None = None
 
 
 class LeastSimilarPair(_Model):
@@ -748,6 +775,10 @@ class DraftDryRun(_Model):
     suggested_threshold: float | None = None
     seed_similarity: SeedSimilarity | None = None
     score_range: list[float] | None = None
+    # Every scored paper, best first, each with its ``scores`` value. The
+    # 10-card ``preview`` is the top of the pool and never changes as the
+    # slider moves; this lets the UI show which papers a threshold lets in.
+    papers: list[DryRunPaper] = Field(default_factory=list)
 
 
 class DraftDryRunStart(_Model):
