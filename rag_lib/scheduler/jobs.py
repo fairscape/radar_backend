@@ -77,6 +77,19 @@ class _ProgressReporter:
             self._conn, self._run_id, name, n_total=total, message=message,
         )
 
+    def tick(self, *, n_processed: int, message: str | None = None) -> None:
+        """Report absolute progress within the current step.
+
+        ``make_embed_tick`` counts for callers that only know "one more
+        done"; this is for loops that already know where they are, such
+        as the Prosopia import walking a fixed list of works. Both land
+        on the same column, so the frontend needs no second idiom.
+        """
+        gather_runs_repo.tick(
+            self._conn, self._run_id,
+            n_processed=n_processed, message=message,
+        )
+
     def make_embed_tick(self, total: int | None = None) -> "callable":
         """Return a zero-arg callback for embed_progress().
 
@@ -538,4 +551,72 @@ def dry_run_for_draft(
         conn.close()
 
 
-__all__ = ["gather_for_profile", "dry_run_for_draft"]
+def import_prosopia_profile(
+    plan: Any,
+    *,
+    settings: Any | None = None,
+    run_id: int,
+) -> int | None:
+    """Async body for ``POST /api/import/prosopia``.
+
+    The expensive half of the import: an OpenAlex round trip per DOI
+    batch and one embedding per paper. For the reference profile that is
+    82 papers behind a cold SPECTER2 load, which is minutes — far past
+    what a request can hold open, and with no way to show progress if it
+    tried.
+
+    The kickoff route has already read the Prosopia profile and created
+    the draft, so ``plan`` carries everything needed and there is no
+    second chance for the slug to 404 somewhere the caller cannot see.
+    Like the dry-run job we reuse the pre-created ``run_id`` and close
+    the row either way — a failure lands on ``gather_runs.error``, which
+    is what the poll endpoint shows.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+
+    from ..api.services.prosopia import run_import
+
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        reporter = _ProgressReporter(conn, run_id)
+        try:
+            reporter.step(
+                "loading_profile",
+                total=len(plan.records),
+                message=f"Importing {len(plan.records)} works from '{plan.slug}'",
+            )
+            result = run_import(conn, settings, plan=plan, reporter=reporter)
+            reporter.step("persisting", message="Saving import result")
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=result["drafted"],
+                n_new=result["drafted"],
+                n_redup=0,
+                tier_used="prosopia_import",
+                result_json=json.dumps(result),
+            )
+            log.info(
+                "prosopia_import.ok",
+                run_id=run_id, slug=plan.slug,
+                draft_slug=plan.draft_slug, drafted=result["drafted"],
+                resolved_by=result["resolved_by"],
+            )
+            return run_id
+        except Exception as exc:  # noqa: BLE001 — surface into audit row
+            gather_runs_repo.finish(
+                conn, run_id,
+                n_fetched=0, n_new=0, n_redup=0,
+                tier_used="prosopia_import",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception(
+                "prosopia_import.failed", run_id=run_id, slug=plan.slug,
+            )
+            return run_id
+    finally:
+        conn.close()
+
+
+__all__ = ["gather_for_profile", "dry_run_for_draft", "import_prosopia_profile"]

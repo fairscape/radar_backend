@@ -29,7 +29,7 @@ per-user PDFs/feedback under `./vault/`, vector indexes under `./chroma/`.
 
 ## Install
 
-Requires Python 3.11+.
+Requires Python 3.12+.
 
 ```sh
 git clone https://github.com/fairscape/radar_backend.git

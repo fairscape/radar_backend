@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # Keep symmetric with RADAR_DEFAULT_EMBEDDING_MODEL so operators can
     # swap defaults without code changes.
     RADAR_DEFAULT_SELECTOR: str = "centroid"
+    # Prosopia instance the seed-corpus importer reads
+    # (``POST /api/profiles/import/prosopia``). Per-request ``base_url``
+    # overrides it, so this is the default a plain slug resolves against.
+    RADAR_PROSOPIA_BASE_URL: str = "https://prosopia.databio.org"
     RADAR_CORS_ORIGINS: list[str] = ["*"]
     RADAR_LOG_JSON: bool = True
     # Optional path to a log file. When set, every record (request lines,

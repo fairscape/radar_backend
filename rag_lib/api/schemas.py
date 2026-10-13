@@ -337,6 +337,69 @@ class DraftCreateRequest(_Model):
     selector: str | None = None
 
 
+class ProsopiaImportRequest(_Model):
+    """Body of ``POST /api/import/prosopia``.
+
+    ``ref`` is a bare slug *or* a full profile URL — the latter is what
+    a user copies out of the address bar, and rejecting it would be a
+    gratuitous papercut. ``base_url`` points at a non-default Prosopia
+    instance. ``name`` overrides the draft name, which otherwise comes
+    from the Prosopia profile's own metadata; ``embedding_model``
+    overrides the configured default, exactly as on the wizard's
+    create-draft route.
+    """
+
+    ref: str
+    base_url: str | None = None
+    name: str | None = None
+    embedding_model: str | None = None
+
+
+class ProsopiaImportStart(_Model):
+    """Kick-off ack for ``POST /api/import/prosopia``.
+
+    The draft exists by the time this returns — the Prosopia read and
+    the draft insert happen inline, because a bad slug should be a 404
+    on the request rather than an error buried in a run row. Everything
+    expensive (OpenAlex resolution, embedding every paper) runs in the
+    background under ``run_id``.
+    """
+
+    draft_slug: str
+    run_id: int
+
+
+class ProsopiaImportResult(_Model):
+    """What the import actually managed to do.
+
+    ``resolved_by`` is the point of this shape. Every paper lands as a
+    seed either way, so the row count alone cannot distinguish a profile
+    that imported cleanly from one reconstructed by fuzzy title search.
+    The per-rung counts can: ``work_id`` and ``doi`` are the paper the
+    profile named, ``title`` is our best guess at it, and ``none`` is a
+    synthetic id embedded from the Prosopia summary.
+    """
+
+    slug: str
+    draft_slug: str
+    name: str
+    drafted: int
+    resolved_by: dict[str, int] = Field(default_factory=dict)
+    unresolved: list[str] = Field(default_factory=list)
+
+
+class ProsopiaImportStatus(_Model):
+    """Poll response for ``GET /api/import/prosopia/{run_id}``.
+
+    Mirrors ``DraftDryRunStatus``: the audit row always, the payload
+    only once the job finished cleanly. A failed job leaves ``result``
+    null and the reason on ``run.error``.
+    """
+
+    run: GatherRun
+    result: ProsopiaImportResult | None = None
+
+
 class DraftCoherence(_Model):
     """Output of ``POST /api/profiles/draft/{slug}/coherence``.
 
