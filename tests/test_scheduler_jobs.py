@@ -666,3 +666,38 @@ def test_a_gather_stores_the_vectors_it_computes(monkeypatch, db_path, settings,
     finally:
         conn.close()
     assert vec is not None and np.allclose(vec, [0.3] * 8)
+
+
+def test_a_backfill_stores_papers_from_the_years_asked_for(monkeypatch, db_path, settings, profile_id):
+    """Scans only ever looked back a day, so an interest never held an older
+    paper. ``years`` fetches those years instead, and the rest of the gather
+    -- scoring, keeping what falls below the threshold -- is unchanged."""
+    asked = {}
+
+    class YearStub(_StubGatherer):
+        def fetch(self, *a, **kw):
+            raise AssertionError("a backfill must not fetch by days")
+
+        def fetch_years(self, profile, year_from, year_to, *, per_year):
+            asked.update(span=(year_from, year_to), per_year=per_year)
+            self.last_tier_used = "backfill-years"
+            out = []
+            for i, y in enumerate((2018, 2019, 2020)):
+                p = _candidate_paper(f"W80{i}")
+                p.year = y
+                out.append(p)
+            return out
+
+    monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: YearStub([]))
+    run_id = scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings,
+                                               years=(2018, 2020), tier="backfill")
+    conn = connect(db_path)
+    try:
+        stored = {r[0] for r in conn.execute(
+            "SELECT openalex_id FROM profile_candidates WHERE profile_id = ?", (profile_id,))}
+        run = conn.execute("SELECT tier_used, since_date, error FROM gather_runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    assert asked == {"span": (2018, 2020), "per_year": 100}
+    assert stored == {"W800", "W801", "W802"}
+    assert run[2] is None and run[0] == "backfill-years" and run[1] == "2018-01-01"

@@ -16,6 +16,14 @@ import sqlite3
 # Same rule as ``scoring.pool.passes``.
 PASSES = "(pc.score_raw IS NULL OR pr.threshold IS NULL OR pc.score_raw >= pr.threshold)"
 
+# ... and when its publication year is within the interest's range
+# (migration 0018). An open bound, or a paper with no year, passes. Needs
+# ``p`` (papers) and ``pr``. Same rule as ``scoring.pool.in_years``.
+IN_YEARS = (
+    "((pr.year_from IS NULL OR p.year IS NULL OR p.year >= pr.year_from)"
+    " AND (pr.year_to IS NULL OR p.year IS NULL OR p.year <= pr.year_to))"
+)
+
 
 def insert_dedup(
     conn: sqlite3.Connection,
@@ -205,7 +213,7 @@ def unshown_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES}
+          AND {PASSES} AND {IN_YEARS}
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
@@ -322,6 +330,7 @@ def top_for_profile(
     profile_id: int,
     *,
     limit: int = 50,
+    year_from: int | None = None,
 ) -> list[sqlite3.Row]:
     """Top-N candidates for the daily radar (no shown/dismissed filter).
 
@@ -350,11 +359,13 @@ def top_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES}
+          AND {PASSES} AND {IN_YEARS}
+          -- The feed's own "published since" filter, on top of the interest's range.
+          AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
         ORDER BY COALESCE(pc.score_blended, pc.score) DESC
         LIMIT ?
         """,
-        (profile_id, limit),
+        (profile_id, year_from, year_from, limit),
     ).fetchall()
 
 

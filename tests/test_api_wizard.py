@@ -379,3 +379,34 @@ def test_wizard_options_unknown_default_falls_back_to_first(app, monkeypatch):
         assert len(defaults) == 1
     finally:
         settings_module.get_settings.cache_clear()
+
+
+def test_a_trial_over_a_year_range_samples_each_year(app, tmp_path):
+    """The trial scan only ever looked at the last 30 days. With a range it
+    asks for each year, so the threshold is set against papers from those
+    years."""
+    from rag_lib.api.routers.profiles import get_wizard_gatherer
+    from tests.fixture_gatherer import FixtureGatherer
+
+    class YearGatherer(FixtureGatherer):
+        asked = []
+
+        def fetch_years(self, profile, year_from, year_to, *, per_year):
+            YearGatherer.asked.append((year_from, year_to, per_year))
+            return self.fetch(profile, since=f"{year_from}-01-01", limit=12)
+
+    app.dependency_overrides[get_wizard_gatherer] = lambda: YearGatherer(seed=42, n_candidates=12)
+    db = str(tmp_path / "radar.db")
+    slug = _request(app, "POST", "/api/profiles/draft",
+                    json={"name": "Neonatal", "embedding_model": "placeholder-v1"}).json()["slug"]
+    _attach_seeds(db, user_id=1, slug=slug)
+    _request(app, "GET", f"/api/profiles/draft/{slug}/topics")
+    resp = _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run",
+                    json={"days": 7, "year_from": 2019, "year_to": 2021})
+    assert resp.status_code == 200, resp.text
+    assert YearGatherer.asked == [(2019, 2021, 60)]
+    result = _request(app, "GET", f"/api/profiles/draft/{slug}/dry-run/{resp.json()['run_id']}").json()["result"]
+    assert len(result["papers"]) == 12
+
+    bad = _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run", json={"year_from": 2022, "year_to": 2019})
+    assert bad.status_code == 400

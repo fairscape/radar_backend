@@ -175,12 +175,15 @@ def _load_profile(conn, profile_row) -> Profile:
             paper.embeddings[embedding_model] = vec.tolist()
         papers.append(paper)
 
+    from ..interest_terms import load as load_terms, query_labels
+
     return Profile(
         name=profile_row["name"],
         papers=papers,
         topic_filters=topic_filters,
         embedding_model=embedding_model,
         threshold=profile_row["threshold"],
+        interest_terms=query_labels(load_terms(profile_row)),
     )
 
 
@@ -297,8 +300,15 @@ def gather_for_profile(
     limit: int = GATHER_LIMIT_DEFAULT,
     run_id: int | None = None,
     tier: str = "scheduled",
+    years: tuple[int, int | None] | None = None,
 ) -> int | None:
     """Run one OpenAlex gather + score + persist cycle for a profile.
+
+    ``years`` (``(year_from, year_to)``, ``year_to`` None = this year) makes
+    it a backfill: papers from those years (``fetch_years``, most cited
+    first, ``years.BACKFILL_PER_YEAR`` a year) instead of the last ``days``.
+    Everything after the fetch -- scoring, keeping papers below the
+    threshold, reranking what passes, the pool rescore -- is the same.
 
     When ``run_id`` is supplied (e.g., the ``gather-now`` endpoint
     pre-created the row so it could echo the id back to the caller), the
@@ -325,6 +335,11 @@ def gather_for_profile(
             return None
 
         since = _days_ago_iso(days)
+        span = None
+        if years is not None:
+            from .. import years as years_rules
+            span = years_rules.fetch_span(years[0], years[1])
+            since = f"{span[0]}-01-01"
         if run_id is None:
             run_id = gather_runs_repo.start(
                 conn,
@@ -372,7 +387,13 @@ def gather_for_profile(
             gatherer = OpenAlexGatherer(mailto=mailto)
 
             reporter.step("fetching", message="Querying OpenAlex")
-            candidates = gatherer.fetch(profile, since=since, limit=limit)
+            if span is not None:
+                from .. import years as years_rules
+                candidates = gatherer.fetch_years(
+                    profile, span[0], span[1], per_year=years_rules.BACKFILL_PER_YEAR,
+                )
+            else:
+                candidates = gatherer.fetch(profile, since=since, limit=limit)
 
             reporter.step(
                 "embedding",
@@ -510,6 +531,8 @@ def dry_run_for_draft(
     settings: Any | None = None,
     days: int = 30,
     thresholds: list[float] | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
     run_id: int,
 ) -> int | None:
     """Async dry-run body for the wizard's calibrate step.
@@ -558,6 +581,8 @@ def dry_run_for_draft(
                     slug=slug,
                     days=days,
                     thresholds=thresholds,
+                    year_from=year_from,
+                    year_to=year_to,
                     reporter=reporter,
                 )
             reporter.step("persisting", message="Saving dry-run result")

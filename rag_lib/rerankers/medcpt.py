@@ -386,6 +386,13 @@ class MedCPTReranker:
             queries = self._seed_content_queries(profile)
         elif self.query_mode == "title":
             return self._title_queries(profile)
+        elif self.query_mode == "terms":
+            # The interest's research topics, generated the way Prosopia
+            # generates them (rag_lib/interest_terms.py); short phrases,
+            # the shape "topic" mode already pairs with candidates. An
+            # interest without them falls back to its topic names.
+            queries = list(getattr(profile, "interest_terms", None) or [])[: self.max_queries] \
+                or self._topic_queries(profile)
         else:
             queries = self._topic_queries(profile)
         if queries:

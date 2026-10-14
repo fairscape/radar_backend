@@ -96,6 +96,7 @@ def daily(
     *,
     profile_slug: str | None = None,
     bucket: Bucket | None = None,
+    year_from: int | None = None,
 ) -> DailyRadarResponse:
     """Build the ``DailyRadarResponse`` for the user / profile / bucket.
 
@@ -134,7 +135,7 @@ def daily(
         slug = prow["slug"] or prow["name"]
         topic_filters = profiles_repo.topic_filters(conn, pid)
         active = _active_topic_ids(topic_filters)
-        rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap)
+        rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap, year_from=year_from)
         shown_ids: list[str] = []
         threshold = prow["threshold"]
         try:

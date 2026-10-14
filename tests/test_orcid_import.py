@@ -370,3 +370,39 @@ def test_import_rejects_bad_input(env):
         assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 0
     finally:
         conn.close()
+
+
+def test_import_into_an_existing_draft_adds_seeds_to_it(env):
+    """Once a draft existed, step 1 could not search another ORCID: every
+    ORCID import opened a new draft. ``into`` adds the works to the draft
+    the user is building instead."""
+    app = _app(StubOrcidOpenAlex(WORKS))
+    first = _request(app, "POST", "/api/import/orcid",
+                     json={"orcid": ORCID, "openalex_ids": ["W1"], "name": "Mixed"}).json()
+    slug = first["draft_slug"]
+    resp = _request(app, "POST", "/api/import/orcid",
+                    json={"orcid": ORCID, "openalex_ids": ["W3"], "into": slug})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["draft_slug"] == slug
+    status = _request(app, "GET", f"/api/import/prosopia/{resp.json()['run_id']}").json()
+    assert status["run"]["error"] is None and status["result"]["drafted"] == 1
+
+    conn = connect(env)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 1
+        row = conn.execute("SELECT name FROM profiles WHERE slug = ?", (slug,)).fetchone()
+        assert row["name"] == "Mixed"                      # the draft keeps its name
+        seeds = conn.execute("SELECT openalex_id FROM profile_seeds").fetchall()
+        assert sorted(r["openalex_id"].rsplit("/", 1)[-1] for r in seeds) == ["W1", "W3"]
+    finally:
+        conn.close()
+
+    # Not one of the user's drafts: refused before anything is created.
+    resp = _request(app, "POST", "/api/import/orcid",
+                    json={"orcid": ORCID, "openalex_ids": ["W2"], "into": "no-such-draft"})
+    assert resp.status_code == 404
+    conn = connect(env)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 1
+    finally:
+        conn.close()

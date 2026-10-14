@@ -205,6 +205,59 @@ def list_works(
     return {"slug": slug, "name": profile.name or None, "works": works}
 
 
+class DraftNotFound(LookupError):
+    """``into`` names no draft of this user."""
+
+
+def target_draft(conn: sqlite3.Connection, user_id: int, into: str | None) -> sqlite3.Row | None:
+    """The existing draft an import adds to, or None for a new one.
+
+    Checked before anything is written. Only a draft: a live interest
+    takes papers through ``POST /{key}/seeds``, which also refits it.
+    """
+    if not into:
+        return None
+    row = profiles_repo.get_by_slug(conn, user_id, into)
+    if row is None or not row["is_draft"]:
+        raise DraftNotFound(f"no draft '{into}' to add these papers to")
+    return row
+
+
+def open_draft(
+    conn: sqlite3.Connection,
+    settings: Any,
+    *,
+    user_id: int,
+    target: sqlite3.Row | None,
+    name: str,
+    embedding_model: str,
+    researcher_id: int | None,
+) -> sqlite3.Row:
+    """The draft an import's papers become seeds of: ``target``, or a new one.
+
+    A new draft is linked to the researcher. An existing one keeps its
+    name and, if it was built from someone already, stays theirs -- so a
+    second researcher's papers can join the first's (the wizard's "add
+    papers from an ORCID / Prosopia profile" once a draft exists).
+    """
+    if target is not None:
+        if target["researcher_id"] is None and researcher_id is not None:
+            researchers_repo.set_profile_researcher(conn, int(target["id"]), researcher_id)
+        return target
+    draft = wizard_service.create_draft(
+        conn,
+        user_id=user_id,
+        name=name,
+        embedding_model=embedding_model,
+        selector=settings.RADAR_DEFAULT_SELECTOR,
+    )
+    draft_row = profiles_repo.get_by_slug(conn, user_id, draft["slug"])
+    if draft_row is None:  # pragma: no cover — create_draft just wrote it
+        raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
+    researchers_repo.set_profile_researcher(conn, int(draft_row["id"]), researcher_id)
+    return draft_row
+
+
 def prepare_import(
     conn: sqlite3.Connection,
     settings: Any,
@@ -216,8 +269,13 @@ def prepare_import(
     embedding_model: str | None = None,
     prosopia_client: Any | None = None,
     paper_ids: list[str] | None = None,
+    into: str | None = None,
 ) -> ImportPlan:
     """Read the profile and open the draft. Fast enough for a request.
+
+    With ``into`` the papers become seeds of that existing draft instead
+    of a new one (:class:`DraftNotFound` when it is not one of the user's
+    drafts).
 
     ``paper_ids`` (the ``id`` values from :func:`list_works`) keeps only
     those papers; ``None`` imports the whole profile. Raises
@@ -226,10 +284,12 @@ def prepare_import(
     of ``paper_ids`` are on the profile, and ``ProsopiaError`` for any
     other upstream failure; the router maps those to 400 / 404 / 502.
     """
+    target = target_draft(conn, user_id, into)
     slug, profile = _resolve_profile(ref, base_url, prosopia_client)
     records = select_records(profile, slug, paper_ids)
 
-    model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    model = (target["embedding_model"] if target is not None else None) \
+        or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     # The researcher is recorded whichever way the import was started,
     # so the papers this draft is about to embed are reusable for the
     # next interest without a second import.
@@ -238,22 +298,16 @@ def prepare_import(
         conn, user_id=user_id, slug=slug, profile=profile,
         base_url=base_url or DEFAULT_BASE_URL,
     )
-    draft = wizard_service.create_draft(
-        conn,
-        user_id=user_id,
-        name=(name or profile.name or slug).strip(),
-        embedding_model=model,
-        selector=settings.RADAR_DEFAULT_SELECTOR,
+    draft_row = open_draft(
+        conn, settings, user_id=user_id, target=target,
+        name=(name or profile.name or slug).strip(), embedding_model=model,
+        researcher_id=researcher_id,
     )
-    draft_row = profiles_repo.get_by_slug(conn, user_id, draft["slug"])
-    if draft_row is None:  # pragma: no cover — create_draft just wrote it
-        raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
-    researchers_repo.set_profile_researcher(conn, int(draft_row["id"]), researcher_id)
 
     return ImportPlan(
         slug=slug,
-        draft_slug=draft["slug"],
-        draft_name=draft["name"],
+        draft_slug=draft_row["slug"],
+        draft_name=draft_row["name"],
         profile_id=int(draft_row["id"]),
         researcher_id=researcher_id,
         user_id=user_id,

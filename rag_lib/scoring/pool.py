@@ -93,8 +93,15 @@ KEEP_ALL = float("-inf")
 
 
 def passes(score_raw: float | None, threshold: float | None) -> bool:
-    """Whether a stored candidate is in the feed: the rule ``candidates.PASSES`` spells in SQL."""
+    """Whether a stored candidate clears the threshold: ``candidates.PASSES`` in SQL."""
     return score_raw is None or threshold is None or score_raw >= threshold
+
+
+def in_years(year: int | None, year_from: int | None, year_to: int | None) -> bool:
+    """Whether a paper's year is in the interest's range: ``candidates.IN_YEARS`` in SQL."""
+    if year is None:
+        return True
+    return (year_from is None or year >= year_from) and (year_to is None or year <= year_to)
 
 
 def rescore_profile_pool(
@@ -106,16 +113,24 @@ def rescore_profile_pool(
     per-paper inputs -- untouched, so running it twice changes nothing.
     Rows below the threshold get NULL blend and percentile.
     """
-    prow = conn.execute("SELECT threshold FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    prow = conn.execute(
+        "SELECT threshold, year_from, year_to FROM profiles WHERE id = ?", (profile_id,),
+    ).fetchone()
     threshold = None if prow is None or prow[0] is None else float(prow[0])
+    year_from = None if prow is None else prow[1]
+    year_to = None if prow is None else prow[2]
     rows = [dict(r) for r in conn.execute(
         """
-        SELECT openalex_id, score, score_raw, score_reranker_raw
-        FROM profile_candidates WHERE profile_id = ?
+        SELECT pc.openalex_id, pc.score, pc.score_raw, pc.score_reranker_raw, p.year
+        FROM profile_candidates pc JOIN papers p USING (openalex_id)
+        WHERE pc.profile_id = ?
         """,
         (profile_id,),
     ).fetchall()]
-    pool = [r for r in rows if passes(r["score_raw"], threshold)]
+    # The pool is what the feed can show: above the threshold and inside
+    # the interest's years (feed percentiles would otherwise rank against
+    # papers that are never shown).
+    pool = [r for r in rows if passes(r["score_raw"], threshold) and in_years(r["year"], year_from, year_to)]
     scores = pool_scores(pool, alpha=alpha, beta=beta)
     empty = {"score_reranker_norm": None, "score_blended": None, "score_pct": None}
     conn.executemany(

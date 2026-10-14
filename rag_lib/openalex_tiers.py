@@ -97,6 +97,7 @@ def build_filter_string(
     parts: list[FilterPart],
     since: str,
     *,
+    until: str | None = None,
     extras: str = "type:article,language:en",
 ) -> str:
     """Assemble an OpenAlex /works filter string from tier parts.
@@ -107,8 +108,11 @@ def build_filter_string(
 
     ``from_publication_date:<since>`` and ``extras`` are always emitted
     first so the date-bound + article/language filters apply to every
-    tier."""
+    tier. ``until`` adds ``to_publication_date`` -- a year's backfill
+    (``gatherers.openalex.fetch_years``); the daily scans leave it open."""
     out: list[str] = [f"from_publication_date:{since}"]
+    if until:
+        out.append(f"to_publication_date:{until}")
     if extras:
         out.append(extras)
     for oa_key, ids, mode in parts:

@@ -52,11 +52,14 @@ def daily_radar(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     profile: str | None = Query(default=None),
     bucket: Bucket | None = Query(default=None),
+    # "Published since": on top of each interest's own year range.
+    year_from: int | None = Query(default=None, ge=1900, le=2100),
 ) -> DailyRadarResponse:
     return radar_service.daily(
         db, int(user["id"]),
         profile_slug=profile,
         bucket=bucket,
+        year_from=year_from,
     )
 
 

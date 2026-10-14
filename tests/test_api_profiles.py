@@ -572,3 +572,65 @@ def test_a_saved_interests_topics_can_be_previewed_and_switched(app, tmp_path):
     resp = _request(app, "PUT", f"/api/profiles/{SLUG}/topics", json={"selected_topic_ids": []})
     assert resp.status_code == 409
     assert stored() == {"T11431": False, "T10123": True}                         # unchanged
+
+
+def test_a_backfill_is_queued_for_the_years_asked_and_ranges_are_checked(app, tmp_path):
+    from rag_lib.api.deps import get_scheduler
+
+    queued = []
+
+    class Recorder:
+        def add_job(self, fn, **kw):
+            queued.append((fn.__name__, kw["kwargs"]))
+
+    app.dependency_overrides[get_scheduler] = lambda: Recorder()
+    resp = _request(app, "POST", f"/api/profiles/{SLUG}/backfill", json={"year_from": 2018})
+    assert resp.status_code == 200, resp.text
+    assert queued == [("gather_for_profile", {"run_id": resp.json()["run_id"], "tier": "backfill",
+                                              "years": (2018, None)})]
+    conn = connect(tmp_path / "radar.db")
+    run = conn.execute("SELECT tier_used, since_date FROM gather_runs WHERE id = ?", (resp.json()["run_id"],)).fetchone()
+    conn.close()
+    assert run[0] == "backfill" and run[1] == "2018-01-01"
+
+    assert _request(app, "POST", f"/api/profiles/{SLUG}/backfill", json={"year_from": 2021, "year_to": 2019}).status_code == 400
+    assert _request(app, "POST", f"/api/profiles/{SLUG}/backfill", json={}).status_code == 400
+    assert _request(app, "POST", "/api/profiles/nope/backfill", json={"year_from": 2018}).status_code == 404
+
+
+def test_an_interests_years_bound_its_feed_and_its_ranking_pool(app, tmp_path):
+    """Papers outside the interest's years are kept but not shown, and not
+    ranked against; an open year_to keeps this year's new papers."""
+    conn = connect(tmp_path / "radar.db")
+    conn.execute("UPDATE profile_candidates SET score_raw = score")
+    # Ten of the fifty candidates are old papers.
+    conn.execute("UPDATE papers SET year = 2015 WHERE openalex_id IN (SELECT openalex_id FROM profile_candidates LIMIT 10)")
+    conn.commit()
+    pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (SLUG,)).fetchone()[0]
+    conn.close()
+
+    def feed(**kw):
+        c = connect(tmp_path / "radar.db")
+        try:
+            return candidates_repo.top_for_profile(c, pid, limit=100, **kw)
+        finally:
+            c.close()
+
+    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": 0.4}).status_code == 200
+    assert len(feed()) == 50
+    resp = _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2020, "year_to": None}})
+    assert resp.status_code == 200 and resp.json()["yearFrom"] == 2020 and resp.json()["yearTo"] is None
+    rows = feed()
+    assert len(rows) == 40 and all(r["year"] == 2026 for r in rows)
+    assert max(r["score_pct"] for r in rows) == 1.0 and min(r["score_pct"] for r in rows) == 0.0
+    c = connect(tmp_path / "radar.db")
+    old_pcts = [r[0] for r in c.execute(
+        "SELECT pc.score_pct FROM profile_candidates pc JOIN papers p USING (openalex_id) "
+        "WHERE pc.profile_id = ? AND p.year = 2015", (pid,))]
+    c.close()
+    assert old_pcts and all(p is None for p in old_pcts)          # not in the pool
+
+    # The feed's own "published since" filter narrows further.
+    assert len(feed(year_from=2027)) == 0
+    assert _request(app, "GET", "/api/radar/daily?year_from=2027").json()["cards"] == []
+    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2021, "year_to": 2019}}).status_code == 400

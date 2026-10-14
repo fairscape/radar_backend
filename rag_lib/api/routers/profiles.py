@@ -41,8 +41,12 @@ from ..schemas import (
     RefitResponse,
     Schedule,
     ScheduleUpdate,
+    InterestTerms,
+    InterestTermsGenerate,
+    InterestTermsUpdate,
     Topic,
     TopicSelection,
+    YearRange,
     TopicYield,
     TopicYieldResponse,
     WizardOption,
@@ -281,9 +285,14 @@ def draft_dry_run(
     fixture run finishes before the response returns and the
     status-poll endpoint returns the cached result on first call.
     """
+    from rag_lib import years as years_rules
     from rag_lib.db.repos import gather_runs as gather_runs_repo
     from rag_lib.scheduler.jobs import dry_run_for_draft
 
+    try:
+        years_rules.check_range(body.year_from, body.year_to)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     try:
         profile_row = wizard_service._require_draft(db, int(user["id"]), slug)
     except LookupError as exc:
@@ -310,6 +319,7 @@ def draft_dry_run(
             db, settings,
             user_id=int(user["id"]), slug=slug,
             days=body.days, thresholds=body.thresholds,
+            year_from=body.year_from, year_to=body.year_to,
             gatherer=gatherer,
         )
         gather_runs_repo.finish(
@@ -346,6 +356,8 @@ def draft_dry_run(
             "run_id": run_id,
             "days": body.days,
             "thresholds": body.thresholds,
+            "year_from": body.year_from,
+            "year_to": body.year_to,
         },
         id=f"dry-run:{profile_id}:{run_id}",
         replace_existing=False,
@@ -564,8 +576,14 @@ def commit_draft(
     was written but nothing was registered, so a new interest got no
     nightly scan until the backend happened to restart.
     """
+    from rag_lib import years as years_rules
     from rag_lib.scheduler.runner import valid_cron
 
+    if body.years is not None:
+        try:
+            years_rules.check_range(body.years.year_from, body.years.year_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     # Before anything is written: the commit flips the draft live, so a cron
     # that failed afterwards answered 500 to a commit that had happened, and
     # the wizard's retry then got 404.
@@ -590,6 +608,11 @@ def commit_draft(
             cron=body.cron,
             tz=body.tz,
         )
+        if body.years is not None:
+            from rag_lib.db.repos import profiles as _profiles_repo
+            _row = _profiles_repo.get_by_slug(db, int(user["id"]), body.slug)
+            if _row is not None:
+                _profiles_repo.update_year_range(db, int(_row["id"]), body.years.year_from, body.years.year_to)
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -657,12 +680,23 @@ def update_profile(
     detail page; the dry-run histogram lets the user see how the
     chosen θ affects candidate volume before saving.
     """
+    from rag_lib import years as years_rules
     from rag_lib.db.repos import profiles as profiles_repo
 
+    if body.threshold is None and body.years is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="nothing to update")
+    if body.years is not None:
+        try:
+            years_rules.check_range(body.years.year_from, body.years.year_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
-    profiles_repo.update_threshold(db, profile_id, float(body.threshold))
-    # The threshold decides which stored papers are in the feed, so the
-    # pool the feed ranks (and its percentiles) changes with it.
+    if body.threshold is not None:
+        profiles_repo.update_threshold(db, profile_id, float(body.threshold))
+    if body.years is not None:
+        profiles_repo.update_year_range(db, profile_id, body.years.year_from, body.years.year_to)
+    # The threshold and the years decide which stored papers are in the
+    # feed, so the pool the feed ranks (and its percentiles) changes with them.
     from rag_lib.scheduler.jobs import rescore_pool
     rescore_pool(db, profile_id)
     updated = profiles_service.get_profile(db, int(user["id"]), key)
@@ -709,6 +743,108 @@ def _topics_out(topic_filters: dict, new: set[str] | None = None) -> list[Topic]
             new=(tid in new) if new is not None else None,
         ))
     return out
+
+
+def _terms_view(db: sqlite3.Connection, row: sqlite3.Row, record: dict | None, *, saved: bool = True) -> InterestTerms:
+    """The stored record as the API shape, flagged ``stale`` when the seeds moved on."""
+    from rag_lib import interest_terms
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    if not record:
+        return InterestTerms()
+    seeds = profiles_repo.list_seed_openalex_ids(db, int(row["id"]))
+    fields = {k: v for k, v in record.items() if k in InterestTerms.model_fields and k not in ("stale", "saved")}
+    return InterestTerms(**fields, saved=saved, stale=bool(record.get("seed_hash")) and record["seed_hash"] != interest_terms.seed_hash(seeds))
+
+
+@router.get("/{key}/terms", response_model=InterestTerms)
+def get_terms(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> InterestTerms:
+    """The interest's research topics (empty until generated)."""
+    from rag_lib import interest_terms
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    row = profiles_repo.get_by_slug(db, int(user["id"]), key)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"profile '{key}' not found")
+    return _terms_view(db, row, interest_terms.load(row))
+
+
+@router.post("/{key}/terms/generate", response_model=InterestTerms)
+def generate_terms(
+    key: str,
+    body: InterestTermsGenerate,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> InterestTerms:
+    """Generate the interest's research topics the way Prosopia does, as a preview.
+
+    Nothing is saved: the response (``saved=false``) is shown to the user,
+    who keeps it with ``PUT /terms`` or discards it. Saving on generation
+    gave no chance to look first, and silently replaced topics the user
+    had edited.
+
+    ``api_key`` (optional) is the user's Anthropic key for this call: it is
+    handed to the client and dropped -- never stored, logged or returned.
+    Runs in this request, not as a scheduled job, so the key never sits in
+    a job's arguments. 401 when Anthropic rejects the key, 502 when the LLM
+    call fails, 503 when a package the SDK needs is missing.
+    """
+    from rag_lib import interest_terms
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    row = profiles_repo.get_by_slug(db, int(user["id"]), key)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"profile '{key}' not found")
+    api_key = body.api_key.get_secret_value().strip() if body.api_key else None
+    try:
+        record = interest_terms.generate(db, settings, row, api_key=api_key or None)
+    except interest_terms.KeyRejected as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from None
+    except interest_terms.LLMFailed as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from None
+    except interest_terms.TermsUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
+    finally:
+        api_key = None  # noqa: F841 — dropped as soon as the call returns
+    return _terms_view(db, row, record, saved=False)
+
+
+@router.put("/{key}/terms", response_model=InterestTerms)
+def update_terms(
+    key: str,
+    body: InterestTermsUpdate,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> InterestTerms:
+    """Keep a generated preview, or save edits to the stored topics."""
+    from rag_lib import interest_terms
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    row = profiles_repo.get_by_slug(db, int(user["id"]), key)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"profile '{key}' not found")
+    if body.source:   # a preview being kept: its provenance comes with it
+        if body.source not in ("prosopia", "rp-sdk-llm", "rp-sdk-cluster"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"unknown source '{body.source}'")
+        record = {"source": body.source, "model": body.model, "generated_at": body.generated_at,
+                  "seed_hash": body.seed_hash, "usage": body.usage}
+        record["edited"] = bool(body.edited)
+    else:
+        record = interest_terms.load(row) or {"source": "manual", "model": None, "generated_at": None, "seed_hash": None}
+        record["edited"] = True if body.edited is None else bool(body.edited)
+    record["terms"] = [t.model_dump() for t in body.terms if t.label.strip()]
+    kept = {t["label"] for t in record["terms"]}
+    record["removed"] = [t.model_dump() for t in body.removed if t.label.strip() and t.label not in kept]
+    record["not_interests"] = [s for s in body.not_interests if s.strip()]
+    interest_terms.save(db, int(row["id"]), record)
+    return _terms_view(db, row, record)
 
 
 @router.get("/{key}/topics/preview", response_model=list[Topic])
@@ -931,6 +1067,56 @@ def gather_now(
     return GatherNowResponse(ok=True, run_id=run_id)
 
 
+@router.post("/{key}/backfill", response_model=GatherNowResponse)
+def backfill(
+    key: str,
+    body: YearRange,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    scheduler: Annotated[object, Depends(get_scheduler)],
+) -> GatherNowResponse:
+    """Fetch papers from past years into a live interest's pool, once.
+
+    The daily scans only look back a day, so without this an interest
+    never had a paper older than its first scan. One OpenAlex query per
+    year (at most ``years.MAX_BACKFILL_YEARS``), most cited first, then the
+    usual scoring. Runs in the background like "Scan now"; the run shows
+    under Scans as a backfill. 400 for a bad range, 404 for an unknown or
+    draft interest.
+    """
+    from rag_lib import years as years_rules
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.db.repos import profiles as profiles_repo
+    from rag_lib.scheduler.jobs import gather_for_profile
+
+    if body.year_from is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="year_from is required")
+    try:
+        years_rules.check_range(body.year_from, body.year_to)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    row = profiles_repo.get_by_slug(db, int(user["id"]), key)
+    if row is None or row["is_draft"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
+    profile_id = int(row["id"])
+    start, _end = years_rules.fetch_span(body.year_from, body.year_to)
+    run_id = gather_runs_repo.start(
+        db, profile_id=profile_id, user_id=int(user["id"]),
+        since_date=f"{start}-01-01", tier_used="backfill",
+    )
+    scheduler.add_job(
+        gather_for_profile,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc),
+        args=[int(user["id"]), profile_id],
+        kwargs={"run_id": run_id, "tier": "backfill", "years": (body.year_from, body.year_to)},
+        id=f"backfill:{profile_id}:{run_id}",
+        replace_existing=False,
+        max_instances=1,
+    )
+    return GatherNowResponse(ok=True, run_id=run_id)
+
+
 @router.get("/{key}/feedback", response_model=list[FeedbackEventOut])
 def list_feedback(
     key: str,
@@ -1124,7 +1310,7 @@ def reranker_comparison(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {candidates_repo.PASSES}
+          AND {candidates_repo.PASSES} AND {candidates_repo.IN_YEARS}
           -- "Was reranked" is the reranker's own score, not the blend: the
           -- pool rescore gives every row a blend once any row is reranked.
           AND pc.score_reranker_raw IS NOT NULL

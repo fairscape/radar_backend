@@ -45,6 +45,8 @@ env/
 /data
 /vault
 /chroma
+# Working copies of interests in the researcher_profiles format (rag_lib/interest_terms.py)
+/rp_profiles
 /logs
 /ollama
 /rag_vault

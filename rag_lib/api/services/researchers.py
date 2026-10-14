@@ -292,6 +292,67 @@ def _require(conn: sqlite3.Connection, user_id: int, researcher_id: int) -> sqli
     return row
 
 
+def works_for_refresh(
+    conn: sqlite3.Connection,
+    settings: Any,
+    *,
+    user_id: int,
+    researcher_id: int,
+    prosopia_client: Any | None = None,
+    openalex_client: Any | None = None,
+) -> dict[str, Any]:
+    """Read the researcher's source again and say which works are already saved.
+
+    For "check for new papers": the full re-import re-imported everything
+    the source lists -- bringing back papers deselected the first time
+    (duplicates, datasets) and resolving every paper again against
+    OpenAlex. This lists, the page offers only the new ones, and the
+    import that follows carries just the picked ``paper_ids``.
+
+    A work counts as saved when its id matches (OpenAlex id for ORCID, the
+    profile's paper id for Prosopia) or, failing that, its DOI does --
+    the same paper can come back under a new OpenAlex id after a merge.
+    """
+    from . import orcid as orcid_service
+    from . import prosopia as prosopia_service
+    from ...prosopia_seeds import normalize_doi
+
+    row = _require(conn, user_id, researcher_id)
+    saved = researchers_repo.list_papers(conn, researcher_id)
+    saved_oa = {orcid_service._strip_openalex(r["openalex_id"]) for r in saved}
+    saved_pid = {r["paper_id"] for r in saved if r["paper_id"]}
+    saved_doi = {d for d in (normalize_doi(r["doi"]) for r in saved) if d}
+
+    if row["source"] == "orcid":
+        client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+        listing = orcid_service.list_works(row["key"], client)
+        works = listing["works"]
+        known = {
+            w["openalex_id"] for w in works
+            if orcid_service._strip_openalex(w["openalex_id"]) in saved_oa
+            or (normalize_doi(w.get("doi")) or "") in saved_doi
+        }
+        name = listing.get("name")
+    else:
+        listing = prosopia_service.list_works(
+            row["key"], base_url=row["base_url"] or DEFAULT_BASE_URL,
+            prosopia_client=prosopia_client,
+        )
+        works = listing["works"]
+        known = {
+            w["id"] for w in works
+            if w["id"] in saved_pid
+            or (w.get("openalex_id") and orcid_service._strip_openalex(w["openalex_id"]) in saved_oa)
+            or (normalize_doi(w.get("doi")) or "") in saved_doi
+        }
+        name = listing.get("name")
+    known.discard("")
+    return {
+        "source": row["source"], "key": row["key"], "name": name or row["name"],
+        "works": works, "saved_ids": sorted(known),
+    }
+
+
 def get_researcher_row(
     conn: sqlite3.Connection, user_id: int, researcher_id: int
 ) -> sqlite3.Row:

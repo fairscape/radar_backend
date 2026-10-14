@@ -393,6 +393,8 @@ def dry_run_draft(
     thresholds: list[float] | None = None,
     gatherer: Any | None = None,
     reporter: Any | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
 ) -> DraftDryRun:
     """Resolve the draft + invoke the dry-run compute.
 
@@ -411,6 +413,8 @@ def dry_run_draft(
         thresholds=thresholds,
         gatherer=gatherer,
         reporter=reporter,
+        year_from=year_from,
+        year_to=year_to,
     )
 
 
@@ -424,6 +428,8 @@ def compute_dry_run_for_profile(
     thresholds: list[float] | None = None,
     gatherer: Any | None = None,
     reporter: Any | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
 ) -> DraftDryRun:
     """Run a dry-run sweep + preview against the last ``days`` of OpenAlex.
 
@@ -464,7 +470,16 @@ def compute_dry_run_for_profile(
 
     if reporter is not None:
         reporter.step("fetching", message="Querying OpenAlex")
-    candidates = gatherer.fetch(profile, since=since, limit=fetch_limit)
+    if year_from is not None:
+        # A range of years instead of the last ``days``: each year sampled,
+        # most cited first, so every year in the range is represented.
+        from rag_lib import years as years_rules
+        start, end = years_rules.fetch_span(year_from, year_to)
+        per_year = years_rules.trial_per_year(end - start + 1)
+        log.info("dry_run.year_range", slug=slug, start=start, end=end, per_year=per_year)
+        candidates = gatherer.fetch_years(profile, start, end, per_year=per_year)
+    else:
+        candidates = gatherer.fetch(profile, since=since, limit=fetch_limit)
     log.info(
         "dry_run.fetched",
         slug=slug, n=len(candidates),

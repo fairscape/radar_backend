@@ -127,6 +127,25 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
     )
 
+    # A 422 echoes what was sent ("input"). For a field holding a secret --
+    # the Anthropic key typed in for one topic generation -- that would hand
+    # the key back in the response and to anything that records responses.
+    # SecretStr masks a valid string only; a key sent in the wrong shape (a
+    # list, a number) came back verbatim. Drop input/ctx from those errors.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.encoders import jsonable_encoder
+
+    _SECRET_FIELDS = {"api_key"}
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError):
+        errors = []
+        for err in exc.errors():
+            if _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}:
+                err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
+            errors.append(err)
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
     access_log = structlog.get_logger("rag_lib.api.access")
 
     @app.middleware("http")

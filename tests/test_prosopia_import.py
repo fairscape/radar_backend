@@ -864,3 +864,32 @@ def test_imported_papers_count_in_the_vault_stats_and_tags(env):
         assert vault_repo.tag_counts_for_user(conn, uid).get(draft_slug, 0) > 0
     finally:
         conn.close()
+
+
+def test_import_into_an_existing_draft_adds_seeds_to_it(env):
+    """Once a draft existed the wizard could not add a Prosopia profile's
+    papers to it: every import opened a new draft. ``into`` adds them to
+    the draft the user is building, which keeps its name."""
+    app = _app(StubProsopia(_stub_profile()), _stub_openalex())
+    slug = _request(app, "POST", "/api/profiles/draft", json={"name": "Mixed"}).json()["slug"]
+    resp = _start(app, ref="sheffield-nathan", into=slug)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["draft_slug"] == slug
+
+    conn = connect(env)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 1
+        row = conn.execute("SELECT id, name, researcher_id FROM profiles WHERE slug = ?", (slug,)).fetchone()
+        assert row["name"] == "Mixed" and row["researcher_id"] is not None
+        n = conn.execute("SELECT COUNT(*) AS n FROM profile_seeds WHERE profile_id = ?", (row["id"],)).fetchone()["n"]
+        assert n == 5
+    finally:
+        conn.close()
+
+    resp = _start(app, ref="sheffield-nathan", into="no-such-draft")
+    assert resp.status_code == 404
+    conn = connect(env)
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 1
+    finally:
+        conn.close()

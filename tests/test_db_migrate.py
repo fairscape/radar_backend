@@ -43,6 +43,8 @@ EXPECTED_VERSIONS = [
     "0014_candidate_source_topic",
     "0015_seed_similarity",
     "0016_researchers",
+    "0017_interest_terms",
+    "0018_year_range",
 ]
 
 

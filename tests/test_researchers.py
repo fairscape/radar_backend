@@ -391,3 +391,31 @@ def test_stored_papers_can_be_attached_to_a_plain_draft(env):
 
     assert _request(app, "POST", f"/api/profiles/draft/{slug}/seeds", json={"openalex_ids": []}).status_code == 400
     assert _request(app, "POST", "/api/profiles/draft/none/seeds", json={"openalex_ids": ["x"]}).status_code == 404
+
+
+def test_check_for_new_papers_marks_what_is_already_saved(env):
+    """Re-import used to bring back every paper the source lists, including
+    ones deselected the first time. The listing says which works are
+    already saved, so only the new ones are offered and imported."""
+    app = _app(StubProsopia(_stub_profile()), StubOrcidOpenAlex(WORKS))
+    rid = _import(app, source="orcid", ref=ORCID, paper_ids=["W1"]).json()["researcher_id"]
+
+    resp = _request(app, "GET", f"/api/researchers/{rid}/works")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "orcid" and len(body["works"]) == 3
+    assert body["saved_ids"] == ["W1"]
+
+    _import(app, source="orcid", ref=ORCID, paper_ids=["W3"])          # pick one new paper
+    assert _request(app, "GET", f"/api/researchers/{rid}/works").json()["saved_ids"] == ["W1", "W3"]
+    assert _count(env, "SELECT COUNT(*) FROM researcher_papers") == 2  # W2 was never added
+
+    # Prosopia: matched on the profile's own paper ids.
+    listing = _request(app, "GET", "/api/import/prosopia/works", params={"ref": "sheffield-nathan"}).json()
+    first = listing["works"][0]["id"]
+    pid = _import(app, source="prosopia", ref="sheffield-nathan", paper_ids=[first]).json()["researcher_id"]
+    body = _request(app, "GET", f"/api/researchers/{pid}/works").json()
+    assert body["source"] == "prosopia" and body["saved_ids"] == [first]
+    assert len(body["works"]) == len(listing["works"])
+
+    assert _request(app, "GET", "/api/researchers/9999/works").status_code == 404

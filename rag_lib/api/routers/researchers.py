@@ -37,6 +37,7 @@ from ..schemas import (
     ResearcherInterestRequest,
     ResearcherInterestResponse,
     ResearcherSuggestions,
+    ResearcherWorks,
 )
 from ..settings import Settings
 from .prosopia import get_import_openalex_client, get_prosopia_client, launch_import
@@ -139,6 +140,40 @@ def get_researcher(
         return researchers_service.get_researcher(db, int(user["id"]), researcher_id)
     except researchers_service.ResearcherNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/{researcher_id}/works", response_model=ResearcherWorks)
+def researcher_works(
+    researcher_id: int,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    prosopia_client: Annotated[object | None, Depends(get_prosopia_client)] = None,
+    openalex_client: Annotated[
+        object | None, Depends(get_import_openalex_client)
+    ] = None,
+) -> ResearcherWorks:
+    """The researcher's source read again, with the works already saved
+    marked (``saved_ids``): what "check for new papers" offers. Nothing is
+    written. 404 for another user's or an unknown researcher; 502 when the
+    source could not be read."""
+    from ..services import prosopia as prosopia_service
+    from ..services import researchers as researchers_service
+
+    try:
+        return ResearcherWorks(**researchers_service.works_for_refresh(
+            db, settings, user_id=int(user["id"]), researcher_id=researcher_id,
+            prosopia_client=prosopia_client, openalex_client=openalex_client,
+        ))
+    except researchers_service.ResearcherNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except prosopia_service.ProfileNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — the source could not be read
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not read the source for this researcher: {exc}",
+        ) from exc
 
 
 @router.get("/{researcher_id}/suggestions", response_model=ResearcherSuggestions)

@@ -116,7 +116,10 @@ def import_prosopia(
             embedding_model=body.embedding_model,
             prosopia_client=prosopia_client,
             paper_ids=body.paper_ids,
+            into=body.into,
         )
+    except prosopia_service.DraftNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except prosopia_service.PapersNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -297,6 +300,7 @@ def import_orcid(
     server never saw.
     """
     from ..services import orcid as orcid_service
+    from ..services import prosopia as prosopia_service
 
     try:
         plan = orcid_service.prepare_import(
@@ -308,7 +312,10 @@ def import_orcid(
             name=body.name,
             embedding_model=body.embedding_model,
             openalex_client=openalex_client,
+            into=body.into,
         )
+    except prosopia_service.DraftNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except orcid_service.ImportAlreadyRunning as exc:
         # Not an error: the user asked for an import that is already
         # running, so hand back the run they can poll instead of starting

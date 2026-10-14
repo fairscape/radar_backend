@@ -124,6 +124,8 @@ def profile_row_to_profile(
         seedSimMin=float(sim_min) if sim_min is not None else None,
         seedSimMax=float(sim_max) if sim_max is not None else None,
         researcherId=int(researcher_id) if researcher_id is not None else None,
+        yearFrom=_col(row, "year_from"),
+        yearTo=_col(row, "year_to"),
     )
 
 

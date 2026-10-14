@@ -129,3 +129,11 @@ watchfiles==1.2.0
 websocket-client==1.9.2
 websockets==17.1
 yarl==1.25.1
+
+# Research topics the Prosopia way (rag_lib/interest_terms.py): the
+# researcher_profiles SDK's index needs sentence-transformers + sqlite-vec,
+# its LLM step anthropic. sentence-transformers is pinned below 6: 6.x pulls
+# transformers 5.x, which the SPECTER2 adapters and MedCPT were not run on.
+sentence-transformers==5.7.0
+sqlite-vec==0.1.9
+anthropic==1.12.1

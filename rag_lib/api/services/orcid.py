@@ -30,14 +30,11 @@ from typing import Any
 import structlog
 
 from ...db.repos import gather_runs as gather_runs_repo
-from ...db.repos import profiles as profiles_repo
-from ...db.repos import researchers as researchers_repo
 from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, fetch_claimed
 from ...paper import normalize_title, title_key
 from ...prosopia_seeds import normalize_doi
-from . import wizard as wizard_service
-from .prosopia import ImportPlan
+from .prosopia import ImportPlan, open_draft, target_draft
 
 
 log = structlog.get_logger("rag_lib.api.services.orcid")
@@ -412,8 +409,14 @@ def prepare_import(
     name: str | None = None,
     embedding_model: str | None = None,
     openalex_client: Any | None = None,
+    into: str | None = None,
 ) -> ImportPlan:
     """Keep the chosen works, open the draft, return the job's plan.
+
+    With ``into`` the works become seeds of that existing draft instead
+    of a new one -- so a second researcher's papers can join the first's.
+    It must be one of the user's drafts (``prosopia.DraftNotFound``
+    otherwise). The draft's own researcher link and name are kept.
 
     Raises ``ValueError`` for a malformed ORCID or an empty selection,
     and :class:`WorksNotFound` when none of the ids are the author's —
@@ -445,30 +448,27 @@ def prepare_import(
     if not records:
         raise WorksNotFound(f"none of the selected works are by ORCID {oid}")
 
-    model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    target = target_draft(conn, user_id, into)
+
+    model = (target["embedding_model"] if target is not None else None) \
+        or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     # Record the researcher too: the works embedded for this draft are
     # then on hand for the next interest built from the same person.
     from . import researchers as researchers_service
     researcher_id = researchers_service.record_orcid_researcher(
         conn, user_id=user_id, orcid=oid, name=listing["name"],
     )
-    draft_name = (name or listing["name"] or f"ORCID {oid}").strip()
-    draft = wizard_service.create_draft(
-        conn,
-        user_id=user_id,
-        name=draft_name,
-        embedding_model=model,
-        selector=settings.RADAR_DEFAULT_SELECTOR,
+    draft_row = open_draft(
+        conn, settings, user_id=user_id, target=target,
+        name=(name or listing["name"] or f"ORCID {oid}").strip(), embedding_model=model,
+        researcher_id=researcher_id,
     )
-    draft_row = profiles_repo.get_by_slug(conn, user_id, draft["slug"])
-    if draft_row is None:  # pragma: no cover — create_draft just wrote it
-        raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
-    researchers_repo.set_profile_researcher(conn, int(draft_row["id"]), researcher_id)
+    draft = {"slug": draft_row["slug"], "name": draft_row["name"]}
 
     log.info(
         "orcid.prepare_import",
         orcid=oid, n_selected=len(wanted), n_kept=len(records),
-        draft_slug=draft["slug"],
+        draft_slug=draft["slug"], into_existing=target is not None,
     )
     return ImportPlan(
         slug=oid,

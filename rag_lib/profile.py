@@ -53,6 +53,9 @@ class Profile:
     threshold: float | None = None
     created: str | None = None
     last_radar_date: str | None = None
+    # Research topics labels (rag_lib/interest_terms.py), the reranker's
+    # queries in query_mode="terms". Runtime only; not serialized.
+    interest_terms: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Serialization

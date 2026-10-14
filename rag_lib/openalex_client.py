@@ -217,6 +217,7 @@ class OpenAlexClient:
         *,
         limit: int | None = None,
         per_page: int = 200,
+        sort: str | None = None,
     ) -> list[dict]:
         out: list[dict] = []
         cursor: str | None = "*"
@@ -226,6 +227,10 @@ class OpenAlexClient:
                 "per-page": per_page,
                 "cursor": cursor,
             }
+            # ``sort`` (e.g. "cited_by_count:desc") decides *which* works a
+            # ``limit`` keeps; without it OpenAlex's order is unspecified.
+            if sort:
+                params["sort"] = sort
             j = self._get("/works", params=params)
             results = j.get("results") or []
             if limit is not None:

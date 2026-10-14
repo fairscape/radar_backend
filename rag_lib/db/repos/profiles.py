@@ -488,3 +488,14 @@ def coherence_bins(
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     hist, _ = np.histogram(np.clip(cos, 0.0, 1.0), bins=edges)
     return [int(c) for c in hist]
+
+
+def update_year_range(
+    conn: sqlite3.Connection, profile_id: int, year_from: int | None, year_to: int | None,
+) -> None:
+    """Set the publication years an interest recommends from (None = open)."""
+    conn.execute(
+        "UPDATE profiles SET year_from = ?, year_to = ?, updated_at = datetime('now') WHERE id = ?",
+        (year_from, year_to, profile_id),
+    )
+    conn.commit()

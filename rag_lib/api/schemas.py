@@ -11,9 +11,9 @@ assigning ``bucket`` from ``score`` instead of duplicating numbers.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
 # Rank-percentile fallback cut-points for ``bucket`` when a candidate row
@@ -70,6 +70,9 @@ class Profile(_Model):
     seedSimMax: float | None = None
     # The stored researcher this interest was built from, if any.
     researcherId: int | None = None
+    # Publication years the feed draws from (NULL = no bound; yearTo NULL = to now).
+    yearFrom: int | None = None
+    yearTo: int | None = None
 
 
 class Card(_Model):
@@ -291,6 +294,62 @@ class SeedSimilarity(_Model):
     max: float
 
 
+class InterestTerm(_Model):
+    label: str
+    weight: float | None = None
+    # Seeds this topic was drawn from (OpenAlex ids), when known.
+    paper_ids: list[str] = Field(default_factory=list)
+    kind: str | None = None
+
+
+class InterestTerms(_Model):
+    """An interest's research topics (``rag_lib/interest_terms.py``); empty until generated."""
+
+    source: str | None = None
+    model: str | None = None
+    generated_at: str | None = None
+    seed_hash: str | None = None
+    # True when the seeds changed after these were generated.
+    stale: bool = False
+    terms: list[InterestTerm] = Field(default_factory=list)
+    # Topics the user struck out: kept so they can be put back, never used.
+    removed: list[InterestTerm] = Field(default_factory=list)
+    not_interests: list[str] = Field(default_factory=list)
+    edited: bool = False
+    usage: dict[str, Any] | None = None
+    # False for a freshly generated preview: generation saves nothing, the
+    # user keeps it with PUT /terms (or discards it).
+    saved: bool = True
+
+
+class InterestTermsGenerate(_Model):
+    """Body of ``POST /api/profiles/{key}/terms/generate``.
+
+    ``api_key`` is the user's Anthropic key for this one call. ``SecretStr``
+    keeps it out of reprs, logs and validation errors (shown as
+    ``**********``); it is used once and never stored. Omitted = the SDK's
+    cluster method, no LLM.
+    """
+
+    api_key: SecretStr | None = None
+
+
+class InterestTermsUpdate(_Model):
+    """Body of ``PUT /api/profiles/{key}/terms``: keep a generated preview
+    (its provenance fields set) or save edits (provenance omitted: the
+    stored record's is kept and ``edited`` is set)."""
+
+    terms: list[InterestTerm] = Field(default_factory=list)
+    removed: list[InterestTerm] = Field(default_factory=list)
+    not_interests: list[str] = Field(default_factory=list)
+    source: str | None = None
+    model: str | None = None
+    generated_at: str | None = None
+    seed_hash: str | None = None
+    usage: dict[str, Any] | None = None
+    edited: bool | None = None
+
+
 class DryRunPaper(_Model):
     """One trial-scan paper, just enough to list it beside the threshold slider."""
 
@@ -367,10 +426,21 @@ class ScheduleUpdate(_Model):
     enabled: bool | None = None
 
 
-class ProfileThresholdUpdate(_Model):
-    """Body of ``PATCH /api/profiles/{key}`` — for inline threshold edits."""
+class YearRange(_Model):
+    """Publication years: ``year_from`` / ``year_to`` inclusive, None = open."""
 
-    threshold: float = Field(ge=0.0, le=1.0)
+    year_from: int | None = None
+    year_to: int | None = None
+
+
+class ProfileThresholdUpdate(_Model):
+    """Body of ``PATCH /api/profiles/{key}``: the threshold and/or the years.
+
+    ``years`` present sets both bounds (None clears one); omitted leaves them.
+    """
+
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    years: YearRange | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +512,8 @@ class ProsopiaImportRequest(_Model):
     # The ``id`` values from GET /api/import/prosopia/works to keep;
     # omitted = every paper on the profile.
     paper_ids: list[str] | None = None
+    # A draft to add these papers to, instead of opening a new one.
+    into: str | None = None
 
 
 class ProsopiaWork(_Model):
@@ -514,6 +586,9 @@ class OrcidImportRequest(_Model):
     openalex_ids: list[str]
     name: str | None = None
     embedding_model: str | None = None
+    # A draft to add these works to, instead of opening a new one: the
+    # wizard's "add papers from another ORCID" once a draft exists.
+    into: str | None = None
 
 
 class ProsopiaImportStart(_Model):
@@ -644,6 +719,22 @@ class SuggestedInterest(_Model):
     seed_titles: list[str] = Field(default_factory=list)
 
 
+class ResearcherWorks(_Model):
+    """``GET /api/researchers/{id}/works``: the source read again.
+
+    ``works`` is the same listing the wizard's ORCID / Prosopia pickers
+    get (``OrcidWork`` or ``ProsopiaWork`` items, by ``source``);
+    ``saved_ids`` are the ``works`` ids this researcher already has, so
+    the page can offer only what is new since the last import.
+    """
+
+    source: str
+    key: str
+    name: str | None = None
+    works: list[dict[str, Any]] = Field(default_factory=list)
+    saved_ids: list[str] = Field(default_factory=list)
+
+
 class ResearcherSuggestions(_Model):
     """``GET /api/researchers/{id}/suggestions``: at most three groups.
 
@@ -757,6 +848,10 @@ class DraftDryRunRequest(_Model):
 
     days: int = 30
     thresholds: list[float] | None = None
+    # A range of years instead of the last ``days``: the trial samples each
+    # year, most cited first (gatherers/openalex.fetch_years).
+    year_from: int | None = None
+    year_to: int | None = None
 
 
 class DraftDryRun(_Model):
@@ -831,6 +926,8 @@ class CommitDraftRequest(_Model):
     selected_topic_ids: list[str] = Field(default_factory=list)
     cron: str | None = None
     tz: str | None = None
+    # The publication years chosen on step 4; the wizard then starts a backfill.
+    years: YearRange | None = None
 
 
 # ---------------------------------------------------------------------------

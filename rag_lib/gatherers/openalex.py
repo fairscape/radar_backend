@@ -204,6 +204,79 @@ class OpenAlexGatherer:
 
     # ------------------------------------------------------------------
 
+    def fetch_years(
+        self,
+        profile: Profile,
+        year_from: int,
+        year_to: int,
+        *,
+        per_year: int,
+    ) -> list[Paper]:
+        """Papers from past years, for a one-off backfill or a trial scan.
+
+        The daily scans only ever look back a day or a week, so an interest
+        never saw a paper older than its first scan. This asks OpenAlex for
+        each year in ``[year_from, year_to]`` separately -- one query per
+        year, the enabled topics OR'd together -- most cited first, keeping
+        ``per_year``. One query per year (not per topic per year, as
+        ``fetch`` does for days) keeps a 15-year backfill at ~15 calls of
+        the 1000-a-day budget, and the per-year split makes every year
+        count rather than letting the most-cited years take the whole
+        limit. Citation order favours a year's early papers; the UI says so.
+
+        Same topic rules as ``fetch``: all topics switched off -> nothing;
+        never aggregated -> tier 1's filter.
+        """
+        client = self._resolve_client()
+        t0 = time.time()
+        calls_before = client.api_calls
+        self.last_source_topics = {}
+        self.last_tier_used = "backfill-years"
+        self.last_filter_str = None
+
+        topics = (profile.topic_filters or {}).get("topics") or []
+        topic_ids = enabled_topic_ids(profile.topic_filters)
+        if topic_ids:
+            parts = [("topics.id", [bare_id(t) for t in topic_ids], "or")]
+        elif topics:
+            self.last_tier_used = "no-enabled-topics"
+            parts = []
+        else:
+            tiers = tier_specs(
+                profile,
+                must_have_prevalence=self.must_have_prevalence,
+                top_topics_n=self.top_topics_n,
+                top_subfields_n=self.top_subfields_n,
+            )
+            parts = tiers[0][1] if tiers else []
+
+        chosen: list[Paper] = []
+        seen = _Deduper()
+        if parts:
+            per_page = max(1, min(200, per_year))
+            for year in range(int(year_from), int(year_to) + 1):
+                filter_str = build_filter_string(
+                    parts, f"{year}-01-01", until=f"{year}-12-31", extras=self.extras,
+                )
+                if self.last_filter_str is None:
+                    self.last_filter_str = filter_str
+                works = client.paginate_filter(
+                    filter_str, limit=per_year, per_page=per_page, sort="cited_by_count:desc",
+                )
+                n_new = 0
+                for w in works:
+                    p = client.paper_from_work(w, source="openalex_gatherer")
+                    if p.openalex_id and seen.take(p):
+                        chosen.append(p)
+                        n_new += 1
+                log.info("openalex_gatherer.year_fetch", profile=profile.name,
+                         year=year, n=len(works), new=n_new)
+        self._last_cost = {
+            "wall_seconds": time.time() - t0,
+            "api_calls": int(client.api_calls - calls_before),
+        }
+        return chosen
+
     def _fetch_per_topic(
         self,
         client: OpenAlexClient,
