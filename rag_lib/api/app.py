@@ -9,6 +9,7 @@ APScheduler instance. The module-level ``app`` is what uvicorn imports
 from __future__ import annotations
 
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as pkg_version
@@ -145,14 +146,36 @@ def create_app() -> FastAPI:
 
     _SECRET_FIELDS = {"api_key"}
 
+    def _json_safe(value, depth: int = 0):
+        """An echoed input JSON can encode: NaN / inf as text, long text cut.
+
+        A NaN threshold failed validation and then failed again here --
+        ``JSONResponse`` refuses NaN -- so the 422 became a 500.
+        """
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        if isinstance(value, str) and len(value) > 200:
+            return value[:200] + "…"
+        if depth < 4 and isinstance(value, dict):
+            return {k: _json_safe(v, depth + 1) for k, v in list(value.items())[:50]}
+        if depth < 4 and isinstance(value, (list, tuple)):
+            return [_json_safe(v, depth + 1) for v in list(value)[:50]]
+        return value
+
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
         errors = []
         for err in exc.errors():
             if _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}:
                 err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
-            errors.append(err)
-        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+            errors.append(_json_safe(jsonable_encoder(err)))
+        return JSONResponse(status_code=422, content={"detail": errors})
+
+    @app.exception_handler(OverflowError)
+    async def _overflow(request: Request, exc: OverflowError):
+        # An id past SQLite's 64-bit integers (2**63 and up) cannot name a
+        # row; it was a 500 from the driver.
+        return JSONResponse(status_code=404, content={"detail": "not found"})
 
     access_log = structlog.get_logger("rag_lib.api.access")
 

@@ -1,74 +1,71 @@
-"""Threshold autotune sketch.
+"""Threshold from feedback.
 
-Reads the recent saved/dismissed events for a profile and recommends a
-score threshold that maximises an F1-like blend of precision (saves
-above the threshold / total above) and coverage (saves above /
-total saves). Opt-in only — surfaced via ``?autotune=1`` on
+Reads an interest's saved and dismissed papers and recommends the
+threshold that best separates them: an F1-like blend of precision (saves
+above the threshold / everything triaged above it) and coverage (saves
+above / all saves). Surfaced on the Threshold tab
+(``GET /api/profiles/{key}/feedback-threshold``) and as ``?autotune=1`` on
 ``POST /api/profiles/{key}/refit``.
 
-Phase 11 may surface ``recommend_threshold`` as a read-only preview in
-the wizard's Step 4.
+It reads the papers' current state and raw cosine from
+``profile_candidates``. It used to read the feedback log, whose ``score``
+is the card's rank percentile: those were swept as if they were cosines
+against 0.50..0.95, and an un-save stayed counted as a save.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-from rag_lib.db.repos import feedback as feedback_repo
 from rag_lib.db.repos import profiles as profiles_repo
 
-
-_SWEEP_LO = 0.50
-_SWEEP_HI = 0.95
-_SWEEP_STEP = 0.01
+MIN_EVENTS = 30
 
 
-def _sweep_thresholds() -> list[float]:
-    out: list[float] = []
-    n = int(round((_SWEEP_HI - _SWEEP_LO) / _SWEEP_STEP)) + 1
-    for i in range(n):
-        out.append(round(_SWEEP_LO + i * _SWEEP_STEP, 2))
-    return out
+def triaged_scores(db: sqlite3.Connection, profile_id: int) -> tuple[list[float], list[float]]:
+    """``(saved cosines, dismissed cosines)`` for an interest's papers now."""
+    from rag_lib.db.repos.candidates import NOT_SEED
+
+    rows = db.execute(
+        f"""
+        SELECT COALESCE(pc.score_raw, pc.score) AS s, pc.saved_at IS NOT NULL AS saved
+        FROM profile_candidates pc
+        WHERE pc.profile_id = ? AND (pc.saved_at IS NOT NULL OR pc.dismissed_at IS NOT NULL)
+          AND COALESCE(pc.score_raw, pc.score) IS NOT NULL AND {NOT_SEED}
+        """,
+        (profile_id,),
+    ).fetchall()
+    saves = [float(r[0]) for r in rows if r[1]]
+    dismisses = [float(r[0]) for r in rows if not r[1]]
+    return saves, dismisses
 
 
 def recommend_threshold(
     db: sqlite3.Connection,
     profile_id: int,
     *,
-    min_events: int = 30,
+    min_events: int = MIN_EVENTS,
 ) -> float | None:
-    """Return the F1-optimal threshold over recent feedback, or ``None``.
+    """Return the F1-optimal threshold over the triaged papers, or ``None``.
 
-    ``None`` when fewer than ``min_events`` scored save+dismiss events
-    exist (insufficient signal to make a recommendation). The "F1-like"
-    metric is ``2 * precision * coverage / (precision + coverage)``
-    where:
-        precision = saves above th / (saves+dismisses above th)
-        coverage  = saves above th / total saves
-    Ties pick the *lower* threshold (more permissive).
+    ``None`` when fewer than ``min_events`` papers are saved or dismissed,
+    or none is saved. The cut points tried are the triaged papers' own
+    cosines (a threshold between two of them scores the same as the
+    upper one), rounded to 3 decimals as the slider is. Ties pick the
+    *lower* threshold (more permissive).
     """
-    rows = feedback_repo.scored_save_dismiss_for_profile(db, profile_id)
-    if len(rows) < min_events:
+    saves, dismisses = triaged_scores(db, profile_id)
+    if len(saves) + len(dismisses) < min_events or not saves:
         return None
-
-    saves = [float(r["score"]) for r in rows if r["action"] == "saved"]
-    dismisses = [float(r["score"]) for r in rows if r["action"] == "dismissed"]
     total_saves = len(saves)
-    if total_saves == 0:
-        return None
 
     best_th: float | None = None
     best_score = -1.0
-    for th in _sweep_thresholds():
+    for th in sorted({round(s, 3) for s in saves}):
         s_above = sum(1 for s in saves if s >= th)
         d_above = sum(1 for s in dismisses if s >= th)
-        denom = s_above + d_above
-        if denom == 0:
-            continue
-        precision = s_above / denom
+        precision = s_above / (s_above + d_above)
         coverage = s_above / total_saves
-        if precision + coverage == 0:
-            continue
         f1 = 2 * precision * coverage / (precision + coverage)
         # Lower threshold wins ties (strictly greater wins outright).
         if f1 > best_score:
@@ -81,7 +78,7 @@ def apply_recommended(
     db: sqlite3.Connection,
     profile_id: int,
     *,
-    min_events: int = 30,
+    min_events: int = MIN_EVENTS,
 ) -> dict:
     """Persist the recommended threshold on the profile row.
 
@@ -89,7 +86,8 @@ def apply_recommended(
     "applied": bool}``. ``applied=False`` when there is not enough data
     or the recommendation matches the current value.
     """
-    n_events = feedback_repo.total_for_profile(db, profile_id)
+    saves, dismisses = triaged_scores(db, profile_id)
+    n_events = len(saves) + len(dismisses)
     row = db.execute(
         "SELECT threshold FROM profiles WHERE id = ?",
         (profile_id,),

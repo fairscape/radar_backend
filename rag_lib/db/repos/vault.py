@@ -3,8 +3,8 @@
 A "vault doc" is a paper the user has put in their vault. That covers
 two sources:
 
-1. Papers the user uploaded as a PDF (``papers.uploaded_by_user_id =
-   user_id``). These have a ``local_path`` and were typically attached
+1. Papers the user uploaded as a PDF (a ``paper_uploads`` row for the
+   user; migration 0020). These have a ``local_path`` and were typically attached
    to a profile as a seed via ``profile_seeds``.
 2. Papers the user saved from the daily radar
    (``profile_candidates.saved_at IS NOT NULL`` for a profile owned by
@@ -60,7 +60,7 @@ def list_for_user(
             f"""
             SELECT {_VAULT_COLS}
             FROM papers p
-            WHERE p.uploaded_by_user_id = ?
+            WHERE EXISTS (SELECT 1 FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?)
                OR EXISTS (
                  SELECT 1
                  FROM researcher_papers rp
@@ -126,7 +126,7 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
         WITH vault_papers AS (
           SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
           FROM papers p
-          WHERE p.uploaded_by_user_id = ?
+          WHERE EXISTS (SELECT 1 FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?)
           UNION
           -- A researcher's imported papers, as list_for_user counts them.
           -- Imports used to stamp uploaded_by_user_id, which is how they

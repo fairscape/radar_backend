@@ -36,6 +36,32 @@ from ..schemas import (
 _DAILY_LIMIT = 200
 
 
+def fair_shares(sizes: list[int], limit: int) -> list[int]:
+    """How many cards each interest gets of ``limit``, given how many it has.
+
+    An equal share each, and what an interest with fewer cards leaves
+    unused goes to the others, so the feed is full whenever there are
+    ``limit`` cards in all. A flat ``limit // n`` left most of it empty
+    when a few interests had many cards.
+    """
+    shares = [0] * len(sizes)
+    left = limit
+    open_ = [i for i, n in enumerate(sizes) if n > 0]
+    while left > 0 and open_:
+        each = max(1, left // len(open_))
+        nxt = []
+        for i in open_:
+            if left <= 0:
+                break
+            take = min(each, sizes[i] - shares[i], left)
+            shares[i] += take
+            left -= take
+            if shares[i] < sizes[i]:
+                nxt.append(i)
+        open_ = nxt
+    return shares
+
+
 def _today_label() -> str:
     """Mock-api formats date as 'THU 16 APR 2026'. Match that on the API."""
     return datetime.now(timezone.utc).strftime("%a %d %b %Y").upper()
@@ -54,40 +80,43 @@ def _active_topic_ids(topic_filters: dict | None) -> list[str]:
     return enabled_topic_ids(topic_filters)
 
 
+# Runs that scanned for the feed: not a wizard trial, not a seed import.
+_SCAN_RUN = "(tier_used IS NULL OR (tier_used != 'dry_run' AND tier_used NOT LIKE '%import'))"
+
+
 def _last_run_metrics(
     conn: sqlite3.Connection,
     profile_ids: list[int],
 ) -> tuple[str, int]:
-    """``(fetchedAt, candidatesScored)`` aggregated over the latest run(s).
+    """``(fetchedAt, candidatesScored)`` over each interest's latest scan.
 
-    For a single profile, takes the most-recent finished run.
-    For ``profile=all`` (multiple ids), sums n_fetched and uses the most
-    recent finished_at across runs.
+    ``fetchedAt`` is when the most recent of them finished, as ISO-8601
+    UTC: it used to be the time of day alone, which the feed rendered as
+    "Last scan finished" with no date. ``candidatesScored`` adds up each
+    interest's latest scan, not every run it ever had (it read 9,000+ for
+    a week of nightly scans), and trials and imports are not scans.
     """
     if not profile_ids:
         return "", 0
     placeholders = ",".join("?" for _ in profile_ids)
     row = conn.execute(
         f"""
-        SELECT
-          MAX(finished_at) AS finished_at,
-          SUM(COALESCE(n_fetched, 0)) AS scored
-        FROM gather_runs
-        WHERE profile_id IN ({placeholders}) AND finished_at IS NOT NULL
+        WITH latest AS (
+          SELECT profile_id, MAX(id) AS id FROM gather_runs
+          WHERE profile_id IN ({placeholders}) AND finished_at IS NOT NULL
+            AND error IS NULL AND {_SCAN_RUN}
+          GROUP BY profile_id
+        )
+        SELECT MAX(g.finished_at) AS finished_at, SUM(COALESCE(g.n_fetched, 0)) AS scored
+        FROM gather_runs g JOIN latest l ON l.id = g.id
         """,
         profile_ids,
     ).fetchone()
-
     finished_at = row["finished_at"] or ""
-    # The frontend renders "06:59:12"; pull the time half of an ISO ts.
-    if "T" in finished_at:
-        fetched_at = finished_at.split("T", 1)[1][:8]
-    elif " " in finished_at:
-        fetched_at = finished_at.split(" ", 1)[1][:8]
-    else:
-        fetched_at = finished_at[:8]
-
-    return fetched_at, int(row["scored"] or 0)
+    if finished_at and "T" not in finished_at:
+        # SQLite's datetime('now'): "YYYY-MM-DD HH:MM:SS", UTC.
+        finished_at = finished_at.replace(" ", "T", 1) + "Z"
+    return finished_at, int(row["scored"] or 0)
 
 
 def daily(
@@ -123,11 +152,9 @@ def daily(
     else:
         profile_rows = profiles_repo.list_for_user(conn, user_id)
 
-    cards: list[Card] = []
     states: dict[str, CardState | None] = {}
     profile_ids: list[int] = []
-
-    per_profile_cap = max(1, _DAILY_LIMIT // max(1, len(profile_rows)))
+    per_profile: list[tuple[int, list[Card]]] = []
 
     for prow in profile_rows:
         pid = int(prow["id"])
@@ -135,14 +162,22 @@ def daily(
         slug = prow["slug"] or prow["name"]
         topic_filters = profiles_repo.topic_filters(conn, pid)
         active = _active_topic_ids(topic_filters)
-        rows = candidates_repo.top_for_profile(conn, pid, limit=per_profile_cap, year_from=year_from,
-                                               below=bucket == "low")
-        shown_ids: list[str] = []
+        # The whole limit from each interest, filtered, and only then cut to
+        # its share. Cutting first (to 200 / interests) and filtering the
+        # bucket after dropped matching cards: across 15 interests "Above
+        # the bar" showed 19 cards of 41.
         threshold = prow["threshold"]
         try:
             seed_sim_min = prow["seed_sim_min"]
         except (IndexError, KeyError):
             seed_sim_min = None
+        band = float(seed_sim_min) if seed_sim_min is not None and threshold is not None else None
+        rows = candidates_repo.top_for_profile(
+            conn, pid, limit=_DAILY_LIMIT, year_from=year_from, below=bucket == "low",
+            sim_at_least=band if bucket == "high" else None,
+            sim_below=band if bucket == "medium" else None,
+        )
+        mine: list[Card] = []
         for crow in rows:
             card = candidate_row_to_card(
                 crow, profile_slug=slug, active_topic_ids=active,
@@ -153,20 +188,25 @@ def daily(
             # Two copies of this rule had already drifted apart once.
             if bucket is not None and card.bucket != bucket:
                 continue
-            state: CardState | None = (
+            card.state = (
                 "saved" if crow["saved_at"] else
                 "dismissed" if crow["dismissed_at"] else None
             )
-            card.state = state
-            cards.append(card)
-            shown_ids.append(card.id)
-            if state is not None:
-                states[card.id] = state
+            mine.append(card)
+        per_profile.append((pid, mine))
 
+    cards: list[Card] = []
+    shares = fair_shares([len(c) for _, c in per_profile], _DAILY_LIMIT)
+    for (pid, mine), share in zip(per_profile, shares):
+        kept = mine[:share]
+        cards.extend(kept)
+        for card in kept:
+            if card.state is not None:
+                states[card.id] = card.state
         # Stamp shown_at for the cards we're returning from this profile.
         # Held open deliberately: one commit for all profiles, below.
-        if shown_ids:
-            candidates_repo.mark_shown_bulk(conn, pid, shown_ids, commit=False)
+        if kept:
+            candidates_repo.mark_shown_bulk(conn, pid, [c.id for c in kept], commit=False)
 
     conn.commit()
 
@@ -226,28 +266,35 @@ def _resolve_card(
     return int(row["profile_id"]), row["openalex_id"]
 
 
-def save(
-    conn: sqlite3.Connection, user_id: int, card_id: str,
-    profile_slug: str | None = None,
-) -> CardActionResponse | None:
+def _set(
+    conn: sqlite3.Connection, user_id: int, card_id: str, column: str,
+    profile_slug: str | None, on: bool | None,
+) -> tuple[CardActionResponse, bool] | None:
     resolved = _resolve_card(conn, user_id, card_id, profile_slug)
     if resolved is None:
         return None
     profile_id, openalex_id = resolved
-    state = candidates_repo.mark_saved(conn, profile_id, openalex_id)
-    return CardActionResponse(id=card_id, state=state)
+    res = candidates_repo.set_state(conn, profile_id, openalex_id, column, on)
+    if res is None:
+        return None
+    state, changed = res
+    return CardActionResponse(id=card_id, state=state), changed
+
+
+def save(
+    conn: sqlite3.Connection, user_id: int, card_id: str,
+    profile_slug: str | None = None, on: bool | None = None,
+) -> tuple[CardActionResponse, bool] | None:
+    """Save (``on=True``), un-save (``False``) or toggle (None). ``(response, changed)``."""
+    return _set(conn, user_id, card_id, "saved_at", profile_slug, on)
 
 
 def dismiss(
     conn: sqlite3.Connection, user_id: int, card_id: str,
-    profile_slug: str | None = None,
-) -> CardActionResponse | None:
-    resolved = _resolve_card(conn, user_id, card_id, profile_slug)
-    if resolved is None:
-        return None
-    profile_id, openalex_id = resolved
-    state = candidates_repo.mark_dismissed(conn, profile_id, openalex_id)
-    return CardActionResponse(id=card_id, state=state)
+    profile_slug: str | None = None, on: bool | None = None,
+) -> tuple[CardActionResponse, bool] | None:
+    """Dismiss / un-dismiss / toggle, as ``save``."""
+    return _set(conn, user_id, card_id, "dismissed_at", profile_slug, on)
 
 
 def card_feedback_context(

@@ -28,6 +28,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ...redact import public_error
+
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
     Researcher,
@@ -90,6 +92,9 @@ def import_researcher(
             prosopia_client=prosopia_client,
             openalex_client=openalex_client,
         )
+    except researchers_service.ResearcherImportRunning as exc:
+        # Already importing this person: the run to watch, not a second one.
+        return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id)
     except (prosopia_service.PapersNotFound, orcid_service.WorksNotFound) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except prosopia_service.ProfileNotFound as exc:
@@ -100,14 +105,14 @@ def import_researcher(
     except prosopia_service.ProsopiaError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{body.ref}': {exc}",
+            detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read works for '{body.ref}': {exc}",
+            detail=f"could not read works for '{body.ref}': {public_error(exc)}",
         ) from exc
 
     start = launch_import(
@@ -172,7 +177,7 @@ def researcher_works(
     except Exception as exc:  # noqa: BLE001 — the source could not be read
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read the source for this researcher: {exc}",
+            detail=f"could not read the source for this researcher: {public_error(exc)}",
         ) from exc
 
 

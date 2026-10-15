@@ -93,6 +93,7 @@ def app(tmp_path, monkeypatch):
         def __init__(self, **_): pass
         def lookup_by_doi(self, doi): return None
         def lookup_by_title(self, *a, **kw): return None
+        def search_by_title(self, *a, **kw): return []
         def paper_from_work(self, *a, **kw): return None
     monkeypatch.setattr(vault_service, "OpenAlexClient", _NoNetClient)
 
@@ -114,6 +115,9 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
 
 def _upload(app, content: bytes, filename: str = "paper.pdf",
             profile_slug: str | None = None) -> httpx.Response:
+    # Uploads must carry a PDF header now; the fake ingest ignores the rest.
+    if content and not content.startswith(b"%PDF-"):
+        content = b"%PDF-1.4\n" + content
     files = {"file": (filename, io.BytesIO(content), "application/pdf")}
     data = {"profile_slug": profile_slug} if profile_slug else {}
     return _request(app, "POST", "/api/vault/upload", files=files, data=data)
@@ -208,3 +212,162 @@ def test_tags_endpoint_includes_all_total(app):
     # multi-tagged docs would only count once under "all"
     assert counts["all"] == 2
     assert counts.get("neonatal-vitals") == 1
+
+
+# -----------------------------------------------------------------------------
+# Rejected uploads, per-user uploads, title matching (review round 3)
+# -----------------------------------------------------------------------------
+
+
+def _raw_upload(app, content: bytes, filename: str = "paper.pdf", headers=None):
+    files = {"file": (filename, io.BytesIO(content), "application/pdf")}
+    return _request(app, "POST", "/api/vault/upload", files=files, headers=headers or {})
+
+
+def test_non_pdf_upload_is_rejected_and_not_kept(app, tmp_path):
+    resp = _raw_upload(app, b"just some notes\n", filename="notes.txt")
+    assert resp.status_code == 415, resp.text
+    assert "not a PDF" in resp.json()["detail"]
+    assert not any((tmp_path / "vault").rglob("*.pdf"))
+    assert _request(app, "GET", "/api/vault/docs").json() == []
+
+
+def test_unreadable_pdf_is_rejected_and_not_kept(app, tmp_path, monkeypatch):
+    def _broken(path):
+        raise ValueError("No /Root object! - Is this really a PDF?")
+    monkeypatch.setattr(vault_service, "ingest_pdf", _broken)
+    resp = _raw_upload(app, b"%PDF-1.4\n\x00garbage")
+    assert resp.status_code == 422, resp.text
+    assert "could not be read" in resp.json()["detail"]
+    assert not [p for p in (tmp_path / "vault").rglob("*") if p.is_file()]
+
+
+def test_upload_size_limit(app, monkeypatch):
+    monkeypatch.setenv("RADAR_UPLOAD_MAX_MB", "1")
+    settings_module.get_settings.cache_clear()
+    resp = _raw_upload(app, b"%PDF-1.4\n" + b"x" * (1024 * 1024 + 10))
+    assert resp.status_code == 413, resp.text
+
+
+def test_reupload_says_duplicate(app):
+    a = _upload(app, b"dup-bytes").json()
+    b = _upload(app, b"dup-bytes").json()
+    assert not a.get("duplicate")
+    assert b["duplicate"] is True
+
+
+def test_two_users_uploading_one_paper_both_keep_it(app, monkeypatch):
+    # Both PDFs resolve to the same OpenAlex work.
+    work = {"id": "https://openalex.org/W42", "title": "Shared paper"}
+
+    class _Client:
+        def __init__(self, **_): pass
+        def lookup_by_doi(self, doi): return work
+        def search_by_title(self, *a, **kw): return []
+        def paper_from_work(self, w, source=None):
+            from rag_lib.paper import Paper
+            return Paper(doi="10.1/x", openalex_id="https://openalex.org/W42", title="Shared paper")
+    monkeypatch.setattr(vault_service, "OpenAlexClient", _Client)
+
+    texts = iter(["first user's text for Shared paper", "second user's text for Shared paper"])
+
+    def _ingest(path):
+        return PdfIngestRecord(path=str(path), title="Shared paper",
+                               body_text=next(texts), doi="10.1/x", n_pages=2)
+    monkeypatch.setattr(vault_service, "ingest_pdf", _ingest)
+
+    a = _upload(app, b"copy-one")
+    assert a.status_code == 200, a.text
+    b_hdr = {"X-User-Email": "other@example.com"}
+    b = _raw_upload(app, b"%PDF-1.4\ncopy-two", headers=b_hdr)
+    assert b.status_code == 200, b.text
+
+    mine = [d["id"] for d in _request(app, "GET", "/api/vault/docs").json()]
+    theirs = [d["id"] for d in _request(app, "GET", "/api/vault/docs", headers=b_hdr).json()]
+    assert "https://openalex.org/W42" in mine
+    assert "https://openalex.org/W42" in theirs
+    # The shared text is the first upload's; the second did not rewrite it.
+    import os
+    conn = connect(os.environ["RADAR_DB_PATH"])
+    body = conn.execute("SELECT body_text FROM papers WHERE openalex_id='https://openalex.org/W42'").fetchone()[0]
+    n = conn.execute("SELECT count(*) FROM paper_uploads WHERE openalex_id='https://openalex.org/W42'").fetchone()[0]
+    conn.close()
+    assert body.startswith("first user's")
+    assert n == 2
+
+
+def _rec(title, body, doi=None):
+    return PdfIngestRecord(path="x.pdf", title=title, body_text=body, doi=doi, n_pages=1)
+
+
+def _work(title, *authors, doi=None):
+    return {"title": title, "doi": doi,
+            "authorships": [{"author": {"display_name": a}} for a in authors]}
+
+
+_GOODFELLOW = _work("Deep Learning", "Ian Goodfellow", "Yoshua Bengio", "Aaron Courville")
+_BOOK_TEXT = "Deep Learning\nIan Goodfellow, Yoshua Bengio and Aaron Courville\nMIT Press"
+
+
+def test_the_lab_note_is_not_the_book():
+    notes = _rec("Deep learning", "Lab notes, week 3. Tried a bigger batch size.")
+    assert vault_service.title_rule(notes, _GOODFELLOW)          # same title...
+    assert not vault_service.author_rule(notes, _GOODFELLOW)     # ...nobody's name
+    assert vault_service._verified_title_match(notes, [_GOODFELLOW]) is None
+    book = _rec("Deep Learning", _BOOK_TEXT)
+    assert vault_service._verified_title_match(book, [_GOODFELLOW]) is _GOODFELLOW
+
+
+def test_title_rule_is_exact_after_normalizing():
+    w = _work("Chromatin accessibility: a review", "A Smith")
+    assert vault_service.title_rule(_rec("CHROMATIN ACCESSIBILITY — A REVIEW", ""), w)
+    assert vault_service.title_rule(_rec("Chromatin accessibility", ""), w)          # no subtitle
+    assert not vault_service.title_rule(_rec("Chromatin accessibility in mice", ""), w)
+    assert vault_service.title_rule(_rec("Résumé of García's work", ""), _work("Resume of Garcia's work"))
+    # A mangled extracted title, but the real one is printed on page one.
+    assert vault_service.title_rule(_rec("bioRxiv preprint", "Chromatin accessibility: a review\nA. Smith"), w)
+
+
+def test_author_rule_needs_the_first_author_and_one_more():
+    w = _work("T", "Jane Doe", "Wei Zhang", "Ana Pérez")
+    assert vault_service.author_rule(_rec("T", "Jane Doe1, Ana Perez2"), w)
+    assert not vault_service.author_rule(_rec("T", "Jane Doe only"), w)            # one of three
+    assert not vault_service.author_rule(_rec("T", "Wei Zhang and Ana Perez"), w)  # first author missing
+    assert vault_service.author_rule(_rec("T", "Jane Doe only"), w, first_only=True)
+    assert not vault_service.author_rule(_rec("T", "John Doerr wrote this"), _work("T", "Jane Doe"))
+    assert not vault_service.author_rule(_rec("T", ""), w)                         # nothing to check
+
+
+def test_author_rule_reads_bylines_as_pdfs_print_them():
+    # Spaces lost, affiliation marks glued on (seen in the live vault).
+    assert vault_service.author_rule(
+        _rec("T", "AlexMallen1,∗MadelineBrumley2,JuliaKharchenko2"),
+        _work("T", "Alex Mallen", "Brumley, Madeline"))
+    assert vault_service.author_rule(
+        _rec("T", "KathleenC.Frasera,JedA.Meltzerb andFrankRudzicza,c"),
+        _work("T", "Kathleen Fraser", "Jed A. Meltzer"))
+    # "Last, First" from OpenAlex, with a particle.
+    assert vault_service.author_rule(
+        _rec("T", "ChuhanZhang⋆ GuillaumeLeMoing⋆"), _work("T", "Zhang, Chuhan", "Moing, Guillaume Le"))
+    # Initials only.
+    assert vault_service.author_rule(_rec("T", "K. C. Fraser, J. A. Meltzer"),
+                                     _work("T", "Kathleen Fraser", "Jed Meltzer"))
+    # A group author, its members listed at the end.
+    assert vault_service.author_rule(_rec("T", "DeepSeek-AI\nresearch@deepseek.com"),
+                                     _work("T", "DeepSeek-AI", "Xu, Anyi"))
+
+
+def test_a_preprint_doi_does_not_rule_out_the_published_work():
+    w = _work("AllTracker: Efficient Dense Point Tracking", "Adam W. Harley", "Yang You",
+              doi="https://doi.org/10.1109/iccv.2025.1")
+    rec = _rec("AllTracker: Efficient Dense Point Tracking", "AdamW.Harley1 YangYou1",
+               doi="10.48550/arXiv.2506.07310")
+    assert vault_service._verified_title_match(rec, [w]) is w
+
+
+def test_a_doi_from_the_references_is_not_the_paper():
+    cited = _work("Some cited method", "Bob Ray", "Eve Long")
+    body = "My own paper\nJane Doe\n" + "Body text. " * 800 + "References: Ray B, Long E. Some cited method."
+    mine = _rec("My own paper", body)
+    assert not vault_service._verified_doi_match(mine, cited)
+    assert vault_service._verified_doi_match(_rec("Some cited method", "x"), cited)

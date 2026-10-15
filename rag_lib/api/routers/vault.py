@@ -14,6 +14,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
+from ...redact import public_error
+
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import VaultDoc, VaultMeta, VaultStats
 from ..services import vault as vault_service
@@ -35,7 +37,13 @@ def upload(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="upload missing filename",
         )
-    data = file.file.read()
+    max_bytes = int(settings.RADAR_UPLOAD_MAX_MB) * 1024 * 1024
+    data = file.file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"This file is larger than {settings.RADAR_UPLOAD_MAX_MB} MB, the most the vault takes.",
+        )
     if not data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -49,11 +57,13 @@ def upload(
             data=data,
             profile_slug=profile_slug,
         )
+    except vault_service.UploadRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except ImportError as exc:
         # ingest_pdf raises this when phase1b extras (pdfplumber) are missing.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"PDF ingestion unavailable: {exc}",
+            detail=f"PDF ingestion unavailable: {public_error(exc)}",
         ) from exc
     return VaultDoc.model_validate(doc)
 

@@ -25,6 +25,19 @@ IN_YEARS = (
 )
 
 
+# ... and when it is not one of the interest's own seeds, by id or DOI. A
+# feed paper made a seed kept its candidate row, and a scan finds the seeds
+# themselves; either way the seed topped its own feed. Needs ``pc``. Same
+# rule as ``scoring.pool`` (``seed_keys``) and the gathers' ``without_seeds``.
+NOT_SEED = (
+    "NOT EXISTS (SELECT 1 FROM profile_seeds ps"
+    " LEFT JOIN papers sp ON sp.openalex_id = ps.openalex_id"
+    " WHERE ps.profile_id = pc.profile_id AND (ps.openalex_id = pc.openalex_id"
+    " OR (sp.doi IS NOT NULL AND lower(sp.doi) ="
+    " (SELECT lower(cp.doi) FROM papers cp WHERE cp.openalex_id = pc.openalex_id))))"
+)
+
+
 def insert_dedup(
     conn: sqlite3.Connection,
     *,
@@ -130,6 +143,50 @@ def mark_shown(
     return cur.rowcount
 
 
+def set_state(
+    conn: sqlite3.Connection, profile_id: int, openalex_id: str,
+    column: str, on: bool | None = None,
+) -> tuple[str | None, bool] | None:
+    """Set (``on``) or toggle (``on=None``) ``saved_at`` / ``dismissed_at``.
+
+    Returns ``(state, changed)``, or None when there is no such row.
+    ``changed`` comes from the conditional UPDATE itself, so of two
+    requests racing to save one card exactly one reports a change -- the
+    feedback log records the save once. Setting one state clears the
+    other. Toggling is for older clients: a double click toggled a save
+    straight back off.
+    """
+    other = {"saved_at": "dismissed_at", "dismissed_at": "saved_at"}[column]
+    label = {"saved_at": "saved", "dismissed_at": "dismissed"}[column]
+    row = conn.execute(
+        f"SELECT {column} FROM profile_candidates WHERE profile_id = ? AND openalex_id = ?",
+        (profile_id, openalex_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if on is None:
+        on = row[column] is None
+    if on:
+        cur = conn.execute(
+            f"""
+            UPDATE profile_candidates
+            SET {column} = datetime('now'), {other} = NULL
+            WHERE profile_id = ? AND openalex_id = ? AND {column} IS NULL
+            """,
+            (profile_id, openalex_id),
+        )
+    else:
+        cur = conn.execute(
+            f"""
+            UPDATE profile_candidates SET {column} = NULL
+            WHERE profile_id = ? AND openalex_id = ? AND {column} IS NOT NULL
+            """,
+            (profile_id, openalex_id),
+        )
+    conn.commit()
+    return (label if on else None), cur.rowcount > 0
+
+
 def mark_saved(
     conn: sqlite3.Connection, profile_id: int, openalex_id: str
 ) -> str | None:
@@ -137,33 +194,8 @@ def mark_saved(
 
     Returns the resulting state: ``"saved"`` or ``None``.
     """
-    row = conn.execute(
-        "SELECT saved_at FROM profile_candidates WHERE profile_id = ? AND openalex_id = ?",
-        (profile_id, openalex_id),
-    ).fetchone()
-    if row is None:
-        return None
-    if row["saved_at"] is None:
-        conn.execute(
-            """
-            UPDATE profile_candidates
-            SET saved_at = datetime('now'), dismissed_at = NULL
-            WHERE profile_id = ? AND openalex_id = ?
-            """,
-            (profile_id, openalex_id),
-        )
-        conn.commit()
-        return "saved"
-    conn.execute(
-        """
-        UPDATE profile_candidates
-        SET saved_at = NULL
-        WHERE profile_id = ? AND openalex_id = ?
-        """,
-        (profile_id, openalex_id),
-    )
-    conn.commit()
-    return None
+    res = set_state(conn, profile_id, openalex_id, "saved_at")
+    return None if res is None else res[0]
 
 
 def mark_dismissed(
@@ -173,33 +205,8 @@ def mark_dismissed(
 
     Returns ``"dismissed"`` or ``None``.
     """
-    row = conn.execute(
-        "SELECT dismissed_at FROM profile_candidates WHERE profile_id = ? AND openalex_id = ?",
-        (profile_id, openalex_id),
-    ).fetchone()
-    if row is None:
-        return None
-    if row["dismissed_at"] is None:
-        conn.execute(
-            """
-            UPDATE profile_candidates
-            SET dismissed_at = datetime('now'), saved_at = NULL
-            WHERE profile_id = ? AND openalex_id = ?
-            """,
-            (profile_id, openalex_id),
-        )
-        conn.commit()
-        return "dismissed"
-    conn.execute(
-        """
-        UPDATE profile_candidates
-        SET dismissed_at = NULL
-        WHERE profile_id = ? AND openalex_id = ?
-        """,
-        (profile_id, openalex_id),
-    )
-    conn.commit()
-    return None
+    res = set_state(conn, profile_id, openalex_id, "dismissed_at")
+    return None if res is None else res[0]
 
 
 def unshown_for_profile(
@@ -218,7 +225,7 @@ def unshown_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES} AND {IN_YEARS}
+          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
@@ -249,9 +256,9 @@ def scores_for_profile(
     before ``score_raw`` existed fall back to ``score``.
     """
     rows = conn.execute(
-        """
-        SELECT COALESCE(score_raw, score) AS s FROM profile_candidates
-        WHERE profile_id = ?
+        f"""
+        SELECT COALESCE(pc.score_raw, pc.score) AS s FROM profile_candidates pc
+        WHERE pc.profile_id = ? AND {NOT_SEED}
         ORDER BY s DESC
         """,
         (profile_id,),
@@ -268,12 +275,12 @@ def scored_papers_for_profile(
     threshold compares (``score_raw``, as ``scores_for_profile``).
     """
     return conn.execute(
-        """
+        f"""
         SELECT pc.openalex_id, COALESCE(pc.score_raw, pc.score) AS s,
                p.title, p.venue, p.year
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
-        WHERE pc.profile_id = ?
+        WHERE pc.profile_id = ? AND {NOT_SEED}
         ORDER BY s DESC
         """,
         (profile_id,),
@@ -337,8 +344,14 @@ def top_for_profile(
     limit: int = 50,
     year_from: int | None = None,
     below: bool = False,
+    sim_at_least: float | None = None,
+    sim_below: float | None = None,
 ) -> list[sqlite3.Row]:
     """Top-N candidates for the daily radar (no shown/dismissed filter).
+
+    ``sim_at_least`` / ``sim_below`` narrow on the raw cosine, so a feed
+    bucket ("Like your seeds" is at least the least typical seed) is
+    filtered before the ``LIMIT`` rather than after it.
 
     ``below``: the papers under the threshold instead (the feed's "Below
     the bar" filter), closest to it first. They are stored but not in the
@@ -370,13 +383,16 @@ def top_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS}
+          AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS} AND {NOT_SEED}
           -- The feed's own "published since" filter, on top of the interest's range.
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
+          AND (? IS NULL OR pc.score_raw >= ?)
+          AND (? IS NULL OR pc.score_raw IS NULL OR pc.score_raw < ?)
         ORDER BY {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
         LIMIT ?
         """,
-        (profile_id, year_from, year_from, limit),
+        (profile_id, year_from, year_from, sim_at_least, sim_at_least,
+         sim_below, sim_below, limit),
     ).fetchall()
 
 
@@ -398,7 +414,7 @@ def topic_yield_for_profile(
     and are excluded.
     """
     # What reached the feed: a topic is judged by papers above the threshold.
-    where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES]
+    where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES, NOT_SEED]
     params: list = [profile_id]
     if since:
         where.append("pc.fetched_at >= ?")

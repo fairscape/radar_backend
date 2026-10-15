@@ -13,6 +13,7 @@ slot in without refactoring the call site.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import structlog
@@ -271,14 +272,14 @@ _refresh_again: set[int] = set()
 def stale_rerank_ids(conn, profile_id: int, key: str, limit: int | None = None) -> list[str]:
     """Pool rows (what the feed can show) whose reranker logit is missing or
     was computed against another query set, best cosine first."""
-    from ..db.repos.candidates import IN_YEARS, PASSES
+    from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES
 
     sql = f"""
         SELECT pc.openalex_id
         FROM profile_candidates pc
         JOIN profiles pr ON pr.id = pc.profile_id
         JOIN papers p ON p.openalex_id = pc.openalex_id
-        WHERE pc.profile_id = ? AND {PASSES} AND {IN_YEARS}
+        WHERE pc.profile_id = ? AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
           AND (pc.score_reranker_raw IS NULL OR pc.reranker_query_key IS NULL
                OR pc.reranker_query_key != ?)
         ORDER BY pc.score_raw DESC
@@ -503,6 +504,48 @@ def gather_for_profile(
     from ..api.services.wizard import capped_fetch_limit
     limit = capped_fetch_limit(settings, limit)
 
+    lock = _scan_locks.setdefault(profile_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        # Another scan of this interest is in this process right now (the
+        # nightly one and a "Scan now", or the wizard's first scan).
+        conn = connect(settings.RADAR_DB_PATH)
+        try:
+            if run_id is None:
+                run_id = gather_runs_repo.start(
+                    conn, profile_id=profile_id, user_id=user_id, tier_used=tier,
+                )
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                error=SCAN_BUSY,
+            )
+        finally:
+            conn.close()
+        log.info("scheduler.gather_skipped", profile_id=profile_id, run_id=run_id, reason="scan_running")
+        return run_id
+    try:
+        return _gather_for_profile_locked(
+            user_id, profile_id, settings=settings, days=days, limit=limit,
+            run_id=run_id, tier=tier, years=years,
+        )
+    finally:
+        lock.release()
+
+
+SCAN_BUSY = "Skipped: another scan of this interest was running."
+_scan_locks: dict[int, threading.Lock] = {}
+
+
+def _gather_for_profile_locked(
+    user_id: int,
+    profile_id: int,
+    *,
+    settings: Any,
+    days: int,
+    limit: int,
+    run_id: int | None,
+    tier: str,
+    years: tuple[int, int | None] | None,
+) -> int | None:
     conn = connect(settings.RADAR_DB_PATH)
     try:
         user_row = users_repo.get(conn, user_id)
@@ -573,6 +616,11 @@ def gather_for_profile(
                 )
             else:
                 candidates = gatherer.fetch(profile, since=since, limit=limit)
+            # An interest's own seeds are not news to it.
+            candidates = profiles_repo.without_seeds(
+                candidates, profiles_repo.seed_keys(conn, profile_id))
+            embeddings_repo.attach_stored(
+                conn, candidates, getattr(selector, "embedding_model", None) or profile.embedding_model)
 
             reporter.step(
                 "embedding",
@@ -675,6 +723,21 @@ def gather_for_profile(
                 log.info("scheduler.gather_seeds_changed", profile_id=profile_id, run_id=run_id)
                 rescore_candidates(conn, profile_id)
                 reranker, profile = _build_reranker(now_row, settings), None
+                # "New" is what reached the feed; count it on the new scores.
+                from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES
+
+                n_new = int(conn.execute(
+                    f"""
+                    SELECT count(*) FROM profile_candidates pc
+                    JOIN profiles pr ON pr.id = pc.profile_id
+                    JOIN papers p ON p.openalex_id = pc.openalex_id
+                    JOIN gather_runs g ON g.id = pc.gather_run_id
+                    WHERE pc.profile_id = ? AND pc.gather_run_id = ?
+                      AND pc.fetched_at >= g.started_at
+                      AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+                    """,
+                    (profile_id, run_id),
+                ).fetchone()[0])
             # Pool papers this batch did not rerank (they started passing
             # since their own scan, or their queries changed) get a current
             # logit now; the rest of the pool was blended at the median.

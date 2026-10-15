@@ -33,6 +33,44 @@ def _ensure_bootstrap(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# A migration that rebuilds a table other tables reference runs with
+# foreign keys off: with them on, DROP TABLE on the old copy deletes from it
+# first, and every ON DELETE CASCADE child row goes with it. SQLite ignores
+# the pragma inside a transaction, so the runner sets it around one, and
+# checks the keys before committing. Such a migration is a ``.py`` file with
+# ``migrate(conn)`` (and ``NO_FOREIGN_KEYS = True``), since a rebuild has to
+# read the table it replaces.
+
+
+def _apply_python(conn: sqlite3.Connection, version: str, path: Path) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(f"_radar_migration_{version}", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    no_fk = bool(getattr(module, "NO_FOREIGN_KEYS", False))
+    fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if no_fk:
+        conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        module.migrate(conn)
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise sqlite3.IntegrityError(
+                f"{version}: foreign key check failed: {[tuple(r) for r in bad[:5]]}")
+        conn.execute("INSERT INTO _migrations_applied (version) VALUES (?)", (version,))
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        if no_fk:
+            conn.execute(f"PRAGMA foreign_keys = {'ON' if fk_was_on else 'OFF'}")
+
+
 def apply_migrations(
     conn: sqlite3.Connection,
     migrations_dir: Path | str | None = None,
@@ -50,11 +88,18 @@ def apply_migrations(
         for row in conn.execute("SELECT version FROM _migrations_applied")
     }
 
-    sql_files = sorted(mdir.glob("*.sql"))
+    sql_files = sorted(
+        [*mdir.glob("*.sql"), *(p for p in mdir.glob("*.py") if p.stem[:4].isdigit())],
+        key=lambda p: p.stem,
+    )
     new_versions: list[str] = []
     for sql_path in sql_files:
         version = sql_path.stem
         if version in applied:
+            continue
+        if sql_path.suffix == ".py":
+            _apply_python(conn, version, sql_path)
+            new_versions.append(version)
             continue
         body = sql_path.read_text()
         # Wrap the migration plus its bookkeeping insert in one transaction

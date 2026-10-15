@@ -160,6 +160,30 @@ def record_orcid_researcher(
 # ---------------------------------------------------------------------------
 
 
+class ResearcherImportRunning(RuntimeError):
+    """This person's papers are already being imported for this user.
+
+    Carries the run to watch. Two imports of one ORCID at once embedded
+    the same papers twice and raced on the researcher's paper list.
+    """
+
+    def __init__(self, researcher_id: int, run_id: int):
+        super().__init__("an import of this researcher is already running")
+        self.researcher_id = researcher_id
+        self.run_id = run_id
+
+
+def _refuse_if_importing(
+    conn: sqlite3.Connection, user_id: int, *,
+    researcher_id: int | None = None, orcid: str | None = None,
+) -> None:
+    row = gather_runs_repo.find_inflight_researcher_import(
+        conn, user_id, researcher_id=researcher_id, orcid=orcid,
+    )
+    if row is not None:
+        raise ResearcherImportRunning(int(row["researcher_id"]), int(row["run_id"]))
+
+
 def prepare_researcher_import(
     conn: sqlite3.Connection,
     settings: Any,
@@ -192,6 +216,13 @@ def prepare_researcher_import(
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     if source == "prosopia":
         slug, profile = _resolve_profile(ref, base_url, prosopia_client)
+        existing = researchers_repo.get_by_key(conn, user_id, "prosopia", slug)
+        rid = str(_read(profile, "rid", "") or "")
+        _refuse_if_importing(
+            conn, user_id,
+            researcher_id=int(existing["id"]) if existing is not None else None,
+            orcid=rid if rid and not rid.lower().startswith("local:") else None,
+        )
         records = select_records(profile, slug, paper_ids)
         researcher_id = record_prosopia_researcher(
             conn, user_id=user_id, slug=slug, profile=profile,
@@ -205,6 +236,7 @@ def prepare_researcher_import(
         oid = orcid_service.normalize_orcid(ref)
         if not oid:
             raise ValueError("orcid must be an ORCID iD such as 0000-0001-5643-4068")
+        _refuse_if_importing(conn, user_id, orcid=oid)
         wanted: set[str] | None = None
         if paper_ids is not None:
             wanted = {orcid_service._strip_openalex(i) for i in paper_ids if (i or "").strip()}

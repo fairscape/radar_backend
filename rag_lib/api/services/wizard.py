@@ -100,9 +100,9 @@ def create_draft(
     """Insert a draft profiles row. Returns ``{slug, name}``.
 
     The slug is ``slugify(name)`` with a numeric suffix on collision
-    against any existing slug. ``profiles.name`` carries a global UNIQUE
-    constraint (0001_initial.sql) so we mirror the same suffix into the
-    name when needed; the user sees the suffix and can rename later.
+    with one of the user's own slugs. ``profiles.name`` is unique per user
+    (migration 0021) so we mirror the same suffix into the name when
+    needed; the user sees the suffix and can rename later.
 
     ``embedding_model`` is stored on the profile so coherence joins and
     selector fits use the same vectors the upload path produced.
@@ -113,12 +113,15 @@ def create_draft(
     selector to fit. Both knobs are validated up-front; an unknown key
     raises ``ValueError`` before any DB write.
     """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name must not be empty")
     from ...embedders import get_embedder
     get_embedder(embedding_model)  # validate; raises ValueError if unknown
     get_selector(selector)         # validate; raises ValueError if unknown
 
     base_slug = profiles_repo.slugify(name)
-    slug, suffix = _unique_slug(conn, user_id, base_slug)
+    slug, suffix = _unique_slug(conn, user_id, base_slug, name)
     final_name = name if suffix == 0 else f"{name} ({suffix})"
     profile_id = profiles_repo.create_draft(
         conn,
@@ -138,20 +141,23 @@ def create_draft(
 
 
 def _unique_slug(
-    conn: sqlite3.Connection, user_id: int, base: str  # noqa: ARG001
+    conn: sqlite3.Connection, user_id: int, base: str, name: str | None = None,
 ) -> tuple[str, int]:
     """Return ``(slug, suffix_n)`` where suffix_n is 0 for the bare slug.
 
-    Walks ``base``, ``base-2``, ``base-3``, ... and stops once both
-    the slug AND the suffix-n itself are not in the global profiles
-    table (slug + name carry separate UNIQUE constraints so we have
-    to dodge both).
+    Walks ``base``, ``base-2``, ``base-3``, ... until neither the slug nor
+    (when given) ``name (n)`` is one of *this user's* interests. Both are
+    unique per user (migration 0021); checking the whole table, as this
+    did, renamed an interest because another user had one of that name,
+    and so told the user it existed.
     """
     n = 1
     while True:
         slug = base if n == 1 else f"{base}-{n}"
+        final_name = None if name is None else (name if n == 1 else f"{name} ({n})")
         taken = conn.execute(
-            "SELECT 1 FROM profiles WHERE slug = ? LIMIT 1", (slug,),
+            "SELECT 1 FROM profiles WHERE user_id = ? AND (slug = ? OR name = ?) LIMIT 1",
+            (user_id, slug, final_name),
         ).fetchone() is not None
         if not taken:
             return slug, 0 if n == 1 else n
@@ -493,6 +499,10 @@ def compute_dry_run_for_profile(
         candidates = gatherer.fetch_years(profile, start, end, per_year=per_year)
     else:
         candidates = gatherer.fetch(profile, since=since, limit=fetch_limit)
+    # The seeds score ~1.0 against themselves; left in, they would set the
+    # top of the distribution the threshold is suggested from.
+    candidates = profiles_repo.without_seeds(
+        candidates, profiles_repo.seed_keys(conn, profile_id))
     log.info(
         "dry_run.fetched",
         slug=slug, n=len(candidates),
@@ -865,7 +875,7 @@ def _require_draft(
 ) -> sqlite3.Row:
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None or not row["is_draft"]:
-        raise LookupError(f"draft '{slug}' not found for user {user_id}")
+        raise LookupError(f"draft '{slug}' not found")
     return row
 
 
@@ -906,7 +916,7 @@ def _require_profile(
     """
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None:
-        raise LookupError(f"profile '{slug}' not found for user {user_id}")
+        raise LookupError(f"profile '{slug}' not found")
     return row
 
 

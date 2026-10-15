@@ -40,6 +40,10 @@ class CardActionRequest(BaseModel):
     # click could un-save the paper in another interest. Optional only for
     # older clients.
     profile: str | None = None
+    # The state wanted: true = saved (or dismissed), false = not. Omitted,
+    # the call toggles, as it always did; a double click then toggled the
+    # save back off, and two clicks racing logged the feedback twice.
+    on: bool | None = None
 from ..services import radar as radar_service
 from ..settings import Settings, get_settings
 
@@ -105,13 +109,16 @@ def save_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    res = radar_service.save(db, int(user["id"]), body.card_id, profile_slug=body.profile)
-    if res is None:
+    out = radar_service.save(db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on)
+    if out is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"card '{body.card_id}' not found for current user",
+            detail="card not found for current user",
         )
-    if res.state == "saved":
+    res, changed = out
+    # Only a real transition is feedback: re-saving a saved card is not a
+    # second vote for it.
+    if changed and res.state == "saved":
         _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile)
     return res
 
@@ -123,12 +130,15 @@ def dismiss_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    res = radar_service.dismiss(db, int(user["id"]), body.card_id, profile_slug=body.profile)
-    if res is None:
+    out = radar_service.dismiss(db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on)
+    if out is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"card '{body.card_id}' not found for current user",
+            detail="card not found for current user",
         )
-    if res.state == "dismissed":
+    res, changed = out
+    # Only a real transition is feedback: re-saving a saved card is not a
+    # second vote for it.
+    if changed and res.state == "dismissed":
         _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile)
     return res

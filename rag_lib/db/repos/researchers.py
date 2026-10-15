@@ -218,7 +218,7 @@ def user_owns_papers(
         FROM papers p
         WHERE p.openalex_id IN ({marks})
           AND (
-            p.uploaded_by_user_id = ?
+            EXISTS (SELECT 1 FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?)
             OR EXISTS (
               SELECT 1 FROM researcher_papers rp
               JOIN researchers r ON r.id = rp.researcher_id

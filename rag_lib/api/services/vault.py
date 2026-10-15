@@ -4,14 +4,19 @@ Functions here are router-thin: they take ``(db, settings, user_id, ...)``
 and return Pydantic-shaped dicts the router serializes verbatim.
 
 The upload path is the only write surface:
-  1. Hash the bytes.
-  2. Dedup against ``papers.uploaded_by_user_id + file_hash`` —
-     a re-upload of the same file returns the existing VaultDoc.
+  1. Refuse anything without a PDF header (``UploadRejected``), then
+     hash the bytes.
+  2. Dedup against this user's ``paper_uploads`` row for the hash —
+     a re-upload of the same file returns the existing VaultDoc,
+     marked ``duplicate``.
   3. Write bytes to ``RADAR_VAULT_DIR/{user_id}/{sha256}.pdf``
      (content-addressed; the original filename is preserved on
      ``papers.local_path``).
-  4. ``vault.ingest_pdf`` extracts title / body_text / DOI / n_pages.
-  5. Best-effort OpenAlex enrichment: lookup_by_doi → lookup_by_title.
+  4. ``vault.ingest_pdf`` extracts title / body_text / DOI / n_pages; a
+     file it cannot open is deleted and refused.
+  5. Best-effort OpenAlex enrichment: lookup_by_doi → title search, each
+     kept only if it passes the match rules (``title_rule`` /
+     ``author_rule``).
      On failure we still create a row with ``source='user_pdf'`` and a
      synthetic ``openalex_id = "local:<hash>"`` so dedup still works.
   6. Embed via the active model (``settings.RADAR_DEFAULT_EMBEDDING_MODEL``,
@@ -23,9 +28,12 @@ The upload path is the only write surface:
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +117,23 @@ def _row_to_vault_doc(
     }
 
 
+class UploadRejected(ValueError):
+    """The upload is not something the vault can take; the message says why.
+
+    The router's 4xx. A file that is not a PDF used to reach pdfplumber,
+    fail as a 500, and leave the bytes on disk under the user's vault.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def looks_like_pdf(data: bytes) -> bool:
+    """A PDF header within the first 1024 bytes, as readers accept it."""
+    return b"%PDF-" in data[:1024]
+
+
 def upload(
     conn: sqlite3.Connection,
     settings: Any,
@@ -122,6 +147,12 @@ def upload(
     import time as _time
     t0 = _time.monotonic()
 
+    if not looks_like_pdf(data):
+        raise UploadRejected(
+            "This file is not a PDF. Only PDF files can be added.",
+            status_code=415,
+        )
+
     file_hash = compute_file_hash(data)
 
     existing = papers_repo.get_by_user_hash(conn, user_id, file_hash)
@@ -133,14 +164,31 @@ def upload(
             openalex_id=existing["openalex_id"],
             elapsed_ms=round((_time.monotonic() - t0) * 1000, 1),
         )
-        return _row_to_vault_doc(conn, user_id, existing, settings=settings)
+        doc = _row_to_vault_doc(conn, user_id, existing, settings=settings)
+        doc["duplicate"] = True
+        return doc
 
     pdf_dir = _vault_dir_for_user(settings, user_id)
     pdf_path = pdf_dir / f"{file_hash}.pdf"
-    pdf_path.write_bytes(data)
+    # Read from a scratch name and move it in place only once it parsed: a
+    # file pdfplumber cannot open is not kept.
+    part_path = pdf_dir / f".{file_hash}.part"
+    part_path.write_bytes(data)
 
     t1 = _time.monotonic()
-    record = ingest_pdf(pdf_path)
+    try:
+        record = ingest_pdf(part_path)
+    except ImportError:
+        part_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 -- pdfplumber/pdfminer raise many kinds
+        part_path.unlink(missing_ok=True)
+        log.info("vault.upload.unreadable", filename=filename[:120], reason=str(exc)[:160])
+        raise UploadRejected(
+            "This file could not be read as a PDF. It may be damaged or password-protected.",
+            status_code=422,
+        ) from exc
+    os.replace(part_path, pdf_path)
     log.info("vault.upload.ingest_pdf", elapsed_ms=round((_time.monotonic() - t1) * 1000, 1))
 
     t2 = _time.monotonic()
@@ -150,17 +198,27 @@ def upload(
     )
     log.info("vault.upload.openalex", elapsed_ms=round((_time.monotonic() - t2) * 1000, 1))
 
+    # Another user may have uploaded this paper already. Its stored text and
+    # embedding are what their seeds are scored with, so a second copy of
+    # the PDF does not rewrite them; this user gets their own upload row.
+    prior = papers_repo.get_by_openalex_id(conn, openalex_id)
+    keep_text = prior is not None and bool((prior["body_text"] or "").strip())
     paper_dict.update({
         "file_hash": file_hash,
         "uploaded_by_user_id": user_id,
         "n_pages": record.n_pages,
         "local_path": str(pdf_path),
-        "body_text": record.body_text,
+        "body_text": None if keep_text else record.body_text,
     })
     papers_repo.upsert(conn, paper_dict)
+    papers_repo.record_upload(
+        conn, user_id=user_id, openalex_id=openalex_id, file_hash=file_hash,
+        local_path=str(pdf_path), n_pages=record.n_pages,
+    )
 
     t3 = _time.monotonic()
     embedding_model = settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    stored = papers_repo.get_by_openalex_id(conn, openalex_id)
     paper = Paper(
         doi=paper_dict.get("doi"),
         openalex_id=openalex_id,
@@ -168,11 +226,12 @@ def upload(
         abstract=paper_dict.get("abstract") or "",
         year=paper_dict.get("year"),
         venue=paper_dict.get("venue"),
-        body_text=record.body_text,
+        body_text=stored["body_text"] if keep_text else record.body_text,
     )
-    text = build_embedding_input(paper)
-    embedder = get_embedder(embedding_model)
-    embeddings_repo.upsert(conn, openalex_id, embedding_model, embedder(text))
+    if not (keep_text and embeddings_repo.get(conn, openalex_id, embedding_model) is not None):
+        text = build_embedding_input(paper)
+        embedder = get_embedder(embedding_model)
+        embeddings_repo.upsert(conn, openalex_id, embedding_model, embedder(text))
     log.info("vault.upload.embed", model=embedding_model, elapsed_ms=round((_time.monotonic() - t3) * 1000, 1))
 
     if profile_slug:
@@ -413,8 +472,14 @@ def _enrich_via_openalex(
         work = None
         if record.doi:
             work = client.lookup_by_doi(record.doi)
+            # A DOI on the page can be a cited work's; keep it only if the
+            # PDF looks like that work.
+            if work is not None and not _verified_doi_match(record, work):
+                log.info("vault.upload.doi_rejected", doi=record.doi,
+                         work_title=(work.get("title") or "")[:120])
+                work = None
         if work is None and record.title:
-            work = client.lookup_by_title(record.title)
+            work = _verified_title_match(record, client.search_by_title(record.title))
         if work is not None:
             paper = client.paper_from_work(work, source="user_pdf")
             paper_dict["openalex_id"] = paper.openalex_id
@@ -436,6 +501,129 @@ def _enrich_via_openalex(
     if "openalex_id" not in paper_dict:
         paper_dict["openalex_id"] = f"local:{file_hash}"
     return paper_dict["openalex_id"], paper_dict
+
+
+# Whether an OpenAlex work is the uploaded PDF is decided by rules, each a
+# yes/no check of one fact, not by a similarity score: OpenAlex ranks a
+# near miss first for a title it does not have, and a short title matches
+# something else exactly -- a lab note titled "Deep learning" became
+# Goodfellow et al.'s book, and its text was written into that shared paper.
+#
+#   title    the PDF's title is the work's (normalized; or minus a subtitle),
+#            or the work's whole title is printed on the PDF's first page
+#   authors  the work's first author is named in the PDF's first pages, and
+#            a second of its authors too -- unless it has one author, or the
+#            first is a group ("DeepSeek-AI") whose members are listed last
+#
+# A title-search hit must pass both. A DOI hit needs either: the DOI already
+# names the work, and the check only catches one the extractor took from
+# the references. A DOI that differs is not held against a title hit: a
+# preprint carries its arXiv DOI while OpenAlex has the published one, and
+# the title search only runs once the PDF's DOI has failed to identify it.
+#
+# Names are matched on text with the spaces taken out: pdfplumber often
+# drops them ("AlexMallen1", "KathleenC.Frasera" -- the digits and the
+# trailing letter are affiliation marks), so a whole-word match missed
+# most real bylines.
+
+# Authors and the title are looked for where they are printed: the start.
+_HEAD_CHARS = 6000
+_FIRST_PAGE_CHARS = 3000
+# Letters allowed between a given name and the family name: a middle
+# initial or a particle ("Kathleen C. Fraser", "Guillaume Le Moing").
+_MIDDLE = 4
+
+
+def _norm(text: str | None) -> str:
+    """Lowercase ASCII words: accents stripped, punctuation dropped."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    ascii_ = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", ascii_.lower()).strip()
+
+
+def _squash(text: str | None) -> str:
+    """Letters only, no spaces: how a byline reads once the spaces are lost."""
+    return re.sub(r"[^a-z]+", "", _norm(text))
+
+
+def _work_title(work: dict) -> str:
+    return work.get("title") or work.get("display_name") or ""
+
+
+def _main_title(title: str | None) -> str:
+    """The title without a subtitle (what follows the first colon)."""
+    return _norm((title or "").split(":", 1)[0])
+
+
+def title_rule(record: Any, work: dict) -> bool:
+    pdf, oa = _norm(record.title), _norm(_work_title(work))
+    if not pdf or not oa:
+        return False
+    if pdf == oa or _main_title(record.title) == oa or pdf == _main_title(_work_title(work)):
+        return True
+    return _squash(_work_title(work)) in _squash((record.body_text or "")[:_FIRST_PAGE_CHARS])
+
+
+def _name_parts(name: str) -> tuple[str, str]:
+    """``(given, family)``; OpenAlex gives "First Last" or "Last, First"."""
+    if "," in name:
+        family, given = name.split(",", 1)
+    else:
+        tokens = name.strip().split()
+        family, given = (tokens[-1], " ".join(tokens[:-1])) if tokens else ("", "")
+    return _squash(given), _squash(family)
+
+
+def _is_group(name: str) -> bool:
+    return len(name.split()) == 1 and "," not in name
+
+
+def _named_in(name: str, head: str, spaced_head: str) -> bool:
+    """Whether this author is printed in the head.
+
+    The full name on the squashed text ("kathleen" up to 4 letters "fraser"),
+    or, for a byline of initials ("K. C. Fraser"), the initial and the family
+    name as words on the spaced text, an affiliation letter allowed after it.
+    """
+    if _is_group(name):
+        token = _squash(name)
+        return len(token) >= 4 and token in head
+    given, family = _name_parts(name)
+    if len(family) < 2 or not given:
+        return False
+    if re.search(re.escape(given) + f"[a-z]{{0,{_MIDDLE}}}" + re.escape(family), head):
+        return True
+    initials = r"(?<![a-z])" + re.escape(given[0]) + r"(?: [a-z]){0,2} " + re.escape(family) + r"[a-z]?(?![a-z])"
+    return len(family) >= 3 and re.search(initials, spaced_head) is not None
+
+
+def author_rule(record: Any, work: dict, *, first_only: bool = False) -> bool:
+    text = (record.body_text or "")[:_HEAD_CHARS]
+    head = _squash(text)
+    spaced = re.sub(r"[0-9]+", " ", _norm(text))
+    if not head:
+        return False
+    names = [n for n in _authors_from_work(work) if _squash(n)]
+    if not names or not _named_in(names[0], head, spaced):
+        return False
+    if first_only or len(names) == 1 or _is_group(names[0]):
+        return True
+    return any(_named_in(n, head, spaced) for n in names[1:])
+
+
+def _verified_title_match(record: Any, works: list[dict] | None) -> dict | None:
+    """The search hit that passes every rule, or None (the paper stays local)."""
+    for work in works or []:
+        checks = {"title": title_rule(record, work), "authors": author_rule(record, work)}
+        if all(checks.values()):
+            return work
+        log.info("vault.upload.title_match_rejected", title=(record.title or "")[:120],
+                 candidate=_work_title(work)[:120], failed=[k for k, ok in checks.items() if not ok])
+    return None
+
+
+def _verified_doi_match(record: Any, work: dict) -> bool:
+    return title_rule(record, work) or author_rule(record, work, first_only=True)
 
 
 def _authors_from_work(work: dict) -> list[str]:

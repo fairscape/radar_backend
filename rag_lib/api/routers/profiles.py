@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
+    FeedbackThresholdResponse,
     SeedUmlsStatus,
     CommitDraftRequest,
     Draft,
@@ -174,6 +175,9 @@ def list_drafts(
             phase=r["phase"],
             import_run_id=(int(r["import_run_id"])
                            if r["import_run_id"] is not None else None),
+            # Built by the query all along and never passed on: a failed
+            # import resumed with no word of why.
+            import_error=r["import_error"] if r["phase"] == "failed" else None,
         )
         for r in rows
     ]
@@ -1094,6 +1098,18 @@ def _resolve_profile_id(db: sqlite3.Connection, user_id: int, key: str) -> int:
     return int(row["id"])
 
 
+def _refuse_if_scanning(db: sqlite3.Connection, profile_id: int) -> None:
+    """409 while one of the interest's scans is still running."""
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    running = gather_runs_repo.running_scan(db, profile_id)
+    if running is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A scan of this interest is already running. Try again when it has finished.",
+        )
+
+
 @router.post("/{key}/gather-now", response_model=GatherNowResponse)
 def gather_now(
     key: str,
@@ -1114,6 +1130,7 @@ def gather_now(
     from rag_lib.scheduler.jobs import gather_for_profile
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    _refuse_if_scanning(db, profile_id)
     # Open the audit row eagerly so we can echo a real run_id; the
     # background job reuses it via the ``run_id`` kwarg.
     run_id = gather_runs_repo.start(
@@ -1172,6 +1189,7 @@ def backfill(
     if row is None or row["is_draft"]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
     profile_id = int(row["id"])
+    _refuse_if_scanning(db, profile_id)
     start, _end = years_rules.fetch_span(body.year_from, body.year_to)
     run_id = gather_runs_repo.start(
         db, profile_id=profile_id, user_id=int(user["id"]),
@@ -1188,6 +1206,29 @@ def backfill(
         max_instances=1,
     )
     return GatherNowResponse(ok=True, run_id=run_id)
+
+
+@router.get("/{key}/feedback-threshold", response_model=FeedbackThresholdResponse)
+def feedback_threshold(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> FeedbackThresholdResponse:
+    """The threshold that best separates the papers saved from those dismissed.
+
+    Read-only; the Threshold tab offers it, and applying it is the usual
+    threshold PATCH. This is where saves and dismisses change the scoring.
+    """
+    from rag_lib.feedback.autotune import MIN_EVENTS, recommend_threshold, triaged_scores
+
+    profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    saves, dismisses = triaged_scores(db, profile_id)
+    row = db.execute("SELECT threshold FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    return FeedbackThresholdResponse(
+        n_saved=len(saves), n_dismissed=len(dismisses), min_events=MIN_EVENTS,
+        suggested=recommend_threshold(db, profile_id),
+        threshold=float(row["threshold"]) if row and row["threshold"] is not None else None,
+    )
 
 
 @router.get("/{key}/feedback", response_model=list[FeedbackEventOut])
@@ -1231,7 +1272,7 @@ def list_runs(
     key: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-    limit: int = 20,
+    limit: int = Query(default=20, ge=1, le=200),
 ) -> list[GatherRun]:
     from rag_lib.db.repos import gather_runs as gather_runs_repo
 
@@ -1269,11 +1310,21 @@ def update_schedule(
     scheduler: Annotated[object, Depends(get_scheduler)],
 ) -> Schedule:
     """Update the cron / tz / enabled flag for a profile and re-register the job."""
-    from apscheduler.triggers.cron import CronTrigger
-
     from rag_lib.db.repos import schedules as schedules_repo
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    # A blank cron was validated as "unchanged" (``body.cron or current``)
+    # and then stored: the interest showed as scheduled and never ran.
+    for field, value in (("cron", body.cron), ("tz", body.tz)):
+        if value is not None and not value.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field} must not be empty; omit it to keep the current one",
+            )
+    body = body.model_copy(update={
+        "cron": body.cron.strip() if body.cron else body.cron,
+        "tz": body.tz.strip() if body.tz else body.tz,
+    })
 
     # Validate what the row will hold, not just the field that was sent: a
     # tz-only change used to skip validation, be stored, and then make
@@ -1395,6 +1446,7 @@ def reranker_comparison(
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
           AND {candidates_repo.PASSES} AND {candidates_repo.IN_YEARS}
+          AND {candidates_repo.NOT_SEED}
           -- "Was reranked" is the reranker's own score, not the blend: the
           -- pool rescore gives every row a blend once any row is reranked.
           AND pc.score_reranker_raw IS NOT NULL

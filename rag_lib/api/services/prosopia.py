@@ -60,6 +60,7 @@ from ...prosopia_client import (
     ProfileNotFound,
     ProsopiaClient,
     ProsopiaError,
+    allowed_base_url,
     read_summary,
     looks_like_orcid,
 )
@@ -163,6 +164,14 @@ def _resolve_profile(ref: str, base_url: str | None, prosopia_client: Any | None
     if not slug:
         raise ValueError("ref must be a non-empty slug, profile URL or ORCID")
 
+    if prosopia_client is None:
+        from ..settings import get_settings
+
+        settings = get_settings()
+        base_url = allowed_base_url(
+            base_url,
+            [settings.RADAR_PROSOPIA_BASE_URL, *settings.RADAR_PROSOPIA_ALLOWED_BASE_URLS],
+        )
     client = prosopia_client or ProsopiaClient(base_url or DEFAULT_BASE_URL)
     # An ORCID (bare, or as an orcid.org URL, which normalize_ref has
     # already reduced to the bare id) names a researcher, not a profile;

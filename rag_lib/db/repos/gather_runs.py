@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from ...redact import public_error
+
 
 def start(
     conn: sqlite3.Connection,
@@ -70,7 +72,10 @@ def finish(
           current_step = 'done'
         WHERE id = ?
         """,
-        (n_fetched, n_new, n_redup, api_calls, error, tier_used, result_json, run_id),
+        (n_fetched, n_new, n_redup, api_calls,
+         # Shown to the user as the run's error; see rag_lib/redact.py.
+         public_error(error) if error is not None else None,
+         tier_used, result_json, run_id),
     )
     conn.commit()
 
@@ -245,6 +250,35 @@ def find_inflight_import(
     ).fetchone()
 
 
+def find_inflight_researcher_import(
+    conn: sqlite3.Connection, user_id: int, *,
+    researcher_id: int | None = None, orcid: str | None = None,
+) -> sqlite3.Row | None:
+    """This user's unfinished import of a researcher (by row or ORCID), or None.
+
+    ``researcher_id, run_id`` of the newest one. Any import tier counts:
+    the papers are the same whichever way the person is being imported.
+    """
+    if researcher_id is None and not orcid:
+        return None
+    placeholders = ",".join("?" * len(IMPORT_TIERS))
+    return conn.execute(
+        f"""
+        SELECT g.researcher_id AS researcher_id, g.id AS run_id
+          FROM gather_runs g
+          JOIN researchers r ON r.id = g.researcher_id
+          LEFT JOIN profiles p ON p.id = g.profile_id
+         WHERE (r.id = ? OR (? IS NOT NULL AND r.orcid = ?))
+           AND (p.user_id = ? OR (p.id IS NULL AND g.user_id = ?))
+           AND g.tier_used IN ({placeholders})
+           AND {_INFLIGHT_PREDICATE}
+         ORDER BY g.id DESC
+         LIMIT 1
+        """,
+        (researcher_id, orcid, orcid, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
+    ).fetchone()
+
+
 INTERRUPTED = "Interrupted: the backend restarted while this was running."
 
 
@@ -263,3 +297,27 @@ def close_interrupted(conn: sqlite3.Connection) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+# A scan that has not reported progress for this long is taken to be dead
+# (the process stopped under it), not running.
+SCAN_STALE_MINUTES = 120
+
+
+def running_scan(conn: sqlite3.Connection, profile_id: int) -> sqlite3.Row | None:
+    """The interest's scan that is still running, if any.
+
+    A scan is any run but a wizard trial or a seed import. Two scans of one
+    interest at once wrote each other's run id onto the new papers and
+    blended against centroids the other was replacing.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM gather_runs
+        WHERE profile_id = ? AND finished_at IS NULL
+          AND (tier_used IS NULL OR (tier_used != 'dry_run' AND tier_used NOT LIKE '%import'))
+          AND COALESCE(progress_updated_at, started_at) >= datetime('now', ?)
+        ORDER BY id DESC LIMIT 1
+        """,
+        (profile_id, f"-{SCAN_STALE_MINUTES} minutes"),
+    ).fetchone()

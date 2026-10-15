@@ -11,9 +11,9 @@ assigning ``bucket`` from ``score`` instead of duplicating numbers.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 # Rank-percentile fallback cut-points for ``bucket`` when a candidate row
@@ -34,6 +34,15 @@ LLMProvider = Literal["ollama", "anthropic", "openai"]
 
 class _Model(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+
+# Input limits. Nothing bounded these, so a threshold of -5 was stored, NaN
+# was a 500, and a 100,000-character name made a draft no URL could reach.
+Threshold = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+MAX_NAME = 120
+MAX_EMAIL = 254
+MAX_TERMS = 200
+MAX_TERM_LABEL = 200
 
 
 class Health(_Model):
@@ -115,6 +124,8 @@ class VaultDoc(_Model):
     pages: int
     chunks: int
     added: str
+    # Upload response only: this user had already uploaded these bytes.
+    duplicate: bool | None = None
 
 
 class Seed(_Model):
@@ -288,6 +299,17 @@ class CardActionResponse(_Model):
     state: CardState | None = None
 
 
+class FeedbackThresholdResponse(_Model):
+    """What the interest's saves and dismisses say the threshold should be."""
+
+    n_saved: int
+    n_dismissed: int
+    min_events: int
+    # None until there are min_events triaged papers with at least one save.
+    suggested: float | None = None
+    threshold: float | None = None
+
+
 class FeedbackEventOut(_Model):
     """One row from ``feedback_events`` shaped for API consumers (Phase 8)."""
 
@@ -362,9 +384,17 @@ class InterestTermsUpdate(_Model):
     (its provenance fields set) or save edits (provenance omitted: the
     stored record's is kept and ``edited`` is set)."""
 
-    terms: list[InterestTerm] = Field(default_factory=list)
-    removed: list[InterestTerm] = Field(default_factory=list)
-    not_interests: list[str] = Field(default_factory=list)
+    terms: list[InterestTerm] = Field(default_factory=list, max_length=MAX_TERMS)
+    removed: list[InterestTerm] = Field(default_factory=list, max_length=MAX_TERMS)
+    not_interests: list[Annotated[str, Field(max_length=MAX_TERM_LABEL)]] = Field(
+        default_factory=list, max_length=MAX_TERMS)
+
+    @model_validator(mode="after")
+    def _labels_fit(self):
+        for t in [*self.terms, *self.removed]:
+            if len(t.label) > MAX_TERM_LABEL:
+                raise ValueError(f"a research topic is at most {MAX_TERM_LABEL} characters")
+        return self
     source: str | None = None
     model: str | None = None
     generated_at: str | None = None
@@ -462,7 +492,7 @@ class ProfileThresholdUpdate(_Model):
     ``years`` present sets both bounds (None clears one); omitted leaves them.
     """
 
-    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    threshold: Threshold | None = None
     years: YearRange | None = None
 
 
@@ -505,7 +535,9 @@ class DraftSummary(_Model):
 
 
 class DraftCreateRequest(_Model):
-    name: str
+    # A 100,000-character name made a draft whose URL no page could open
+    # and no delete could reach.
+    name: str = Field(min_length=1, max_length=MAX_NAME)
     # Plugin keys. Both default to ``None`` so the router can fall back
     # to the configured ``RADAR_DEFAULT_EMBEDDING_MODEL`` and the
     # built-in ``"centroid"`` selector. Any registered key from
@@ -530,7 +562,7 @@ class ProsopiaImportRequest(_Model):
 
     ref: str
     base_url: str | None = None
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=MAX_NAME)
     embedding_model: str | None = None
     # The ``id`` values from GET /api/import/prosopia/works to keep;
     # omitted = every paper on the profile.
@@ -607,7 +639,7 @@ class OrcidImportRequest(_Model):
 
     orcid: str
     openalex_ids: list[str]
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=MAX_NAME)
     embedding_model: str | None = None
     # A draft to add these works to, instead of opening a new one: the
     # wizard's "add papers from another ORCID" once a draft exists.
@@ -869,8 +901,8 @@ class DraftDryRunRequest(_Model):
     defaults to a 0.50–0.95 sweep when omitted.
     """
 
-    days: int = 30
-    thresholds: list[float] | None = None
+    days: int = Field(default=30, ge=1, le=365)
+    thresholds: list[Threshold] | None = Field(default=None, max_length=100)
     # Step 3's selection. Saved on the draft first, so the trial scans the
     # topics the user kept (it used to scan every topic the seeds had) and
     # a resumed draft shows the same ticks. None = keep the stored states.
@@ -949,7 +981,8 @@ class CommitDraftRequest(_Model):
     """Body of ``POST /api/profiles`` (commit-draft)."""
 
     slug: str
-    threshold: float
+    # A cosine; it went in unchecked (-5 was stored, NaN was a 500).
+    threshold: Threshold
     selected_topic_ids: list[str] = Field(default_factory=list)
     cron: str | None = None
     tz: str | None = None
@@ -979,7 +1012,7 @@ class User(_Model):
 class UserUpdateRequest(_Model):
     """Body of ``PATCH /api/users/me``."""
 
-    mailto: str | None = None
+    mailto: str | None = Field(default=None, max_length=MAX_EMAIL)
 
 
 # ---------------------------------------------------------------------------

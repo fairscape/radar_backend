@@ -33,6 +33,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from ...redact import public_error
+
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
     GatherRun,
@@ -138,7 +140,7 @@ def import_prosopia(
     except prosopia_service.ProsopiaError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{body.ref}': {exc}",
+            detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
         ) from exc
     except ValueError as exc:
         raise HTTPException(
@@ -199,7 +201,7 @@ def launch_import(
         except Exception as exc:  # noqa: BLE001 — mirror the job's audit write
             gather_runs_repo.finish(
                 db, run_id, n_fetched=0, n_new=0, n_redup=0,
-                tier_used=tier, error=f"{type(exc).__name__}: {exc}",
+                tier_used=tier, error=f"{type(exc).__name__}: {public_error(exc)}",
             )
             raise
         gather_runs_repo.finish(
@@ -269,7 +271,7 @@ def orcid_works(
     except Exception as exc:  # noqa: BLE001 — upstream trouble is a 502
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read works for ORCID {oid} from OpenAlex: {exc}",
+            detail=f"could not read works for ORCID {oid} from OpenAlex: {public_error(exc)}",
         ) from exc
     return OrcidWorksResponse(**listing)
 
@@ -318,6 +320,13 @@ def import_orcid(
     except prosopia_service.DraftNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except orcid_service.ImportAlreadyRunning as exc:
+        if exc.slug is None:
+            # The run is a researcher import (no draft to hand back): the
+            # wizard used to get an empty draft slug and lose its picks.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This researcher's papers are still being imported. Try again when that finishes.",
+            ) from exc
         # Not an error: the user asked for an import that is already
         # running, so hand back the run they can poll instead of starting
         # a duplicate. Same response shape, so the client polls as usual.
@@ -336,7 +345,7 @@ def import_orcid(
     except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {exc}",
+            detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {public_error(exc)}",
         ) from exc
 
     return launch_import(request, db, settings, plan, user_id=int(user["id"]),
@@ -372,7 +381,7 @@ def prosopia_works(
     except prosopia_service.ProsopiaError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{ref}': {exc}",
+            detail=f"could not read prosopia profile '{ref}': {public_error(exc)}",
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

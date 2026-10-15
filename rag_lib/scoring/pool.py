@@ -119,18 +119,22 @@ def rescore_profile_pool(
     threshold = None if prow is None or prow[0] is None else float(prow[0])
     year_from = None if prow is None else prow[1]
     year_to = None if prow is None else prow[2]
+    from ..db.repos.candidates import NOT_SEED
+
     rows = [dict(r) for r in conn.execute(
-        """
-        SELECT pc.openalex_id, pc.score, pc.score_raw, pc.score_reranker_raw, p.year
+        f"""
+        SELECT pc.openalex_id, pc.score, pc.score_raw, pc.score_reranker_raw, p.year,
+               {NOT_SEED} AS not_seed
         FROM profile_candidates pc JOIN papers p USING (openalex_id)
         WHERE pc.profile_id = ?
         """,
         (profile_id,),
     ).fetchall()]
-    # The pool is what the feed can show: above the threshold and inside
-    # the interest's years (feed percentiles would otherwise rank against
-    # papers that are never shown).
-    pool = [r for r in rows if passes(r["score_raw"], threshold) and in_years(r["year"], year_from, year_to)]
+    # The pool is what the feed can show: above the threshold, inside the
+    # interest's years, and not one of its seeds (feed percentiles would
+    # otherwise rank against papers that are never shown).
+    pool = [r for r in rows if r["not_seed"] and passes(r["score_raw"], threshold)
+            and in_years(r["year"], year_from, year_to)]
     scores = pool_scores(pool, alpha=alpha, beta=beta)
     empty = {"score_reranker_norm": None, "score_blended": None, "score_pct": None}
     conn.executemany(

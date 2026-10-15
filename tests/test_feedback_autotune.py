@@ -65,17 +65,18 @@ def _insert_events(
     saves: list[float],
     dismisses: list[float],
 ) -> None:
-    for s in saves:
+    """Saved / dismissed candidates with these cosines (what autotune reads)."""
+    from rag_lib.db.repos import candidates as candidates_repo
+
+    for i, (s, action) in enumerate([(s, "saved") for s in saves] + [(s, "dismissed") for s in dismisses]):
+        oa = f"W31{i:05d}"
+        papers_repo.upsert(conn, {"openalex_id": oa, "title": f"p{i}", "source": "openalex_gatherer"})
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id=oa, score=s, score_raw=s)
+        col = "saved_at" if action == "saved" else "dismissed_at"
+        candidates_repo.set_state(conn, profile_id, oa, col, True)
         feedback_repo.insert(
-            conn,
-            user_id=user_id, profile_id=profile_id,
-            openalex_id="W3000000", action="saved", score=s,
-        )
-    for s in dismisses:
-        feedback_repo.insert(
-            conn,
-            user_id=user_id, profile_id=profile_id,
-            openalex_id="W3000000", action="dismissed", score=s,
+            conn, user_id=user_id, profile_id=profile_id,
+            openalex_id=oa, action=action, score=s,
         )
 
 
@@ -161,4 +162,19 @@ def test_apply_recommended_skips_when_insufficient(tmp_path):
         "SELECT threshold FROM profiles WHERE id = ?", (profile_id,)
     ).fetchone()
     assert row["threshold"] == pytest.approx(0.50)
+    conn.close()
+
+
+def test_an_unsave_no_longer_counts(tmp_path):
+    """The current state is what counts, not every click ever logged."""
+    from rag_lib.db.repos import candidates as candidates_repo
+
+    user_id, profile_id = _seed_min(tmp_path / "radar.db")
+    conn = _conn(tmp_path / "radar.db")
+    saves = [round(0.80 + i * 0.005, 3) for i in range(30)]
+    dismisses = [round(0.50 + i * 0.003, 3) for i in range(30)]
+    _insert_events(conn, user_id=user_id, profile_id=profile_id, saves=saves, dismisses=dismisses)
+    for i in range(30):          # every save taken back
+        candidates_repo.set_state(conn, profile_id, f"W31{i:05d}", "saved_at", False)
+    assert recommend_threshold(conn, profile_id, min_events=30) is None
     conn.close()

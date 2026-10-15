@@ -88,10 +88,12 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
           venue               = COALESCE(excluded.venue, venue),
           publication_date    = COALESCE(excluded.publication_date, publication_date),
           topics_json         = COALESCE(excluded.topics_json, topics_json),
-          local_path          = COALESCE(excluded.local_path, local_path),
+          -- The first upload's file and uploader stay; each user's own
+          -- upload is a paper_uploads row (migration 0020).
+          local_path          = COALESCE(local_path, excluded.local_path),
           body_text           = COALESCE(NULLIF(excluded.body_text, ''), body_text),
-          file_hash           = COALESCE(excluded.file_hash, file_hash),
-          uploaded_by_user_id = COALESCE(excluded.uploaded_by_user_id, uploaded_by_user_id),
+          file_hash           = COALESCE(file_hash, excluded.file_hash),
+          uploaded_by_user_id = COALESCE(uploaded_by_user_id, excluded.uploaded_by_user_id),
           n_pages             = COALESCE(excluded.n_pages, n_pages),
           authors_json        = COALESCE(excluded.authors_json, authors_json),
           pdf_url             = COALESCE(excluded.pdf_url, pdf_url),
@@ -141,12 +143,37 @@ def get_by_user_hash(
     """
     return conn.execute(
         """
-        SELECT * FROM papers
-        WHERE uploaded_by_user_id = ? AND file_hash = ?
+        SELECT p.* FROM papers p
+        JOIN paper_uploads u ON u.openalex_id = p.openalex_id
+        WHERE u.user_id = ? AND u.file_hash = ?
         LIMIT 1
         """,
         (user_id, file_hash),
     ).fetchone()
+
+
+def record_upload(
+    conn: sqlite3.Connection, *, user_id: int, openalex_id: str,
+    file_hash: str, local_path: str | None, n_pages: int | None,
+) -> None:
+    """This user uploaded this paper (``paper_uploads``; migration 0020).
+
+    Per user, so a second user uploading the same paper adds their own row
+    instead of taking the paper over. A re-upload of a different file of
+    the same paper by the same user replaces their file.
+    """
+    conn.execute(
+        """
+        INSERT INTO paper_uploads (user_id, openalex_id, file_hash, local_path, n_pages)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (user_id, openalex_id) DO UPDATE SET
+          file_hash  = excluded.file_hash,
+          local_path = excluded.local_path,
+          n_pages    = excluded.n_pages
+        """,
+        (user_id, openalex_id, file_hash, local_path, n_pages),
+    )
+    conn.commit()
 
 
 def decode_authors(row: sqlite3.Row | None) -> list[str]:

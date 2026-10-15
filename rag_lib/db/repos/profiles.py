@@ -34,10 +34,12 @@ def slugify(name: str) -> str:
     """
     s = name.strip().lower()
     # Underscores collapse into hyphens to match the 0002_users SQL backfill,
-    # which rewrites both spaces and underscores as hyphens.
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-+", "-", s).strip("-")
-    s = s or "profile"
+    # which rewrites both spaces and underscores as hyphens. Letters and
+    # digits of any script stay: a name in Chinese or Japanese used to
+    # reduce to nothing, and every such interest was "profile", "profile-2"...
+    s = re.sub(r"[\W_]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")[:80].strip("-")
+    s = s or "interest"
     # The profile routes are /api/profiles/{key}, and a few literal paths
     # are declared ahead of it so they win. A profile whose slug is one of
     # those is reachable through every sub-path (/detail, /runs, PATCH...)
@@ -113,7 +115,14 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
       ``seeded``     seeds are attached; the coherence step is next
       ``empty``      nothing attached yet; the upload/pick step is next
     """
+    # An open run that has not moved for STALE_IMPORT_MINUTES is dead (the
+    # backend stopped under it), not importing: without the cutoff such a
+    # draft said "importing" forever.
+    from .gather_runs import STALE_IMPORT_MINUTES
+
     tiers = ",".join("?" * len(IMPORT_TIERS))
+    live = "COALESCE(g.progress_updated_at, g.started_at) > datetime('now', ?)"
+    cutoff = f"-{STALE_IMPORT_MINUTES} minutes"
     return conn.execute(
         f"""
         SELECT p.id, p.slug, p.name, p.created_at, p.updated_at,
@@ -125,31 +134,32 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
                (SELECT MAX(g.id) FROM gather_runs g
                  WHERE g.profile_id = p.id
                    AND g.tier_used IN ({tiers})
-                   AND g.finished_at IS NULL) AS import_run_id,
+                   AND g.finished_at IS NULL AND {live}) AS import_run_id,
                CASE
                  WHEN EXISTS (SELECT 1 FROM gather_runs g
                                WHERE g.profile_id = p.id
                                  AND g.tier_used IN ({tiers})
-                                 AND g.finished_at IS NULL) THEN 'importing'
+                                 AND g.finished_at IS NULL AND {live}) THEN 'importing'
                  WHEN EXISTS (SELECT 1 FROM profile_seeds s
                                WHERE s.profile_id = p.id) THEN 'seeded'
                  WHEN EXISTS (SELECT 1 FROM gather_runs g
                                WHERE g.profile_id = p.id
                                  AND g.tier_used IN ({tiers})
-                                 AND g.error IS NOT NULL) THEN 'failed'
+                                 AND (g.error IS NOT NULL OR g.finished_at IS NULL)) THEN 'failed'
                  ELSE 'empty'
                END AS phase,
-               (SELECT g.error FROM gather_runs g
+               (SELECT COALESCE(g.error, 'The import stopped without finishing.')
+                  FROM gather_runs g
                  WHERE g.profile_id = p.id
                    AND g.tier_used IN ({tiers})
-                   AND g.error IS NOT NULL
+                   AND (g.error IS NOT NULL OR g.finished_at IS NULL)
                  ORDER BY g.id DESC LIMIT 1) AS import_error
           FROM profiles p
           LEFT JOIN researchers r ON r.id = p.researcher_id
          WHERE p.user_id = ? AND p.is_draft = 1
          ORDER BY p.id DESC
         """,
-        (*IMPORT_TIERS, *IMPORT_TIERS, *IMPORT_TIERS, *IMPORT_TIERS, user_id),
+        (*IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, *IMPORT_TIERS, user_id),
     ).fetchall()
 
 
@@ -403,6 +413,33 @@ def list_seed_openalex_ids(
         (profile_id,),
     ).fetchall()
     return [r["openalex_id"] for r in rows]
+
+
+def seed_keys(conn: sqlite3.Connection, profile_id: int) -> tuple[set[str], set[str]]:
+    """``(openalex_ids, lowercased DOIs)`` of an interest's seeds.
+
+    For keeping the seeds themselves out of what is scanned for it: a
+    search for an interest's topics finds its own papers, which then
+    topped its feed and the trial's score distribution.
+    """
+    rows = conn.execute(
+        """
+        SELECT ps.openalex_id, p.doi
+        FROM profile_seeds ps LEFT JOIN papers p ON p.openalex_id = ps.openalex_id
+        WHERE ps.profile_id = ?
+        """,
+        (profile_id,),
+    ).fetchall()
+    return {r[0] for r in rows}, {r[1].lower() for r in rows if r[1]}
+
+
+def without_seeds(papers: list, keys: tuple[set[str], set[str]]) -> list:
+    """``papers`` minus any that is one of the seeds (by id or DOI)."""
+    ids, dois = keys
+    return [
+        p for p in papers
+        if p.openalex_id not in ids and not (p.doi and p.doi.lower() in dois)
+    ]
 
 
 def update_seed_similarity(

@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     RADAR_DB_PATH: Path = Path("data/radar.db")
     RADAR_DEFAULT_MAILTO: str = "demo@example.com"
     RADAR_VAULT_DIR: Path = Path("data/vault")
+    # Largest PDF the vault takes, in megabytes. Uploads had no limit, and a
+    # 30 MB file of random bytes was written to disk as-is.
+    RADAR_UPLOAD_MAX_MB: int = 50
     RADAR_CHROMA_DIR: Path = Path("data/chroma")
     # Default LLM provider for /api/chat. One of: ollama | anthropic | openai.
     # Per-request override is honored by the chat endpoint; this just sets
@@ -73,6 +76,10 @@ class Settings(BaseSettings):
     # (``POST /api/profiles/import/prosopia``). Per-request ``base_url``
     # overrides it, so this is the default a plain slug resolves against.
     RADAR_PROSOPIA_BASE_URL: str = "https://prosopia.databio.org"
+    # Any other Prosopia instance a request's ``base_url`` may name. The
+    # server fetches that URL, so an open ``base_url`` let any caller make
+    # it read loopback ports or a cloud metadata address.
+    RADAR_PROSOPIA_ALLOWED_BASE_URLS: list[str] = []
     RADAR_CORS_ORIGINS: list[str] = ["*"]
     RADAR_LOG_JSON: bool = True
     # Optional path to a log file. When set, every record (request lines,

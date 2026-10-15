@@ -827,6 +827,9 @@ def test_an_import_does_not_take_over_another_users_upload(env):
         "openalex_id": "https://openalex.org/W4415881950", "title": "Atacformer",
         "source": "user_pdf", "uploaded_by_user_id": a, "local_path": "/vault/a/atacformer.pdf",
     })
+    # What an upload writes too (migration 0020): the per-user upload row.
+    papers_repo.record_upload(conn, user_id=a, openalex_id="https://openalex.org/W4415881950",
+                              file_hash="h", local_path="/vault/a/atacformer.pdf", n_pages=1)
     conn.close()
 
     app = _app(StubProsopia(_stub_profile()), _stub_openalex())

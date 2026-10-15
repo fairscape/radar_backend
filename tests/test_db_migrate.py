@@ -46,6 +46,8 @@ EXPECTED_VERSIONS = [
     "0017_interest_terms",
     "0018_year_range",
     "0019_reranker_query_key",
+    "0020_paper_uploads",
+    "0021_profile_names_per_user",
 ]
 
 

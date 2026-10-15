@@ -24,6 +24,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from ...redact import public_error
+
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
     ChatRequest,
@@ -132,13 +134,13 @@ def chat(
     except LLMNotConfigured as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"LLM provider not configured: {exc}. {_env_hint(active_provider)}",
+            detail=f"LLM provider not configured: {public_error(exc)}. {_env_hint(active_provider)}",
         ) from exc
     except LLMUnreachable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                f"LLM service unavailable: {exc}. "
+                f"LLM service unavailable: {public_error(exc)}. "
                 f"{_env_hint(active_provider)}"
             ),
         ) from exc
@@ -147,6 +149,6 @@ def chat(
         # operator gets an actionable hint instead of a 500.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Vector index unavailable: {exc}",
+            detail=f"Vector index unavailable: {public_error(exc)}",
         ) from exc
     return ChatTurn.model_validate(turn)

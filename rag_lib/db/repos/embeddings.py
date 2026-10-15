@@ -61,3 +61,32 @@ def models_for(conn: sqlite3.Connection, openalex_id: str) -> list[str]:
         (openalex_id,),
     ).fetchall()
     return [r["embedding_model"] for r in rows]
+
+
+def attach_stored(conn: sqlite3.Connection, papers: list, model: str) -> int:
+    """Give each paper the vector already stored for it, if any. Returns how many.
+
+    A gather re-embedded every paper it fetched, and ``store_papers`` then
+    kept the vector stored the first time (``skip_re_embed``). Embedding is
+    not bit-stable, so the score written for a resurfaced paper came from a
+    vector that was not stored, and a refit rescoring from stored vectors
+    moved it (by up to 0.017). Scoring with the stored vector keeps the two
+    the same, and skips the embedding.
+    """
+    ids = [p.openalex_id for p in papers if p.openalex_id and model not in (p.embeddings or {})]
+    found = 0
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        marks = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT openalex_id, vector FROM paper_embeddings "
+            f"WHERE embedding_model = ? AND openalex_id IN ({marks})",
+            (model, *chunk),
+        ).fetchall()
+        vecs = {r[0]: r[1] for r in rows}
+        for p in papers:
+            blob = vecs.get(p.openalex_id)
+            if blob is not None and model not in (p.embeddings or {}):
+                p.embeddings[model] = [float(x) for x in decode_vector(blob)]
+                found += 1
+    return found
