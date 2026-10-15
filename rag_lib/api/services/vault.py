@@ -189,6 +189,10 @@ def upload(
             status_code=422,
         ) from exc
     os.replace(part_path, pdf_path)
+    if record.title == part_path.stem:
+        # No title on the page: ingest_pdf fell back to the file's name,
+        # which here is the scratch name (".<hash>"), not the user's.
+        record.title = Path(filename).stem.strip() or "Untitled PDF"
     log.info("vault.upload.ingest_pdf", elapsed_ms=round((_time.monotonic() - t1) * 1000, 1))
 
     t2 = _time.monotonic()

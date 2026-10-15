@@ -242,6 +242,20 @@ def test_unreadable_pdf_is_rejected_and_not_kept(app, tmp_path, monkeypatch):
     assert not [p for p in (tmp_path / "vault").rglob("*") if p.is_file()]
 
 
+def test_a_pdf_without_a_title_is_named_after_the_uploaded_file(app, monkeypatch):
+    """ingest_pdf falls back to the file's stem, and the file it reads is the
+    scratch ``.<hash>.part``: a blank PDF was listed as ".cef3b030..."."""
+    from pathlib import Path
+
+    def _untitled(path):
+        p = Path(path)
+        return PdfIngestRecord(path=str(p), title=p.stem, body_text="", doi=None, n_pages=1)
+    monkeypatch.setattr(vault_service, "ingest_pdf", _untitled)
+    resp = _upload(app, b"untitled-bytes", filename="Lab scan 2024.pdf")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == "Lab scan 2024"
+
+
 def test_upload_size_limit(app, monkeypatch):
     monkeypatch.setenv("RADAR_UPLOAD_MAX_MB", "1")
     settings_module.get_settings.cache_clear()
