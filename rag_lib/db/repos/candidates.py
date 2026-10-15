@@ -346,8 +346,14 @@ def top_for_profile(
     below: bool = False,
     sim_at_least: float | None = None,
     sim_below: float | None = None,
+    triaged: bool | None = None,
 ) -> list[sqlite3.Row]:
     """Top-N candidates for the daily radar (no shown/dismissed filter).
+
+    ``triaged`` False keeps only papers neither saved nor dismissed, True
+    only the ones that are, None both. The feed asks for the two apart: a
+    triaged paper used to hold its place in an interest's share, so once
+    the top share was triaged the feed showed nothing new.
 
     ``sim_at_least`` / ``sim_below`` narrow on the raw cosine, so a feed
     bucket ("Like your seeds" is at least the least typical seed) is
@@ -388,11 +394,12 @@ def top_for_profile(
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
           AND (? IS NULL OR pc.score_raw >= ?)
           AND (? IS NULL OR pc.score_raw IS NULL OR pc.score_raw < ?)
+          AND (? IS NULL OR (pc.saved_at IS NOT NULL OR pc.dismissed_at IS NOT NULL) = ?)
         ORDER BY {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
         LIMIT ?
         """,
         (profile_id, year_from, year_from, sim_at_least, sim_at_least,
-         sim_below, sim_below, limit),
+         sim_below, sim_below, triaged, None if triaged is None else int(triaged), limit),
     ).fetchall()
 
 

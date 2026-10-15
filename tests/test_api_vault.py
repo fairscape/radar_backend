@@ -413,3 +413,26 @@ def test_a_doi_from_the_references_is_not_the_paper():
     mine = _rec("My own paper", body)
     assert not vault_service._verified_doi_match(mine, cited)
     assert vault_service._verified_doi_match(_rec("Some cited method", "x"), cited)
+
+
+def test_a_retry_embeds_an_upload_that_failed_at_embedding(app, tmp_path, monkeypatch):
+    """The rows are written before the embedder runs; with it down the upload
+    500'd, and every retry was a 'duplicate' that never embedded the paper."""
+    from rag_lib.db import connect as _connect
+
+    real = vault_service.get_embedder
+
+    def down(model):
+        raise ConnectionError("ollama down")
+    monkeypatch.setattr(vault_service, "get_embedder", down)
+    try:
+        _upload(app, b"retry-bytes")
+    except Exception:  # noqa: BLE001 -- the ASGI transport re-raises the 500
+        pass
+    monkeypatch.setattr(vault_service, "get_embedder", real)
+    resp = _upload(app, b"retry-bytes")
+    assert resp.status_code == 200 and resp.json()["duplicate"] is True
+    conn = _connect(tmp_path / "radar.db")
+    n = conn.execute("SELECT COUNT(*) FROM paper_embeddings WHERE openalex_id = ?", (resp.json()["id"],)).fetchone()[0]
+    conn.close()
+    assert n == 1

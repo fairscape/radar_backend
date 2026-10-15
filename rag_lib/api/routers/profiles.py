@@ -362,6 +362,10 @@ def draft_dry_run(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
     profile_id = int(profile_row["id"])
+    if gather_runs_repo.has_unfinished_import(db, profile_id):
+        # The trial would score against part of the seeds.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"an import is still filling draft '{slug}'")
     if body.selected_topic_ids is not None:
         try:
             wizard_service.save_topics(db, user_id=int(user["id"]), slug=slug,
@@ -683,6 +687,11 @@ def commit_draft(
             _row = _profiles_repo.get_by_slug(db, int(user["id"]), body.slug)
             if _row is not None:
                 _profiles_repo.update_year_range(db, int(_row["id"]), body.years.year_from, body.years.year_to)
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'; save once it has finished",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -1496,7 +1505,9 @@ def reranker_comparison(
     return RerankerComparisonResponse(
         ok=True,
         key=key,
-        n=len(candidates),
+        # Every reranked paper, not the ``limit`` listed: the ranks shown run
+        # over all of them (a row can read 312), and the page says so.
+        n=len(all_rows),
         candidates=candidates,
         avg_rank_change=round(avg_change, 2),
         max_rank_up=max_up,

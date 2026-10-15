@@ -188,17 +188,16 @@ def compute_draft_coherence(
     profile_id = int(row["id"])
     embedding_model = row["embedding_model"]
 
+    # An import attaches its seeds one at a time, so mid-import the draft
+    # holds part of them: coherence (and from it topics, the trial and the
+    # fit at commit) would describe a set the user never chose. With none
+    # attached yet it also looked like a draft with no seeds at all, which
+    # invited adding 82 papers by hand while they were being embedded.
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
     ids, vecs = _seed_embeddings_with_ids(conn, profile_id, embedding_model)
     bins = profiles_repo.coherence_bins(conn, profile_id)
     if not vecs:
-        # No seeds has two causes that look identical here and must not read
-        # the same to the user: nothing was ever attached, or an import is
-        # still resolving and embedding (it writes profile_seeds at the end,
-        # so a draft mid-import is byte-for-byte an empty one). Saying "no
-        # seed papers yet" while 82 are being embedded invites the user to
-        # start adding them by hand.
-        if gather_runs_repo.has_unfinished_import(conn, profile_id):
-            raise ImportInProgress(slug)
         conn.execute(
             """
             UPDATE profiles SET
@@ -702,6 +701,10 @@ def commit_draft(
     """
     row = _require_draft(conn, user_id, slug)
     profile_id = int(row["id"])
+    # Committing mid-import fitted the interest on the seeds attached so far;
+    # the rest arrived on a live interest that nothing re-fitted.
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
 
     full_topics = profiles_repo.topic_filters(conn, profile_id)
     # As save_topics: with every topic off, each scan gathers nothing.

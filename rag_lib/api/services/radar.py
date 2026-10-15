@@ -154,7 +154,7 @@ def daily(
 
     states: dict[str, CardState | None] = {}
     profile_ids: list[int] = []
-    per_profile: list[tuple[int, list[Card]]] = []
+    per_profile: list[tuple[int, list[Card], list[Card]]] = []
 
     for prow in profile_rows:
         pid = int(prow["id"])
@@ -172,37 +172,46 @@ def daily(
         except (IndexError, KeyError):
             seed_sim_min = None
         band = float(seed_sim_min) if seed_sim_min is not None and threshold is not None else None
-        rows = candidates_repo.top_for_profile(
-            conn, pid, limit=_DAILY_LIMIT, year_from=year_from, below=bucket == "low",
-            sim_at_least=band if bucket == "high" else None,
-            sim_below=band if bucket == "medium" else None,
-        )
-        mine: list[Card] = []
-        for crow in rows:
-            card = candidate_row_to_card(
-                crow, profile_slug=slug, active_topic_ids=active,
-                threshold=float(threshold) if threshold is not None else None,
-                seed_sim_min=float(seed_sim_min) if seed_sim_min is not None else None,
+
+        def cards_for(triaged: bool) -> list[Card]:
+            rows = candidates_repo.top_for_profile(
+                conn, pid, limit=_DAILY_LIMIT, year_from=year_from, below=bucket == "low",
+                sim_at_least=band if bucket == "high" else None,
+                sim_below=band if bucket == "medium" else None,
+                triaged=triaged,
             )
-            # Filter on the card's own bucket rather than recomputing it.
-            # Two copies of this rule had already drifted apart once.
-            if bucket is not None and card.bucket != bucket:
-                continue
-            card.state = (
-                "saved" if crow["saved_at"] else
-                "dismissed" if crow["dismissed_at"] else None
-            )
-            mine.append(card)
-        per_profile.append((pid, mine))
+            out: list[Card] = []
+            for crow in rows:
+                card = candidate_row_to_card(
+                    crow, profile_slug=slug, active_topic_ids=active,
+                    threshold=float(threshold) if threshold is not None else None,
+                    seed_sim_min=float(seed_sim_min) if seed_sim_min is not None else None,
+                )
+                # Filter on the card's own bucket rather than recomputing it.
+                # Two copies of this rule had already drifted apart once.
+                if bucket is not None and card.bucket != bucket:
+                    continue
+                card.state = (
+                    "saved" if crow["saved_at"] else
+                    "dismissed" if crow["dismissed_at"] else None
+                )
+                out.append(card)
+            return out
+
+        # Papers still to look at and papers already saved or dismissed are
+        # shared out separately: the feed hides the second kind by default,
+        # and when they shared one budget they crowded the first out.
+        per_profile.append((pid, cards_for(False), cards_for(True)))
 
     cards: list[Card] = []
-    shares = fair_shares([len(c) for _, c in per_profile], _DAILY_LIMIT)
-    for (pid, mine), share in zip(per_profile, shares):
-        kept = mine[:share]
+    fresh_shares = fair_shares([len(f) for _, f, _ in per_profile], _DAILY_LIMIT)
+    done_shares = fair_shares([len(d) for _, _, d in per_profile], _DAILY_LIMIT)
+    for (pid, fresh, done), n_fresh, n_done in zip(per_profile, fresh_shares, done_shares):
+        kept = fresh[:n_fresh]
         cards.extend(kept)
-        for card in kept:
-            if card.state is not None:
-                states[card.id] = card.state
+        for card in done[:n_done]:
+            cards.append(card)
+            states[card.id] = card.state
         # Stamp shown_at for the cards we're returning from this profile.
         # Held open deliberately: one commit for all profiles, below.
         if kept:
@@ -210,8 +219,12 @@ def daily(
 
     conn.commit()
 
-    cards.sort(key=lambda c: c.score, reverse=True)
-    cards = cards[:_DAILY_LIMIT]
+    # Below the bar, closest to it first: ``score`` there is a rank from the
+    # paper's own scan, not its similarity to the seeds now.
+    if bucket == "low":
+        cards.sort(key=lambda c: c.similarity if c.similarity is not None else -1.0, reverse=True)
+    else:
+        cards.sort(key=lambda c: c.score, reverse=True)
 
     fetched_at, scored = _last_run_metrics(conn, profile_ids)
     fetch_ms = int(round((time.perf_counter() - t0) * 1000))

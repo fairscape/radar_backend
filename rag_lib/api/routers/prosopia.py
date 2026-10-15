@@ -105,6 +105,7 @@ def import_prosopia(
     needs the run row, not an exception.
     """
     from ...scheduler.jobs import import_prosopia_profile
+    from ..services import orcid as orcid_service
     from ..services import prosopia as prosopia_service
     from ...db.repos import gather_runs as gather_runs_repo
 
@@ -123,6 +124,16 @@ def import_prosopia(
         )
     except prosopia_service.DraftNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except orcid_service.ImportAlreadyRunning as exc:
+        # As the ORCID route: the run already filling this draft, or a 409.
+        if exc.slug is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This researcher's papers are still being imported. Try again when that finishes.",
+            ) from exc
+        log.info("prosopia.import_already_running",
+                 user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
+        return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id, already_running=True)
     except prosopia_service.PapersNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),

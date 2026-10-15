@@ -67,6 +67,24 @@ class WorksNotFound(LookupError):
     """None of the requested works belong to this ORCID."""
 
 
+def refuse_if_importing(conn: sqlite3.Connection, user_id: int, orcid: str | None, into: str | None) -> None:
+    """Raise ``ImportAlreadyRunning`` when this person is already being imported.
+
+    The running import is the answer only when it fills the same draft this
+    request would: a new draft for a new-draft request, or ``into``. Joining
+    it from "add more seeds" into another draft reported "Added N papers"
+    while nothing reached that draft; there ``slug`` is None, so the router
+    answers 409 (try again when it has finished).
+    """
+    if not orcid:
+        return
+    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=orcid)
+    if inflight is None:
+        return
+    same_target = inflight["slug"] is not None and (into is None or inflight["slug"] == into)
+    raise ImportAlreadyRunning(inflight["slug"] if same_target else None, int(inflight["run_id"]))
+
+
 class ImportAlreadyRunning(RuntimeError):
     """This user already has an unfinished import of this person.
 
@@ -435,9 +453,7 @@ def prepare_import(
     # re-embed the same papers on the same GPU and leave two half-built
     # drafts behind. Checked here rather than in the router so the CLI and
     # the test path get it too.
-    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=oid)
-    if inflight is not None:
-        raise ImportAlreadyRunning(inflight["slug"], int(inflight["run_id"]))
+    refuse_if_importing(conn, user_id, oid, into)
 
     client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
     # check_registry=False: records_for reads only id/title/doi/year/venue,

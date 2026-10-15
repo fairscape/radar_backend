@@ -158,6 +158,11 @@ def upload(
 
     existing = papers_repo.get_by_user_hash(conn, user_id, file_hash)
     if existing is not None:
+        # The rows are written before the paper is embedded, so an upload
+        # that failed there (embedder down: a 500) left a paper with no
+        # vector, and every retry was a "duplicate" that never embedded it
+        # -- a seed silently missing from the fit. A retry finishes the job.
+        _embed_if_missing(conn, existing, settings)
         if profile_slug:
             _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"])
         log.info(
@@ -459,6 +464,21 @@ def _attach_to_profile(
         wizard_service.refit_profile(conn, user_id=user_id, slug=profile_slug)
 
 
+def _embed_if_missing(conn: sqlite3.Connection, row: sqlite3.Row, settings: Any) -> None:
+    """Embed a stored paper that has no vector under the default model."""
+    model = settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    oa = row["openalex_id"]
+    if embeddings_repo.get(conn, oa, model) is not None:
+        return
+    paper = Paper(
+        doi=row["doi"], openalex_id=oa, title=row["title"] or "",
+        abstract=row["abstract"] or "", year=row["year"], venue=row["venue"],
+        body_text=row["body_text"],
+    )
+    embeddings_repo.upsert(conn, oa, model, get_embedder(model)(build_embedding_input(paper)))
+    log.info("vault.upload.embedded_on_retry", openalex_id=oa, model=model)
+
+
 def _enrich_via_openalex(
     record,
     *,
@@ -572,7 +592,19 @@ def title_rule(record: Any, work: dict) -> bool:
         return False
     if pdf == oa or _main_title(record.title) == oa or pdf == _main_title(_work_title(work)):
         return True
-    return _squash(_work_title(work)) in _squash((record.body_text or "")[:_FIRST_PAGE_CHARS])
+    return _squash(_work_title(work)) in _squash(_front_matter(record.body_text))
+
+
+_REFERENCES_HEADING = re.compile(r"\n\s*(?:\d+\.?\s*)?(?:references|bibliography|literature cited)\s*\n", re.IGNORECASE)
+
+
+def _front_matter(body: str | None) -> str:
+    """The first page's worth of text, stopping at a reference list: on a
+    short PDF the references start inside it, and a cited title found
+    there is not this paper's."""
+    head = (body or "")[:_FIRST_PAGE_CHARS]
+    m = _REFERENCES_HEADING.search(head)
+    return head[: m.start()] if m else head
 
 
 def _name_parts(name: str) -> tuple[str, str]:
@@ -634,6 +666,11 @@ def _verified_title_match(record: Any, works: list[dict] | None) -> dict | None:
 
 
 def _verified_doi_match(record: Any, work: dict) -> bool:
+    """A DOI the PDF prints as its own needs one more fact; one found only
+    further in the body may be a reference's, and a self-citation passes the
+    first-author check -- so that one must pass both rules, like a title hit."""
+    if getattr(record, "doi_from_body", False):
+        return title_rule(record, work) and author_rule(record, work)
     return title_rule(record, work) or author_rule(record, work, first_only=True)
 
 

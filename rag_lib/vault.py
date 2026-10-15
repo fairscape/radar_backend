@@ -64,6 +64,9 @@ class PdfIngestRecord:
     body_text: str                      # all extractable text, joined pages
     doi: str | None = None              # first DOI found in the text / metadata
     n_pages: int = 0
+    # The DOI was not on page 1 or in the metadata but further in the body,
+    # where it may be a reference's -- the matcher asks more of it then.
+    doi_from_body: bool = False
 
 
 def ingest_pdf(path: str | Path) -> PdfIngestRecord:
@@ -105,6 +108,7 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
     )
 
     doi = _extract_doi(first_page, body, meta)
+    front = _find_doi(first_page) or _doi_from_metadata(meta)
 
     return PdfIngestRecord(
         path=str(path),
@@ -112,6 +116,7 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
         body_text=body,
         doi=doi,
         n_pages=len(pages_text),
+        doi_from_body=doi is not None and front is None,
     )
 
 

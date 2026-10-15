@@ -196,8 +196,9 @@ def has_unfinished_import(conn: sqlite3.Connection, profile_id: int) -> bool:
     """Is an import still running for this draft?
 
     The wizard's later steps read ``profile_seeds``, which an import fills
-    at the end -- so mid-import a draft looks identical to an empty one.
-    Asking this is how the difference gets told.
+    one paper at a time -- so mid-import a draft holds part of its seeds
+    (or none, and looks like an empty one). Asking this is how the
+    difference gets told.
     """
     placeholders = ",".join("?" * len(IMPORT_TIERS))
     return conn.execute(

@@ -366,6 +366,7 @@ def test_committing_a_draft_with_daily_scans_on_registers_its_job_at_once(app, t
     import rag_lib.scheduler.runner as runner
 
     monkeypatch.setattr(schedules_repo, "DEFAULT_ENABLED", True)
+    monkeypatch.setenv("RADAR_NIGHTLY_GATHER_ENABLED", "true")
     registered: list[int] = []
     monkeypatch.setattr(runner, "register_gather_job",
                         lambda scheduler, **kw: registered.append(kw["profile_id"]) or True)

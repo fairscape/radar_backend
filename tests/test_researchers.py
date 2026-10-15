@@ -97,7 +97,8 @@ def test_prosopia_import_stores_the_person_and_their_papers(env):
     resp = _import(app, source="prosopia", ref="sheffield-nathan")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body) == {"researcher_id", "run_id"}
+    assert set(body) == {"researcher_id", "run_id", "already_running"}
+    assert body["already_running"] is False
 
     # No draft: a researcher import is not an interest.
     assert _count(env, "SELECT COUNT(*) FROM profiles") == 0

@@ -53,13 +53,17 @@ def _apply_python(conn: sqlite3.Connection, version: str, path: Path) -> None:
     fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     if no_fk:
         conn.execute("PRAGMA foreign_keys = OFF")
+    # Only violations the migration made count: an orphan row the DB already
+    # had (anywhere) used to abort it, and the backend would not boot.
+    before = {tuple(r) for r in conn.execute("PRAGMA foreign_key_check").fetchall()}
     try:
         conn.execute("BEGIN")
         module.migrate(conn)
-        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        bad = [tuple(r) for r in conn.execute("PRAGMA foreign_key_check").fetchall()
+               if tuple(r) not in before]
         if bad:
             raise sqlite3.IntegrityError(
-                f"{version}: foreign key check failed: {[tuple(r) for r in bad[:5]]}")
+                f"{version}: foreign key check failed: {bad[:5]}")
         conn.execute("INSERT INTO _migrations_applied (version) VALUES (?)", (version,))
         conn.execute("COMMIT")
     except BaseException:

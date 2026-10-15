@@ -15,6 +15,7 @@ against 0.50..0.95, and an un-save stayed counted as a save.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 
 from rag_lib.db.repos import profiles as profiles_repo
@@ -49,10 +50,11 @@ def recommend_threshold(
     """Return the F1-optimal threshold over the triaged papers, or ``None``.
 
     ``None`` when fewer than ``min_events`` papers are saved or dismissed,
-    or none is saved. The cut points tried are the triaged papers' own
+    or none is saved. The cut points tried are the saved papers' own
     cosines (a threshold between two of them scores the same as the
-    upper one), rounded to 3 decimals as the slider is. Ties pick the
-    *lower* threshold (more permissive).
+    upper one); the winner is rounded *down* to 3 decimals, as the slider
+    is, so it still keeps the save it was cut at. Ties pick the *lower*
+    threshold (more permissive).
     """
     saves, dismisses = triaged_scores(db, profile_id)
     if len(saves) + len(dismisses) < min_events or not saves:
@@ -61,7 +63,10 @@ def recommend_threshold(
 
     best_th: float | None = None
     best_score = -1.0
-    for th in sorted({round(s, 3) for s in saves}):
+    # Cut at the saves' exact scores, so every cut keeps at least one save.
+    # Cutting at round(s, 3) put the top save below its own cut whenever it
+    # rounded up (0.9126 -> 0.913): no save above it, and a division by zero.
+    for th in sorted(set(saves)):
         s_above = sum(1 for s in saves if s >= th)
         d_above = sum(1 for s in dismisses if s >= th)
         precision = s_above / (s_above + d_above)
@@ -71,7 +76,8 @@ def recommend_threshold(
         if f1 > best_score:
             best_score = f1
             best_th = th
-    return best_th
+    # Three decimals, as the slider; down, so the save it was cut at stays in.
+    return None if best_th is None else math.floor(best_th * 1000 + 1e-9) / 1000
 
 
 def apply_recommended(

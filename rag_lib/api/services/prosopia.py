@@ -297,6 +297,11 @@ def prepare_import(
     target = target_draft(conn, user_id, into)
     slug, profile = _resolve_profile(ref, base_url, prosopia_client)
     records = select_records(profile, slug, paper_ids)
+    # As the ORCID import: the same person already importing (under either
+    # source, by ORCID) is that run, not a second draft and a second job.
+    from . import orcid as orcid_service
+    rid = str(getattr(profile, "rid", "") or "").strip().upper()
+    orcid_service.refuse_if_importing(conn, user_id, rid if looks_like_orcid(rid) else None, into)
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL

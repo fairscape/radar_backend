@@ -328,9 +328,14 @@ apscheduler = pytest.importorskip("apscheduler")
 
 
 def test_runner_registers_one_job_per_enabled_schedule(
-    db_path, settings, profile_id
+    db_path, settings, profile_id, monkeypatch
 ):
+    from rag_lib.api.settings import get_settings
     from rag_lib.scheduler import build_scheduler, start, stop
+
+    # Nightly scans are off by default; this is the case where they are on.
+    monkeypatch.setenv("RADAR_NIGHTLY_GATHER_ENABLED", "true")
+    get_settings.cache_clear()
 
     # New rows are disabled (daily scans are off); this is the enabled case.
     conn = connect(db_path)

@@ -94,7 +94,7 @@ def import_researcher(
         )
     except researchers_service.ResearcherImportRunning as exc:
         # Already importing this person: the run to watch, not a second one.
-        return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id)
+        return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id, already_running=True)
     except (prosopia_service.PapersNotFound, orcid_service.WorksNotFound) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except prosopia_service.ProfileNotFound as exc:

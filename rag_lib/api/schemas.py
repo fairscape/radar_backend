@@ -831,6 +831,9 @@ class ResearcherImportStart(_Model):
 
     researcher_id: int
     run_id: int
+    # This person was already being imported: run_id is that run, and the
+    # papers asked for in this request were not added to it.
+    already_running: bool = False
 
 
 class ResearcherInterestRequest(_Model):
