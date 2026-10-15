@@ -213,7 +213,8 @@ def has_unfinished_import(conn: sqlite3.Connection, profile_id: int) -> bool:
 
 
 def find_inflight_import(
-    conn: sqlite3.Connection, user_id: int, *, orcid: str,
+    conn: sqlite3.Connection, user_id: int, *, orcid: str | None = None,
+    researcher_id: int | None = None,
 ) -> sqlite3.Row | None:
     """An import of this person already in flight for this user, or None.
 
@@ -231,23 +232,30 @@ def find_inflight_import(
     and from the run itself when there is not.
 
     ``slug`` is NULL for a researcher import; a caller that wants to point
-    the user somewhere must handle that.
+    the user somewhere must handle that. ``draft_researcher_id`` says who
+    the draft was opened for (NULL: an upload draft, or no draft).
+
+    ``researcher_id`` finds the same person by their row, for a Prosopia
+    profile that has no ORCID.
     """
+    if not orcid and researcher_id is None:
+        return None
     placeholders = ",".join("?" * len(IMPORT_TIERS))
     return conn.execute(
         f"""
-        SELECT p.slug AS slug, g.id AS run_id, g.tier_used AS tier_used
+        SELECT p.slug AS slug, g.id AS run_id, g.tier_used AS tier_used,
+               g.researcher_id AS researcher_id, p.researcher_id AS draft_researcher_id
           FROM gather_runs g
           JOIN researchers r ON r.id = g.researcher_id
           LEFT JOIN profiles p ON p.id = g.profile_id
-         WHERE r.orcid = ?
+         WHERE ((? IS NOT NULL AND r.orcid = ?) OR (? IS NOT NULL AND r.id = ?))
            AND (p.user_id = ? OR (p.id IS NULL AND g.user_id = ?))
            AND g.tier_used IN ({placeholders})
            AND {_INFLIGHT_PREDICATE}
          ORDER BY g.id DESC
          LIMIT 1
         """,
-        (orcid, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
+        (orcid, orcid, researcher_id, researcher_id, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
     ).fetchone()
 
 

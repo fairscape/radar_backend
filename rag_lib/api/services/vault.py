@@ -509,8 +509,15 @@ def _enrich_via_openalex(
                 log.info("vault.upload.doi_rejected", doi=record.doi,
                          work_title=(work.get("title") or "")[:120])
                 work = None
+                # It is some other paper's DOI, so it must not stay on this
+                # one: seeds are matched by DOI, and the local paper then
+                # kept the cited paper (often the most relevant) out of the
+                # feed as if it were a seed itself.
+                paper_dict["doi"] = None
         if work is None and record.title:
             work = _verified_title_match(record, client.search_by_title(record.title))
+        if work is None and getattr(record, "doi_from_body", False):
+            paper_dict["doi"] = None     # not vouched for by anything: likely a reference's
         if work is not None:
             paper = client.paper_from_work(work, source="user_pdf")
             paper_dict["openalex_id"] = paper.openalex_id

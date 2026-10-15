@@ -305,6 +305,11 @@ def draft_topics(
         topic_filters = wizard_service.aggregate_draft_topics(
             db, user_id=int(user["id"]), slug=slug,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -513,9 +518,15 @@ def delete_draft(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> dict:
-    deleted = wizard_service.delete_draft(
-        db, user_id=int(user["id"]), slug=slug,
-    )
+    try:
+        deleted = wizard_service.delete_draft(
+            db, user_id=int(user["id"]), slug=slug,
+        )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'; delete it once that finishes",
+        ) from exc
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -803,6 +814,11 @@ def recompute_coherence(
         return wizard_service.compute_draft_coherence(
             db, user_id=int(user["id"]), slug=key,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
@@ -977,6 +993,11 @@ def recompute_topics(
         topic_filters = wizard_service.aggregate_draft_topics(
             db, user_id=int(user["id"]), slug=key,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),

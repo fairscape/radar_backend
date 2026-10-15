@@ -300,8 +300,13 @@ def prepare_import(
     # As the ORCID import: the same person already importing (under either
     # source, by ORCID) is that run, not a second draft and a second job.
     from . import orcid as orcid_service
+    from ...db.repos import researchers as researchers_repo
     rid = str(getattr(profile, "rid", "") or "").strip().upper()
-    orcid_service.refuse_if_importing(conn, user_id, rid if looks_like_orcid(rid) else None, into)
+    known = researchers_repo.get_by_key(conn, user_id, "prosopia", slug)
+    orcid_service.refuse_if_importing(
+        conn, user_id, rid if looks_like_orcid(rid) else None, into,
+        researcher_id=int(known["id"]) if known is not None else None,
+    )
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL

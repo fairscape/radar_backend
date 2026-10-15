@@ -109,57 +109,58 @@ def import_prosopia(
     from ..services import prosopia as prosopia_service
     from ...db.repos import gather_runs as gather_runs_repo
 
-    try:
-        plan = prosopia_service.prepare_import(
-            db,
-            settings,
-            user_id=int(user["id"]),
-            ref=body.ref,
-            base_url=body.base_url or settings.RADAR_PROSOPIA_BASE_URL,
-            name=body.name,
-            embedding_model=body.embedding_model,
-            prosopia_client=prosopia_client,
-            paper_ids=body.paper_ids,
-            into=body.into,
-        )
-    except prosopia_service.DraftNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except orcid_service.ImportAlreadyRunning as exc:
-        # As the ORCID route: the run already filling this draft, or a 409.
-        if exc.slug is None:
+    with orcid_service.import_start_lock(int(user["id"])):
+        try:
+            plan = prosopia_service.prepare_import(
+                db,
+                settings,
+                user_id=int(user["id"]),
+                ref=body.ref,
+                base_url=body.base_url or settings.RADAR_PROSOPIA_BASE_URL,
+                name=body.name,
+                embedding_model=body.embedding_model,
+                prosopia_client=prosopia_client,
+                paper_ids=body.paper_ids,
+                into=body.into,
+            )
+        except prosopia_service.DraftNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except orcid_service.ImportAlreadyRunning as exc:
+            # As the ORCID route: the run already filling this draft, or a 409.
+            if exc.slug is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This researcher's papers are still being imported. Try again when that finishes.",
+                ) from exc
+            log.info("prosopia.import_already_running",
+                     user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
+            return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id, already_running=True)
+        except prosopia_service.PapersNotFound as exc:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This researcher's papers are still being imported. Try again when that finishes.",
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
             ) from exc
-        log.info("prosopia.import_already_running",
-                 user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
-        return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id, already_running=True)
-    except prosopia_service.PapersNotFound as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
-        ) from exc
-    except prosopia_service.ProfileNotFound as exc:
-        # The client's own message is more specific when it names the
-        # ref (an ORCID nobody published under); otherwise say which
-        # slug was asked for, since a bare "not found" helps nobody.
-        message = str(exc)
-        if body.ref.strip().lower() not in message.lower():
-            message = f"prosopia profile '{body.ref}' not found"
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=message,
-        ) from exc
-    except prosopia_service.ProsopiaError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
-        ) from exc
+        except prosopia_service.ProfileNotFound as exc:
+            # The client's own message is more specific when it names the
+            # ref (an ORCID nobody published under); otherwise say which
+            # slug was asked for, since a bare "not found" helps nobody.
+            message = str(exc)
+            if body.ref.strip().lower() not in message.lower():
+                message = f"prosopia profile '{body.ref}' not found"
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=message,
+            ) from exc
+        except prosopia_service.ProsopiaError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+            ) from exc
 
-    return launch_import(request, db, settings, plan, user_id=int(user["id"]),
-                         tier=TIER, openalex_client=openalex_client)
+        return launch_import(request, db, settings, plan, user_id=int(user["id"]),
+                             tier=TIER, openalex_client=openalex_client)
 
 
 def launch_import(
@@ -316,51 +317,52 @@ def import_orcid(
     from ..services import orcid as orcid_service
     from ..services import prosopia as prosopia_service
 
-    try:
-        plan = orcid_service.prepare_import(
-            db,
-            settings,
-            user_id=int(user["id"]),
-            orcid=body.orcid,
-            openalex_ids=body.openalex_ids,
-            name=body.name,
-            embedding_model=body.embedding_model,
-            openalex_client=openalex_client,
-            into=body.into,
-        )
-    except prosopia_service.DraftNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except orcid_service.ImportAlreadyRunning as exc:
-        if exc.slug is None:
-            # The run is a researcher import (no draft to hand back): the
-            # wizard used to get an empty draft slug and lose its picks.
+    with orcid_service.import_start_lock(int(user["id"])):
+        try:
+            plan = orcid_service.prepare_import(
+                db,
+                settings,
+                user_id=int(user["id"]),
+                orcid=body.orcid,
+                openalex_ids=body.openalex_ids,
+                name=body.name,
+                embedding_model=body.embedding_model,
+                openalex_client=openalex_client,
+                into=body.into,
+            )
+        except prosopia_service.DraftNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except orcid_service.ImportAlreadyRunning as exc:
+            if exc.slug is None:
+                # The run is a researcher import (no draft to hand back): the
+                # wizard used to get an empty draft slug and lose its picks.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This researcher's papers are still being imported. Try again when that finishes.",
+                ) from exc
+            # Not an error: the user asked for an import that is already
+            # running, so hand back the run they can poll instead of starting
+            # a duplicate. Same response shape, so the client polls as usual.
+            log.info("orcid.import_already_running",
+                     user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
+            return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id,
+                                       already_running=True)
+        except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This researcher's papers are still being imported. Try again when that finishes.",
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
             ) from exc
-        # Not an error: the user asked for an import that is already
-        # running, so hand back the run they can poll instead of starting
-        # a duplicate. Same response shape, so the client polls as usual.
-        log.info("orcid.import_already_running",
-                 user_id=int(user["id"]), draft_slug=exc.slug, run_id=exc.run_id)
-        return ProsopiaImportStart(draft_slug=exc.slug, run_id=exc.run_id,
-                                   already_running=True)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
-        ) from exc
-    except orcid_service.WorksNotFound as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {public_error(exc)}",
-        ) from exc
+        except orcid_service.WorksNotFound as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"could not read works for ORCID '{body.orcid}' from OpenAlex: {public_error(exc)}",
+            ) from exc
 
-    return launch_import(request, db, settings, plan, user_id=int(user["id"]),
-                         tier=TIER_ORCID, openalex_client=openalex_client)
+        return launch_import(request, db, settings, plan, user_id=int(user["id"]),
+                             tier=TIER_ORCID, openalex_client=openalex_client)
 
 
 @router.get("/prosopia/works", response_model=ProsopiaWorksResponse)

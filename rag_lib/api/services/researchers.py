@@ -112,8 +112,10 @@ def record_prosopia_researcher(
     base_url: str | None,
 ) -> int:
     """Upsert the person behind a Prosopia profile; returns the row id."""
-    rid = str(_read(profile, "rid", "") or "")
-    orcid = rid if rid and not rid.lower().startswith("local:") else None
+    rid = str(_read(profile, "rid", "") or "").strip()
+    # Upper-cased as the ORCID import stores it: the in-flight check and
+    # the dedup of one person under both sources compare this column.
+    orcid = rid.upper() if rid and not rid.lower().startswith("local:") else None
     metadata = _read(profile, "metadata")
     url = getattr(metadata, "url", None) if metadata is not None else None
     expertise = _read(profile, "expertise", "") or None
@@ -421,6 +423,11 @@ def delete_researcher(
     so those papers stay in the vault); it just no longer points back.
     Their other papers leave the vault with them."""
     _require(conn, user_id, researcher_id)
+    # The import's run row hangs off the researcher: forgetting them mid-
+    # import deleted it, the job then wrote to nothing, and the draft it was
+    # filling lost its "still importing" state and could be committed half
+    # done.
+    _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
     researchers_repo.delete(conn, researcher_id)
 
 

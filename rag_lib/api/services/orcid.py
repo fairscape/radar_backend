@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,22 +68,49 @@ class WorksNotFound(LookupError):
     """None of the requested works belong to this ORCID."""
 
 
-def refuse_if_importing(conn: sqlite3.Connection, user_id: int, orcid: str | None, into: str | None) -> None:
+def refuse_if_importing(
+    conn: sqlite3.Connection, user_id: int, orcid: str | None, into: str | None,
+    *, researcher_id: int | None = None,
+) -> None:
     """Raise ``ImportAlreadyRunning`` when this person is already being imported.
 
     The running import is the answer only when it fills the same draft this
-    request would: a new draft for a new-draft request, or ``into``. Joining
-    it from "add more seeds" into another draft reported "Added N papers"
-    while nothing reached that draft; there ``slug`` is None, so the router
-    answers 409 (try again when it has finished).
+    request would: ``into``, or for a new-draft request a draft that run
+    opened for this person (one whose ``researcher_id`` is theirs). Any
+    other run -- "add more seeds" into some other draft, a researcher
+    import with no draft -- is handed back with ``slug`` None, so the
+    router answers 409 (try again when it has finished). Joining those
+    reported "Added N papers" to a draft nothing reached, or adopted the
+    other draft as the new interest.
+
+    ``researcher_id`` finds the person without an ORCID (a Prosopia profile
+    with no rid).
     """
-    if not orcid:
-        return
-    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=orcid)
+    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=orcid, researcher_id=researcher_id)
     if inflight is None:
         return
-    same_target = inflight["slug"] is not None and (into is None or inflight["slug"] == into)
-    raise ImportAlreadyRunning(inflight["slug"] if same_target else None, int(inflight["run_id"]))
+    slug = inflight["slug"]
+    if into is not None:
+        same_target = slug == into
+    else:
+        same_target = slug is not None and inflight["draft_researcher_id"] == inflight["researcher_id"]
+    raise ImportAlreadyRunning(slug if same_target else None, int(inflight["run_id"]))
+
+
+_start_locks: dict[int, threading.Lock] = {}
+_start_locks_guard = threading.Lock()
+
+
+def import_start_lock(user_id: int) -> threading.Lock:
+    """Held from the in-flight check to the run row's insert, per user.
+
+    The check reads ``gather_runs`` and the row is written after the
+    profile has been read (seconds, for Prosopia), so two identical
+    requests at once -- a double click -- both passed it and opened two
+    drafts and two jobs.
+    """
+    with _start_locks_guard:
+        return _start_locks.setdefault(int(user_id), threading.Lock())
 
 
 class ImportAlreadyRunning(RuntimeError):

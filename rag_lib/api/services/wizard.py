@@ -311,6 +311,9 @@ def aggregate_draft_topics(
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
+    # Part of the seeds would give part of the topics (step 3 by Back/Forward).
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
     # Topics we've never seen start on.
     topic_filters = _aggregate_topics(conn, profile_id, new_on=True)
 
@@ -758,6 +761,10 @@ def delete_draft(
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None or not row["is_draft"]:
         return False
+    # Deleting cascades the import's run row: the job then failed on its
+    # next seed and the researcher kept a partial paper list.
+    if gather_runs_repo.has_unfinished_import(conn, int(row["id"])):
+        raise ImportInProgress(slug)
     profiles_repo.delete(conn, int(row["id"]))
     return True
 

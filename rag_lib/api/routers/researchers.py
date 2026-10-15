@@ -79,46 +79,49 @@ def import_researcher(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"source must be one of {', '.join(researchers_service.SOURCES)}",
         )
-    try:
-        plan = researchers_service.prepare_researcher_import(
-            db,
-            settings,
-            user_id=int(user["id"]),
-            source=source,
-            ref=body.ref,
-            base_url=body.base_url or settings.RADAR_PROSOPIA_BASE_URL,
-            paper_ids=body.paper_ids,
-            embedding_model=body.embedding_model,
-            prosopia_client=prosopia_client,
-            openalex_client=openalex_client,
-        )
-    except researchers_service.ResearcherImportRunning as exc:
-        # Already importing this person: the run to watch, not a second one.
-        return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id, already_running=True)
-    except (prosopia_service.PapersNotFound, orcid_service.WorksNotFound) as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except prosopia_service.ProfileNotFound as exc:
-        message = str(exc)
-        if body.ref.strip().lower() not in message.lower():
-            message = f"prosopia profile '{body.ref}' not found"
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message) from exc
-    except prosopia_service.ProsopiaError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read works for '{body.ref}': {public_error(exc)}",
-        ) from exc
+    from ..services import orcid as orcid_service
 
-    start = launch_import(
-        request, db, settings, plan, user_id=int(user["id"]),
-        tier=TIER, openalex_client=openalex_client,
-    )
+    with orcid_service.import_start_lock(int(user["id"])):
+        try:
+            plan = researchers_service.prepare_researcher_import(
+                db,
+                settings,
+                user_id=int(user["id"]),
+                source=source,
+                ref=body.ref,
+                base_url=body.base_url or settings.RADAR_PROSOPIA_BASE_URL,
+                paper_ids=body.paper_ids,
+                embedding_model=body.embedding_model,
+                prosopia_client=prosopia_client,
+                openalex_client=openalex_client,
+            )
+        except researchers_service.ResearcherImportRunning as exc:
+            # Already importing this person: the run to watch, not a second one.
+            return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id, already_running=True)
+        except (prosopia_service.PapersNotFound, orcid_service.WorksNotFound) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except prosopia_service.ProfileNotFound as exc:
+            message = str(exc)
+            if body.ref.strip().lower() not in message.lower():
+                message = f"prosopia profile '{body.ref}' not found"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message) from exc
+        except prosopia_service.ProsopiaError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"could not read works for '{body.ref}': {public_error(exc)}",
+            ) from exc
+
+        start = launch_import(
+            request, db, settings, plan, user_id=int(user["id"]),
+            tier=TIER, openalex_client=openalex_client,
+        )
     assert plan.researcher_id is not None
     return ResearcherImportStart(researcher_id=plan.researcher_id, run_id=start.run_id)
 
@@ -221,6 +224,11 @@ def delete_researcher(
         researchers_service.delete_researcher(db, int(user["id"]), researcher_id)
     except researchers_service.ResearcherNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except researchers_service.ResearcherImportRunning as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This researcher's papers are still being imported. Forget them once that finishes.",
+        ) from exc
     return {"ok": True}
 
 
