@@ -134,7 +134,7 @@ def test_migration_backfills_schedule_for_existing_profile(db_path, profile_id):
         row = schedules_repo.upsert(conn, profile_id=profile_id)
         assert row["cron"] == "0 4 * * *"
         assert row["tz"] == "UTC"
-        assert row["enabled"] == 1
+        assert row["enabled"] == 0   # daily scans are off by default
     finally:
         conn.close()
 
@@ -332,7 +332,12 @@ def test_runner_registers_one_job_per_enabled_schedule(
 ):
     from rag_lib.scheduler import build_scheduler, start, stop
 
-    # Schedule was backfilled by migration 0004 for the seeded profile.
+    # New rows are disabled (daily scans are off); this is the enabled case.
+    conn = connect(db_path)
+    try:
+        schedules_repo.upsert(conn, profile_id=profile_id, enabled=True)
+    finally:
+        conn.close()
     scheduler = build_scheduler(settings)
     try:
         start(scheduler, settings)
@@ -934,3 +939,28 @@ def test_a_scan_that_overlapped_a_seed_change_rescores_against_the_new_seeds(
     _patch_dependencies(monkeypatch, [_candidate_paper("W801")])
     scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
     assert calls == []
+
+
+def test_nightly_gathers_can_be_paused_for_the_whole_server(monkeypatch):
+    """RADAR_NIGHTLY_GATHER_ENABLED=false registers no nightly job, from any
+    path (boot, commit, schedule edit), and leaves the scheduler itself on."""
+    from rag_lib.api.settings import get_settings
+    from rag_lib.scheduler.runner import register_gather_job
+
+    added = []
+
+    class Jobs:
+        def add_job(self, *a, **k):
+            added.append(k["id"])
+
+    monkeypatch.setenv("RADAR_NIGHTLY_GATHER_ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        assert register_gather_job(Jobs(), user_id=1, profile_id=7, cron="0 4 * * *", tz="UTC")
+        assert added == []
+        monkeypatch.setenv("RADAR_NIGHTLY_GATHER_ENABLED", "true")
+        get_settings.cache_clear()
+        register_gather_job(Jobs(), user_id=1, profile_id=7, cron="0 4 * * *", tz="UTC")
+        assert added == ["gather:7"]
+    finally:
+        get_settings.cache_clear()

@@ -13,6 +13,9 @@ import sqlite3
 
 DEFAULT_CRON = "0 4 * * *"
 DEFAULT_TZ = "UTC"
+# Daily scans are switched off (2026-10-15): a new interest gets its row
+# disabled, and only an explicit ``enabled=True`` turns one on.
+DEFAULT_ENABLED = False
 
 
 def list_enabled(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -72,7 +75,7 @@ def upsert(
                 profile_id,
                 cron or DEFAULT_CRON,
                 tz or DEFAULT_TZ,
-                1 if (enabled is None or enabled) else 0,
+                1 if (DEFAULT_ENABLED if enabled is None else enabled) else 0,
             ),
         )
     else:

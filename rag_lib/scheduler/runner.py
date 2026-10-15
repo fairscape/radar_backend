@@ -73,10 +73,17 @@ def register_gather_job(
     """
     from apscheduler.triggers.cron import CronTrigger
 
+    from ..api.settings import get_settings
+
     problem = valid_cron(cron, tz)
     if problem is not None:
         log.error("scheduler.invalid_cron", profile_id=profile_id, cron=cron, tz=tz, error=problem)
         return False
+    if not get_settings().RADAR_NIGHTLY_GATHER_ENABLED:
+        # Paused for the whole server; the row stays enabled, so turning
+        # the setting back on and restarting brings every job back.
+        log.info("scheduler.nightly_paused", profile_id=profile_id, slug=slug)
+        return True
     scheduler.add_job(
         gather_for_profile,
         trigger=CronTrigger.from_crontab(cron, timezone=tz or "UTC"),

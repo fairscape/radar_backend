@@ -336,11 +336,36 @@ def test_a_feed_paper_attached_to_a_draft_is_embedded_at_once(app, tmp_path):
     conn.close()
 
 
-def test_committing_a_draft_registers_its_gather_job_at_once(app, tmp_path, monkeypatch):
-    """The schedule row used to be written and the job left for 'the next
-    scheduler boot', so a new interest had no nightly scan until a restart."""
+def test_committing_a_draft_registers_no_daily_scan(app, tmp_path, monkeypatch):
+    """Daily scans are off: a committed interest gets a disabled schedule
+    row and no job. (Turned back on, its job registers at commit, not at
+    the next boot -- see the enabled case below.)"""
     import rag_lib.scheduler.runner as runner
 
+    registered: list[int] = []
+    monkeypatch.setattr(runner, "register_gather_job",
+                        lambda scheduler, **kw: registered.append(kw["profile_id"]) or True)
+    slug = _request(app, "POST", "/api/profiles/draft",
+                    json={"name": "to commit", "embedding_model": "placeholder-v1"}).json()["slug"]
+    _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": ["W2000002", "W2000003"]})
+    resp = _request(app, "POST", "/api/profiles",
+                    json={"slug": slug, "threshold": 0.5, "selected_topic_ids": []})
+    assert resp.status_code == 200, resp.text
+    conn = connect(tmp_path / "radar.db")
+    pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]
+    enabled = conn.execute("SELECT enabled FROM profile_schedules WHERE profile_id = ?", (pid,)).fetchone()[0]
+    conn.close()
+    assert enabled == 0
+    assert registered == []
+
+
+def test_committing_a_draft_with_daily_scans_on_registers_its_job_at_once(app, tmp_path, monkeypatch):
+    """The schedule row used to be written and the job left for 'the next
+    scheduler boot', so a new interest had no nightly scan until a restart."""
+    import rag_lib.db.repos.schedules as schedules_repo
+    import rag_lib.scheduler.runner as runner
+
+    monkeypatch.setattr(schedules_repo, "DEFAULT_ENABLED", True)
     registered: list[int] = []
     monkeypatch.setattr(runner, "register_gather_job",
                         lambda scheduler, **kw: registered.append(kw["profile_id"]) or True)

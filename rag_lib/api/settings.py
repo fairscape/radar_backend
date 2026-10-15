@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     RADAR_LOG_FILE_MAX_BYTES: int = 10_000_000
     RADAR_LOG_FILE_BACKUP_COUNT: int = 5
     RADAR_SCHEDULER_ENABLED: bool = True
+    # The nightly per-interest scans (profile_schedules). Off leaves the
+    # scheduler running for scans, imports and sweeps someone starts, and
+    # keeps every schedule row as it is for when this is turned back on.
+    RADAR_NIGHTLY_GATHER_ENABLED: bool = True
     RADAR_HOST: str = "127.0.0.1"
     RADAR_PORT: int = 8000
     # Phase 12 — when False (dev default) requests without ``X-User-Email``
