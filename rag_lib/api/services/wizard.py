@@ -44,6 +44,7 @@ from ...db.repos import (
     gather_runs as gather_runs_repo,
     papers as papers_repo,
     profiles as profiles_repo,
+    users as users_repo,
     schedules as schedules_repo,
 )
 from ...gatherers.openalex import OpenAlexGatherer
@@ -375,6 +376,9 @@ def save_topics(
         (json.dumps(pruned), profile_id),
     )
     conn.commit()
+    # Topic names are the reranker's queries in topic mode.
+    from rag_lib.scheduler.jobs import request_rerank_refresh
+    request_rerank_refresh(profile_id)
     return pruned
 
 
@@ -395,6 +399,7 @@ def dry_run_draft(
     reporter: Any | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
+    selected_topic_ids: list[str] | None = None,
 ) -> DraftDryRun:
     """Resolve the draft + invoke the dry-run compute.
 
@@ -415,6 +420,7 @@ def dry_run_draft(
         reporter=reporter,
         year_from=year_from,
         year_to=year_to,
+        selected_topic_ids=selected_topic_ids,
     )
 
 
@@ -430,6 +436,7 @@ def compute_dry_run_for_profile(
     reporter: Any | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
+    selected_topic_ids: list[str] | None = None,
 ) -> DraftDryRun:
     """Run a dry-run sweep + preview against the last ``days`` of OpenAlex.
 
@@ -454,11 +461,17 @@ def compute_dry_run_for_profile(
     profile = _load_profile(conn, profile_row)
     if not profile.papers:
         return DraftDryRun(sweep=[], preview=[])
+    if selected_topic_ids is not None:
+        # Step 3's ticks as sent, not only as stored: the route saved them,
+        # but a topic-list GET running alongside rewrites the stored list
+        # from what it read before that save.
+        profile.topic_filters = _prune_topic_filters(profile.topic_filters or {}, set(selected_topic_ids))
 
     selector = _new_selector_for_draft(profile_row, profile)
     selector.fit(profile)
 
-    gatherer = gatherer or OpenAlexGatherer(mailto=settings.RADAR_DEFAULT_MAILTO)
+    gatherer = gatherer or OpenAlexGatherer(
+        mailto=users_repo.contact_mailto(conn, profile_row["user_id"], settings.RADAR_DEFAULT_MAILTO))
     since = _days_ago(days)
     fetch_limit = capped_fetch_limit(settings, DRY_RUN_FETCH_LIMIT)
 
@@ -618,6 +631,10 @@ def commit_draft(
     profile_id = int(row["id"])
 
     full_topics = profiles_repo.topic_filters(conn, profile_id)
+    # As save_topics: with every topic off, each scan gathers nothing.
+    ids = {t["id"] for t in (full_topics or {}).get("topics") or [] if t.get("id")}
+    if ids and not (set(selected_topic_ids) & ids):
+        raise ValueError("switch on at least one topic: a scan searches by them")
     pruned = _prune_topic_filters(full_topics, set(selected_topic_ids))
 
     profile = _load_profile(conn, row, topic_filters=pruned)
@@ -1167,12 +1184,15 @@ def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
     paper, so one pathologically slow paper can overrun it — the point is
     to bound the count, not to interrupt work in progress.
     """
-    from .vault import _try_extract_umls, _umls_input_text
+    from .vault import _recently_failed, _try_extract_umls, _umls_input_text
 
     pending = []
     for oa_id in seed_ids:
         row = papers_repo.get_by_openalex_id(conn, oa_id)
-        if row is not None and not row["umls_concepts_json"]:
+        # A recent failure waits out its back-off here too: step 3 is
+        # loaded again and again, and each time it re-ran the linker on
+        # every failing seed for up to the whole budget.
+        if row is not None and not row["umls_concepts_json"] and not _recently_failed(oa_id):
             pending.append(row)
     if not pending:
         return
@@ -1196,16 +1216,89 @@ def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
         done += 1
 
 
+# Per interest, how the last UMLS merge went, for the topic pages to warn
+# when UMLS topics could not be (fully) brought in. In memory: it describes
+# the list the user is looking at, which was built moments ago.
+_UMLS_MERGE_STATE: dict[int, dict] = {}
+
+
+def umls_topics_state(profile_id: int) -> dict:
+    """``{"available", "reason", "n"}`` of the interest's last topic aggregation.
+
+    ``reason``: ``busy`` (database locked), ``error`` (anything else
+    failed), ``bad_data`` (``n`` seeds' stored UMLS data unreadable; they
+    are sent back to extraction), ``pending`` (``n`` seeds not extracted
+    yet) or ``failed`` (``n`` seeds whose extraction failed; retried after
+    a back-off). In each case the stored UMLS topics of those seeds are kept.
+    """
+    return dict(_UMLS_MERGE_STATE.get(profile_id) or {"available": True, "reason": None, "n": 0})
+
+
+def _keep_stored_umls(conn: sqlite3.Connection, profile_id: int, topic_filters: dict,
+                      unread: set[str] | None = None) -> dict:
+    """``topic_filters`` plus the UMLS topics the interest already had.
+
+    The list is rebuilt from the seeds on every aggregation and then
+    written back, so a merge that could not run (or could not read every
+    seed) used to drop every UMLS topic -- and the on/off the user had set
+    on it. Kept as stored; the next complete merge settles them.
+
+    ``unread``: the seeds that could not be read this time. Only topics
+    that came from one of them are kept (each UMLS topic records its
+    ``seeds``), so a topic of a seed the user removed does not linger
+    while some other seed is unreadable. None (the whole merge failed):
+    every stored UMLS topic is kept.
+    """
+    try:
+        stored = profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:  # noqa: BLE001 -- the database may be what failed
+        return topic_filters
+    have = {t.get("id") for t in topic_filters.get("topics") or []}
+    keep = [dict(t) for t in stored.get("topics") or []
+            if t.get("source") == "umls" and t.get("id") and t["id"] not in have
+            # Topics stored before ``seeds`` was recorded are kept as before.
+            and (unread is None or not t.get("seeds") or unread & set(t["seeds"]))]
+    if not keep:
+        return topic_filters
+    return {**topic_filters, "topics": [*(topic_filters.get("topics") or []), *keep]}
+
+
 def _try_merge_umls_topics(
     conn: sqlite3.Connection,
     profile_id: int,
     topic_filters: dict,
 ) -> dict:
+    """``_merge_umls_topics``, never raising; records how it went (``umls_topics_state``)."""
+    state = {"available": True, "reason": None, "n": 0}
+    try:
+        merged = _merge_umls_topics(conn, profile_id, topic_filters, state)
+    except Exception as exc:  # noqa: BLE001
+        locked = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+        state.update(available=False, reason="busy" if locked else "error", n=0)
+        log.warning(
+            "wizard.umls_merge_skipped",
+            profile_id=profile_id,
+            reason=type(exc).__name__,
+            detail=str(exc)[:200],
+        )
+        merged = _keep_stored_umls(conn, profile_id, topic_filters)
+    _UMLS_MERGE_STATE[profile_id] = state
+    return merged
+
+
+def _merge_umls_topics(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    topic_filters: dict,
+    state: dict,
+) -> dict:
     """Best-effort merge of UMLS-mapped topics into topic_filters.
 
     Reads ``umls_mapped_topics_json`` from each seed paper and calls
-    ``merge_umls_topics()`` to append novel topics. Returns the
-    original ``topic_filters`` unchanged on any failure.
+    ``merge_umls_topics()`` to append novel topics. Raises on failure;
+    ``_try_merge_umls_topics`` keeps the stored UMLS topics then. Seeds
+    whose UMLS data is missing or unreadable are recorded in ``state``,
+    and the stored UMLS topics are kept alongside the merge.
 
     A seed whose extraction has not landed yet is computed here rather
     than skipped. This began as a race: ``upload()`` ran extraction on a
@@ -1224,29 +1317,36 @@ def _try_merge_umls_topics(
     clock rather than to the seed count; whatever it does not reach stays
     pending for the next call.
     """
-    try:
-        from ..settings import get_settings
-        settings = get_settings()
-        if not settings.RADAR_UMLS_ENABLED:
-            return topic_filters
+    from ..settings import get_settings
+    settings = get_settings()
+    if not settings.RADAR_UMLS_ENABLED:
+        return topic_filters
 
-        from ...umls.topic_mapper import MappedTopic, merge_umls_topics
+    from ...umls.topic_mapper import MappedTopic, merge_umls_topics
 
-        seed_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
-        if not seed_ids:
-            return topic_filters
+    seed_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
+    if not seed_ids:
+        return topic_filters
 
-        _extract_missing_umls(conn, settings, seed_ids)
+    _extract_missing_umls(conn, settings, seed_ids)
 
-        umls_per_paper: list[list[MappedTopic]] = []
-        for oa_id in seed_ids:
-            row = papers_repo.get_by_openalex_id(conn, oa_id)
-            if row is None:
-                continue
-            raw = row["umls_mapped_topics_json"]
-            if not raw:
-                continue
-            entries = json.loads(raw)
+    from .vault import _recently_failed
+
+    umls_per_paper: list[list[MappedTopic]] = []
+    paper_ids: list[str] = []     # the seed each umls_per_paper entry came from
+    bad: list[str] = []
+    pending: list[str] = []
+    for oa_id in seed_ids:
+        row = papers_repo.get_by_openalex_id(conn, oa_id)
+        if row is None:
+            continue
+        if row["umls_concepts_json"] is None:
+            pending.append(oa_id)     # not extracted yet, or its extraction failed
+            continue
+        raw = row["umls_mapped_topics_json"]
+        if not raw:
+            continue
+        try:
             umls_per_paper.append([
                 MappedTopic(
                     topic_id=e["topic_id"],
@@ -1255,46 +1355,69 @@ def _try_merge_umls_topics(
                     source_cui=e["source_cui"],
                     source_name=e["source_name"],
                 )
-                for e in entries
+                for e in json.loads(raw)
             ])
+            paper_ids.append(oa_id)
+        except (ValueError, KeyError, TypeError):
+            bad.append(oa_id)     # one unreadable seed no longer sinks the rest
 
-        if not umls_per_paper:
-            return topic_filters
+    if bad:
+        # Back to extraction: NULL is what every extraction path picks up.
+        conn.executemany(
+            "UPDATE papers SET umls_concepts_json = NULL, umls_mapped_topics_json = NULL "
+            "WHERE openalex_id = ?", [(oa,) for oa in bad])
+        conn.commit()
+        log.warning("wizard.umls_bad_data", profile_id=profile_id, n=len(bad))
+        state.update(available=False, reason="bad_data", n=len(bad))
+    elif pending:
+        # "failed": every one is waiting out a failed extraction's back-off,
+        # so a reload will not help for hours; "pending": some are just
+        # not read yet.
+        failed = all(_recently_failed(oa) for oa in pending)
+        state.update(available=False, reason="failed" if failed else "pending", n=len(pending))
+    unread = set(bad) | set(pending)
 
-        # [umls-probe] 临时诊断 — 确认后整块删除。阶段 3：这是用户在
-        # step 3 真正看到的那一层。打印 base、候选数，以及合并后 UMLS
-        # 实际补进去了哪几个。
-        _base_names = [t.get("display_name") or ""
-                       for t in (topic_filters.get("topics") or [])]
-        _n_cand = len({m.topic_id for p in umls_per_paper for m in p})
-        print(f"\n[umls] 阶段3 profile_id={profile_id}", flush=True)
-        print(f"[umls]   {len(umls_per_paper)} 篇种子, 去重后 {_n_cand} 个候选 topic, "
-              f"max_additions={settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}", flush=True)
-        print(f"[umls]   OpenAlex base ({len(_base_names)}): {_base_names}", flush=True)
+    if not umls_per_paper:
+        return _keep_stored_umls(conn, profile_id, topic_filters, unread) if unread else topic_filters
 
-        _merged = merge_umls_topics(
-            topic_filters,
-            umls_per_paper,
-            max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
-            cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
-        )
+    # [umls-probe] 临时诊断 — 确认后整块删除。阶段 3：这是用户在
+    # step 3 真正看到的那一层。打印 base、候选数，以及合并后 UMLS
+    # 实际补进去了哪几个。
+    _base_names = [t.get("display_name") or ""
+                   for t in (topic_filters.get("topics") or [])]
+    _n_cand = len({m.topic_id for p in umls_per_paper for m in p})
+    print(f"\n[umls] 阶段3 profile_id={profile_id}", flush=True)
+    print(f"[umls]   {len(umls_per_paper)} 篇种子, 去重后 {_n_cand} 个候选 topic, "
+          f"max_additions={settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}", flush=True)
+    print(f"[umls]   OpenAlex base ({len(_base_names)}): {_base_names}", flush=True)
 
-        # [umls-probe] 排序键是 (similarity, count)，相似度优先。把 count 一起
-        # 打出来，是因为这两个信号在种子少的时候会给出很不一样的顺序。
-        _added = [t for t in (_merged.get("topics") or []) if t.get("source") == "umls"]
-        print(f"[umls]   补进去 {len(_added)} 个:", flush=True)
-        for _t in _added:
-            print(f"[umls]     n={_t.get('count', 0)}  {_t.get('display_name', '')[:56]}",
-                  flush=True)
-        if _n_cand > len(_added):
-            print(f"[umls]   另外 {_n_cand - len(_added)} 个候选没进去"
-                  f"（被判为已有 topic 的近重复，或超出 max_additions）", flush=True)
-        return _merged
-    except Exception as exc:
-        log.warning(
-            "wizard.umls_merge_skipped",
-            profile_id=profile_id,
-            reason=type(exc).__name__,
-            detail=str(exc)[:200],
-        )
-        return topic_filters
+    _merged = merge_umls_topics(
+        topic_filters,
+        umls_per_paper,
+        max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
+        cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+    )
+
+    # [umls-probe] 排序键是 (similarity, count)，相似度优先。把 count 一起
+    # 打出来，是因为这两个信号在种子少的时候会给出很不一样的顺序。
+    _added = [t for t in (_merged.get("topics") or []) if t.get("source") == "umls"]
+    print(f"[umls]   补进去 {len(_added)} 个:", flush=True)
+    for _t in _added:
+        print(f"[umls]     n={_t.get('count', 0)}  {_t.get('display_name', '')[:56]}",
+              flush=True)
+    if _n_cand > len(_added):
+        print(f"[umls]   另外 {_n_cand - len(_added)} 个候选没进去"
+              f"（被判为已有 topic 的近重复，或超出 max_additions）", flush=True)
+    # Which seeds each UMLS topic came from, so that a later merge that
+    # cannot read some seeds keeps only their topics (_keep_stored_umls).
+    by_topic: dict[str, list[str]] = {}
+    for oa, mts in zip(paper_ids, umls_per_paper):
+        for mt in mts:
+            by_topic.setdefault(mt.topic_id, [])
+            if oa not in by_topic[mt.topic_id]:
+                by_topic[mt.topic_id].append(oa)
+    for t in _merged.get("topics") or []:
+        if t.get("source") == "umls" and t.get("id") in by_topic:
+            t["seeds"] = by_topic[t["id"]]
+    return _keep_stored_umls(conn, profile_id, _merged, unread) if unread else _merged
+

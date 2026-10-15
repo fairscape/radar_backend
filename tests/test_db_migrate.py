@@ -45,6 +45,7 @@ EXPECTED_VERSIONS = [
     "0016_researchers",
     "0017_interest_terms",
     "0018_year_range",
+    "0019_reranker_query_key",
 ]
 
 

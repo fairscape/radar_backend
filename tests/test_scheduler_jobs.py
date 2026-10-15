@@ -701,3 +701,236 @@ def test_a_backfill_stores_papers_from_the_years_asked_for(monkeypatch, db_path,
     assert asked == {"span": (2018, 2020), "per_year": 100}
     assert stored == {"W800", "W801", "W802"}
     assert run[2] is None and run[0] == "backfill-years" and run[1] == "2018-01-01"
+
+
+# --------------------------------------------------------------------------
+# Reranker logits: stale (queries changed) or missing (started passing later)
+# --------------------------------------------------------------------------
+
+
+class _FakeReranker:
+    """Logit = 10 x the query-set version, so a stale logit is easy to spot."""
+
+    name = "medcpt"
+    alpha, beta = 0.4, 0.6
+
+    def __init__(self, version: int = 1):
+        self.version = version
+        self.seen: list[str] = []
+
+    def query_key(self, profile):
+        return f"K{self.version}"
+
+    def rerank(self, ranked, profile, *, conn=None):
+        out = []
+        for s, p, bd in ranked:
+            self.seen.append(p.openalex_id)
+            bd = {**bd, "score_reranker_raw": 10.0 * self.version + float(bd.get("score_raw") or s),
+                  "reranker_query_key": f"K{self.version}", "score_blended": s}
+            out.append((s, p, bd))
+        return out
+
+    def diagnostics(self):
+        return {"status": "ok"}
+
+    def cost(self):
+        return {"wall_seconds": 0.0}
+
+
+def _rr_rows(db_path, profile_id):
+    conn = connect(db_path)
+    try:
+        return {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+            "SELECT openalex_id, score_reranker_raw, reranker_query_key, score_blended "
+            "FROM profile_candidates WHERE profile_id = ?", (profile_id,))}
+    finally:
+        conn.close()
+
+
+def test_a_query_change_reranks_the_pool_and_a_newly_passing_paper_gets_a_logit(
+    monkeypatch, db_path, settings, profile_id,
+):
+    from rag_lib.db.repos import candidates as candidates_repo, papers as papers_repo
+
+    rr = _FakeReranker(1)
+    monkeypatch.setattr(scheduler_jobs, "_build_reranker", lambda row, s: rr)
+    _patch_dependencies(monkeypatch, [_candidate_paper("W300"), _candidate_paper("W301")])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+    rows = _rr_rows(db_path, profile_id)
+    assert {k: v[1] for k, v in rows.items()} == {"W300": "K1", "W301": "K1"}
+
+    # A paper stored without a logit (it was below the threshold at its scan
+    # and passes now), and one below the threshold that must stay untouched.
+    conn = connect(db_path)
+    try:
+        for oa in ("W500", "W501"):
+            papers_repo.upsert(conn, {"openalex_id": oa, "title": f"Old {oa}", "abstract": "a", "year": 2025})
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id="W500", score=0.9, score_raw=0.9)
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id="W501", score=0.1, score_raw=0.1)
+        conn.execute("UPDATE profiles SET threshold = 0.5 WHERE id = ?", (profile_id,))
+        conn.execute("UPDATE profile_candidates SET score_raw = 0.95 WHERE openalex_id IN ('W300','W301')")
+        conn.commit()
+
+        # The queries change (a seed or topic edit): every pool row is stale.
+        rr2 = _FakeReranker(2)
+        n = scheduler_jobs.refresh_reranker(conn, profile_id, settings, reranker=rr2)
+    finally:
+        conn.close()
+    assert n == 3 and sorted(rr2.seen) == ["W300", "W301", "W500"]
+    rows = _rr_rows(db_path, profile_id)
+    for oa in ("W300", "W301", "W500"):
+        assert rows[oa][1] == "K2" and rows[oa][0] >= 20.0 and rows[oa][2] is not None, (oa, rows[oa])
+    assert rows["W501"][0] is None and rows["W501"][2] is None      # below the bar: not reranked
+
+    # Nothing stale left: a second refresh reranks nothing.
+    conn = connect(db_path)
+    try:
+        assert scheduler_jobs.refresh_reranker(conn, profile_id, settings, reranker=_FakeReranker(2)) == 0
+    finally:
+        conn.close()
+
+
+def test_a_rescan_without_reranking_keeps_the_key_with_its_logit(db_path, profile_id):
+    from rag_lib.db.repos import candidates as candidates_repo, papers as papers_repo
+
+    conn = connect(db_path)
+    try:
+        papers_repo.upsert(conn, {"openalex_id": "W600", "title": "x", "year": 2025})
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id="W600", score=0.9,
+                                     score_raw=0.9, score_reranker_raw=3.0, reranker_query_key="K1")
+        # Seen again below the threshold: no new logit, so the old key stays.
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id="W600", score=0.2, score_raw=0.2)
+        assert tuple(conn.execute("SELECT score_reranker_raw, reranker_query_key FROM profile_candidates "
+                            "WHERE openalex_id = 'W600'").fetchone()) == (3.0, "K1")
+        # Reranked again: logit and key move together.
+        candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id="W600", score=0.9,
+                                     score_raw=0.9, score_reranker_raw=5.0, reranker_query_key="K2")
+        assert tuple(conn.execute("SELECT score_reranker_raw, reranker_query_key FROM profile_candidates "
+                            "WHERE openalex_id = 'W600'").fetchone()) == (5.0, "K2")
+    finally:
+        conn.close()
+
+
+def test_rescore_pool_asks_for_a_background_refresh(monkeypatch, db_path, settings, profile_id):
+    added = []
+
+    class _Sched:
+        def add_job(self, fn, **kw):
+            added.append((fn, kw["id"], kw["args"]))
+
+    monkeypatch.setattr(scheduler_jobs, "_SCHEDULER", _Sched())
+    monkeypatch.setattr(scheduler_jobs, "_build_reranker", lambda row, s: _FakeReranker())
+    conn = connect(db_path)
+    try:
+        scheduler_jobs.rescore_pool(conn, profile_id, settings)
+    finally:
+        conn.close()
+    assert added == [(scheduler_jobs.refresh_reranker_job, f"rerank-refresh:{profile_id}", [profile_id])]
+
+    # The noop reranker has nothing to refresh.
+    added.clear()
+    from rag_lib.rerankers import NoopReranker
+    monkeypatch.setattr(scheduler_jobs, "_build_reranker", lambda row, s: NoopReranker())
+    conn = connect(db_path)
+    try:
+        scheduler_jobs.rescore_pool(conn, profile_id, settings)
+    finally:
+        conn.close()
+    assert added == []
+
+
+def test_runner_registers_the_rerank_sweep_and_hands_jobs_the_scheduler(db_path, settings, profile_id):
+    from rag_lib.scheduler import build_scheduler, start, stop
+
+    scheduler = build_scheduler(settings)
+    try:
+        start(scheduler, settings)
+        assert scheduler.get_job("rerank-refresh-sweep") is not None
+        assert scheduler_jobs._SCHEDULER is scheduler
+    finally:
+        stop(scheduler)
+    assert scheduler_jobs._SCHEDULER is None
+
+
+def test_a_refresh_does_not_overwrite_a_logit_a_scan_wrote_meanwhile(monkeypatch, db_path, settings, profile_id):
+    from rag_lib.db.repos import candidates as candidates_repo, papers as papers_repo
+
+    conn = connect(db_path)
+    try:
+        for oa in ("W700", "W701"):
+            papers_repo.upsert(conn, {"openalex_id": oa, "title": oa, "year": 2025})
+            candidates_repo.insert_dedup(conn, profile_id=profile_id, openalex_id=oa, score=0.9,
+                                         score_raw=0.9, score_reranker_raw=1.0, reranker_query_key="K1")
+
+        class Slow(_FakeReranker):
+            def rerank(self, ranked, profile, *, conn=None):
+                # While this runs, a scan reranks W700 against newer queries.
+                other = connect(db_path)
+                try:
+                    candidates_repo.insert_dedup(other, profile_id=profile_id, openalex_id="W700", score=0.9,
+                                                 score_raw=0.9, score_reranker_raw=99.0, reranker_query_key="K3")
+                finally:
+                    other.close()
+                return super().rerank(ranked, profile)
+
+        scheduler_jobs.refresh_reranker(conn, profile_id, settings, reranker=Slow(2))
+        got = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT openalex_id, score_reranker_raw, reranker_query_key FROM profile_candidates "
+            "WHERE openalex_id IN ('W700','W701')")}
+    finally:
+        conn.close()
+    assert got["W700"] == (99.0, "K3")          # the scan's newer logit stands
+    assert got["W701"][1] == "K2"               # the untouched row was refreshed
+
+
+def test_a_refresh_asked_for_while_one_runs_makes_the_running_one_go_round_again(
+    monkeypatch, db_path, settings, profile_id,
+):
+    passes = []
+
+    def once(conn, pid, s, *, reranker=None, profile=None, limit=0):
+        passes.append(reranker)
+        if len(passes) == 1:
+            # Another thread asks meanwhile (a seed edit, the sweep): it
+            # finds the lock taken and must not be lost.
+            assert scheduler_jobs.refresh_reranker(conn, pid, s) == 0
+        return 1
+
+    monkeypatch.setattr(scheduler_jobs, "_refresh_once", once)
+    conn = connect(db_path)
+    try:
+        n = scheduler_jobs.refresh_reranker(conn, profile_id, settings, reranker="the scan's")
+    finally:
+        conn.close()
+    # Ran again, and with the reranker rebuilt: the queries may have changed.
+    assert n == 2 and passes == ["the scan's", None]
+
+
+def test_a_scan_that_overlapped_a_seed_change_rescores_against_the_new_seeds(
+    monkeypatch, db_path, settings, profile_id,
+):
+    """The batch was scored against the centroid read at the start; the
+    refit's rescore ran before these rows went in."""
+    from rag_lib.scoring import rescore
+
+    calls = []
+
+    class RefitMidway(_StubGatherer):
+        def fetch(self, profile, *, since, limit):
+            c = connect(db_path)          # a seed edit's refit, mid-scan
+            try:
+                c.execute("UPDATE profiles SET selector_config_json = json_set(selector_config_json, '$.refit', 1) WHERE id = ?", (profile_id,))
+                c.commit()
+            finally:
+                c.close()
+            return super().fetch(profile, since=since, limit=limit)
+
+    monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: RefitMidway([_candidate_paper("W800")]))
+    monkeypatch.setattr(rescore, "rescore_candidates", lambda conn, pid: calls.append(pid) or {})
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+    assert calls == [profile_id]
+
+    calls.clear()      # an ordinary scan does not
+    _patch_dependencies(monkeypatch, [_candidate_paper("W801")])
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
+    assert calls == []

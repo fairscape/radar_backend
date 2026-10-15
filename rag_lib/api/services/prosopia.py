@@ -49,6 +49,7 @@ from ...db.repos import (
     papers as papers_repo,
     profiles as profiles_repo,
     researchers as researchers_repo,
+    users as users_repo,
 )
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
@@ -353,7 +354,7 @@ def run_import(
     """
     records = plan.records
     embedder = get_embedder(plan.embedding_model)
-    oa = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+    oa = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, plan.user_id, settings.RADAR_DEFAULT_MAILTO))
 
     # Batched identifier resolution up front: one request per 50 DOIs
     # rather than one per paper. A failure here is *not* fatal — the

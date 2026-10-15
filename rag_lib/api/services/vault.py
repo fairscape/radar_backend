@@ -38,6 +38,7 @@ from ...db.repos import (
     embeddings as embeddings_repo,
     papers as papers_repo,
     profiles as profiles_repo,
+    users as users_repo,
     vault as vault_repo,
 )
 from ...embed import build_embedding_input
@@ -57,32 +58,12 @@ from ...vault import compute_file_hash, ingest_pdf
 # with no UMLS data at all. It also hurts precision: references, methods
 # boilerplate and figure captions contribute concepts that have nothing
 # to do with the paper's subject.
-_UMLS_TEXT_LIMIT = 20_000
+_UMLS_TEXT_LIMIT = 20_000   # == rag_lib.umls.text.UMLS_TEXT_LIMIT
 
 
-def _umls_input_text(
-    title: str | None,
-    abstract: str | None,
-    body_text: str | None,
-) -> str:
-    """Pick the text to run UMLS extraction over: title, then abstract.
-
-    The title is not decoration here. Abstracts introduce an
-    abbreviation once and use it throughout, and the SciSpacy linker can
-    only expand one when the expansion appears in the same text — so a
-    paper whose abstract says "T2DM" nine times yields no diabetes
-    concept at all. Titles spell the subject out. Prepending it recovered
-    ``C0011860 Diabetes Mellitus, Non-Insulin-Dependent`` at 0.981 on a
-    paper that had extracted nothing but "RF", "Fasting" and "Score".
-
-    That failure is invisible downstream: the concept is simply absent,
-    so no ranking or threshold further along can bring it back.
-    """
-    head = (title or "").strip()
-    if abstract and abstract.strip():
-        return f"{head}\n\n{abstract}" if head else abstract
-    body = (body_text or "")[:_UMLS_TEXT_LIMIT]
-    return f"{head}\n\n{body}" if head and body else (head or body)
+# Lives with the UMLS code (rag_lib/umls/text.py) so the papers repo can tell
+# when a paper's extraction input changed; the names here are kept for callers.
+from ...umls.text import umls_input_text as _umls_input_text  # noqa: E402
 
 
 def _vault_dir_for_user(settings: Any, user_id: int) -> Path:
@@ -163,7 +144,7 @@ def upload(
     log.info("vault.upload.ingest_pdf", elapsed_ms=round((_time.monotonic() - t1) * 1000, 1))
 
     t2 = _time.monotonic()
-    mailto = settings.RADAR_DEFAULT_MAILTO
+    mailto = users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO)
     openalex_id, paper_dict = _enrich_via_openalex(
         record, mailto=mailto, filename=filename, file_hash=file_hash,
     )
@@ -567,6 +548,27 @@ def backfill_seed_umls(
         log.info("vault.umls_backfill", n=len(rows), n_failed=n_failed,
                  scoped=openalex_ids is not None)
     return len(rows)
+
+
+def seed_umls_status(conn: sqlite3.Connection, settings: Any, openalex_ids: list[str]) -> dict:
+    """How far UMLS extraction is for a set of seeds.
+
+    ``done``: extracted (concepts found or not). ``failed``: extraction
+    failed recently and waits out ``_UMLS_RETRY_AFTER_S``. ``pending``:
+    not extracted yet. With UMLS switched off everything counts as done.
+    """
+    total = len(openalex_ids)
+    if not settings.RADAR_UMLS_ENABLED or not openalex_ids:
+        return {"enabled": bool(settings.RADAR_UMLS_ENABLED), "total": total, "done": total,
+                "pending": 0, "failed": 0}
+    marks = ",".join("?" for _ in openalex_ids)
+    null_ids = [r[0] for r in conn.execute(
+        f"SELECT openalex_id FROM papers WHERE umls_concepts_json IS NULL AND openalex_id IN ({marks})",
+        tuple(openalex_ids),
+    ).fetchall()]
+    failed = sum(1 for oa in null_ids if _recently_failed(oa))
+    return {"enabled": True, "total": total, "done": total - len(null_ids),
+            "pending": len(null_ids) - failed, "failed": failed}
 
 
 def _try_extract_umls_unlocked(

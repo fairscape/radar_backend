@@ -128,7 +128,16 @@ def mark_imported(
 
 
 def delete(conn: sqlite3.Connection, researcher_id: int) -> None:
-    """Drop the researcher and its paper links. Papers and interests stay."""
+    """Drop the researcher and its paper links. Papers and interests stay.
+
+    Runs that imported into an interest are that interest's history too
+    (its Scans list): unlinked here, since ``gather_runs.researcher_id``
+    cascades and deleted them. Runs of the researcher alone go with it.
+    """
+    conn.execute(
+        "UPDATE gather_runs SET researcher_id = NULL WHERE researcher_id = ? AND profile_id IS NOT NULL",
+        (researcher_id,),
+    )
     conn.execute("DELETE FROM researchers WHERE id = ?", (researcher_id,))
     conn.commit()
 

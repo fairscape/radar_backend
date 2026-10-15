@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -100,9 +101,14 @@ def embed_topics(topics: list[dict], embedding_model: str) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser(description="Build OpenAlex topic embedding index")
+    from rag_lib.api.settings import get_settings
+
+    # Must be the embedder the mapper uses at runtime, or every search
+    # compares vectors from two different models (see rag_lib/umls/cache.py).
+    default_model = get_settings().RADAR_UMLS_EMBEDDING_MODEL
     parser.add_argument(
-        "--embedding-model", default="specter2",
-        help="Embedder key from rag_lib.embedders registry (default: specter2)",
+        "--embedding-model", default=default_model,
+        help=f"Embedder key from rag_lib.embedders registry (default: RADAR_UMLS_EMBEDDING_MODEL = {default_model})",
     )
     parser.add_argument(
         "--output-dir", default="data/umls_cache",
@@ -133,13 +139,33 @@ def main():
     topics_path = output_dir / "openalex_topics.json"
     embeddings_path = output_dir / "openalex_topic_embeddings.npz"
 
-    with open(topics_path, "w", encoding="utf-8") as f:
+    from datetime import datetime, timezone
+
+    from rag_lib.umls.cache import META_FILE
+
+    meta_path = output_dir / META_FILE
+    # Write beside the live files, then swap all three in: a running backend
+    # never sees new topics with old vectors, or vectors without their model.
+    tmp_topics = topics_path.with_suffix(".json.tmp")
+    tmp_emb = output_dir / "openalex_topic_embeddings.tmp.npz"
+    tmp_meta = meta_path.with_suffix(".json.tmp")
+    with open(tmp_topics, "w", encoding="utf-8") as f:
         json.dump(topics, f, ensure_ascii=False)
-    np.savez_compressed(embeddings_path, embeddings=embeddings)
+    np.savez_compressed(tmp_emb, embeddings=embeddings)
+    tmp_meta.write_text(json.dumps({
+        "embedding_model": args.embedding_model,
+        "dim": int(embeddings.shape[1]),
+        "n_topics": len(topics),
+        "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, indent=2), encoding="utf-8")
+    os.replace(tmp_topics, topics_path)
+    os.replace(tmp_emb, embeddings_path)
+    os.replace(tmp_meta, meta_path)
 
     print(f"\nSaved:")
     print(f"  {topics_path} ({topics_path.stat().st_size / 1024:.1f} KB)")
     print(f"  {embeddings_path} ({embeddings_path.stat().st_size / 1024:.1f} KB)")
+    print(f"  {meta_path} (built with {args.embedding_model})")
     print("Done!")
 
 

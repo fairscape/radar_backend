@@ -243,3 +243,23 @@ def find_inflight_import(
         """,
         (orcid, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
     ).fetchone()
+
+
+INTERRUPTED = "Interrupted: the backend restarted while this was running."
+
+
+def close_interrupted(conn: sqlite3.Connection) -> int:
+    """Close every run still open, at boot. Returns how many.
+
+    Jobs live in the scheduler's memory, so a restart ends every one of
+    them, and nothing else would ever close their rows: a researcher showed
+    "Importing" for good (polled every 3 s), a scan or trial scan spun in
+    the UI forever, and the wizard stayed blocked behind it. Closed with an
+    error, the UI shows the failure and offers to run it again.
+    """
+    cur = conn.execute(
+        "UPDATE gather_runs SET finished_at = datetime('now'), error = ? WHERE finished_at IS NULL",
+        (INTERRUPTED,),
+    )
+    conn.commit()
+    return cur.rowcount

@@ -11,6 +11,13 @@ two sources:
    the user). These have no PDF on disk; the vault still tracks them so
    the saved-paper UX is honest about the user's reading list.
 
+3. Every seed of the user's interests, however it got there: a paper
+   saved in one interest and made a seed of another, or one imported
+   with a researcher the user has since forgotten. Seeds used to count
+   only when uploaded or linked to a saved researcher, so such a seed
+   vanished from the wizard's seed list (and from the vault) while
+   still seeding the interest.
+
 Tags = profile slugs the paper is attached to in either way:
 ``profile_seeds`` (seed membership) ∪ ``profile_candidates`` rows whose
 ``saved_at`` is set. ``tags_for_paper`` returns the union, dedup'd.
@@ -69,9 +76,16 @@ def list_for_user(
                    AND pr.user_id = ?
                    AND pc.saved_at IS NOT NULL
                )
+               OR EXISTS (
+                 SELECT 1
+                 FROM profile_seeds ps
+                 JOIN profiles pr ON pr.id = ps.profile_id
+                 WHERE ps.openalex_id = p.openalex_id
+                   AND pr.user_id = ?
+               )
             ORDER BY p.first_seen_at DESC, p.openalex_id
             """,
-            (user_id, user_id, user_id),
+            (user_id, user_id, user_id, user_id),
         ).fetchall()
     return conn.execute(
         f"""
@@ -84,16 +98,6 @@ def list_for_user(
               WHERE ps.openalex_id = p.openalex_id
                 AND pr.user_id = ?
                 AND pr.slug = ?
-                AND (
-                  p.uploaded_by_user_id = ?
-                  OR EXISTS (
-                    SELECT 1
-                    FROM researcher_papers rp
-                    JOIN researchers r ON r.id = rp.researcher_id
-                    WHERE rp.openalex_id = p.openalex_id
-                      AND r.user_id = ?
-                  )
-                )
             )
            OR EXISTS (
               SELECT 1
@@ -106,7 +110,7 @@ def list_for_user(
             )
         ORDER BY p.first_seen_at DESC, p.openalex_id
         """,
-        (user_id, tag, user_id, user_id, user_id, tag),
+        (user_id, tag, user_id, tag),
     ).fetchall()
 
 
@@ -139,6 +143,13 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           JOIN profile_candidates pc ON pc.openalex_id = p.openalex_id
           JOIN profiles pr           ON pr.id = pc.profile_id
           WHERE pr.user_id = ? AND pc.saved_at IS NOT NULL
+          UNION
+          -- Every seed of the user's interests (module docstring, 3.).
+          SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
+          FROM papers p
+          JOIN profile_seeds ps ON ps.openalex_id = p.openalex_id
+          JOIN profiles pr      ON pr.id = ps.profile_id
+          WHERE pr.user_id = ?
         ),
         deduped AS (
           SELECT openalex_id,
@@ -153,7 +164,7 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           MAX(last_event)           AS last_ingest
         FROM deduped
         """,
-        (user_id, user_id, user_id),
+        (user_id, user_id, user_id, user_id),
     ).fetchone()
     return {
         "docs": int(row["docs"]),
@@ -179,14 +190,6 @@ def tag_counts_for_user(
           JOIN profiles pr ON pr.id = ps.profile_id
           JOIN papers   p  ON p.openalex_id = ps.openalex_id
           WHERE pr.user_id = ?
-            AND (
-              p.uploaded_by_user_id = ?
-              OR EXISTS (
-                SELECT 1 FROM researcher_papers rp
-                JOIN researchers r ON r.id = rp.researcher_id
-                WHERE rp.openalex_id = p.openalex_id AND r.user_id = ?
-              )
-            )
           UNION
           SELECT pr.slug AS slug, pc.openalex_id AS openalex_id
           FROM profile_candidates pc
@@ -198,7 +201,7 @@ def tag_counts_for_user(
         FROM vault_in_profile
         GROUP BY slug
         """,
-        (user_id, user_id, user_id, user_id),
+        (user_id, user_id),
     ).fetchall()
     return {r["slug"]: int(r["n"]) for r in rows}
 

@@ -88,6 +88,7 @@ def map_concepts_to_topics(
 
     embedder = get_embedder(embedding_model)
     index = get_topic_index(cache_dir)
+    index.check_compatible(embedding_model)
 
     # Collect all mappings, dedup by topic_id (keep highest similarity)
     best: dict[str, MappedTopic] = {}
@@ -95,6 +96,9 @@ def map_concepts_to_topics(
     for concept in concepts:
         # Embed the UMLS concept name
         vec = np.array(embedder(concept.name), dtype=np.float32)
+        # An index without META_FILE can still be caught on dimension
+        # (a bare matmul error said nothing about why).
+        index.check_compatible(embedding_model, dim=int(vec.shape[-1]))
 
         # Search topic index
         matches = index.search(vec, top_k=top_k, min_similarity=min_similarity)

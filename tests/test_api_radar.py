@@ -182,3 +182,26 @@ def test_feed_cards_carry_the_stored_byline(app, tmp_path):
     conn.close()
     card = next(c for c in _request(app, "GET", "/api/radar/daily").json()["cards"] if c["id"] == PAPER)
     assert card["authors"] == ["Ada Lovelace", "Alan Turing"]
+
+
+def test_below_the_bar_shows_the_papers_under_the_threshold(app, tmp_path):
+    """The feed holds only papers that pass the threshold, so filtering it
+    for "below the bar" was always empty; it now asks for those papers."""
+    from rag_lib.db import connect
+
+    conn = connect(tmp_path / "radar.db")
+    try:
+        conn.execute("UPDATE profile_candidates SET score_raw = score")
+        conn.execute("UPDATE profiles SET threshold = 0.9")
+        n_below = conn.execute(
+            "SELECT COUNT(*) FROM profile_candidates WHERE score_raw < 0.9").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+    assert n_below > 0
+
+    above = _request(app, "GET", "/api/radar/daily").json()["cards"]
+    assert above and all(c["bucket"] != "low" for c in above)
+    low = _request(app, "GET", "/api/radar/daily?bucket=low").json()["cards"]
+    assert low and all(c["bucket"] == "low" for c in low)
+    assert not {c["id"] for c in low} & {c["id"] for c in above}

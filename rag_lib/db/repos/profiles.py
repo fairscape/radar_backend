@@ -20,7 +20,9 @@ from .gather_runs import IMPORT_TIERS
 
 #: Slugs the profiles router claims as literal paths, declared before
 #: ``/{key}``. Keep in step with routers/profiles.py.
-RESERVED_SLUGS = frozenset({"drafts", "draft", "wizard"})
+# "new": the frontend's /interests/new is the wizard, so an interest named
+# "New" was saved and then opened as a blank wizard, its page unreachable.
+RESERVED_SLUGS = frozenset({"drafts", "draft", "wizard", "new"})
 
 
 def slugify(name: str) -> str:

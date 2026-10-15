@@ -125,6 +125,29 @@ class Seed(_Model):
     coh: float
 
 
+class SeedUmlsStatus(_Model):
+    """UMLS extraction over an interest's seeds (``/{key}/umls``).
+
+    Step 3 shows its topics once ``pending`` is 0: ``done`` seeds were
+    read, ``failed`` ones could not be (their OpenAlex topics still count)
+    and are retried later. ``running``: an extraction job is going.
+    """
+
+    enabled: bool
+    total: int
+    done: int
+    pending: int
+    failed: int
+    running: bool = False
+    # How the last topic list was built: False when UMLS topics could not be
+    # brought in fully -- the UMLS topics found before are kept then.
+    # ``topics_reason``: busy | error | bad_data | pending; ``topics_n``:
+    # seeds affected (bad_data, pending).
+    topics_available: bool = True
+    topics_reason: str | None = None
+    topics_n: int = 0
+
+
 class Topic(_Model):
     id: str
     name: str
@@ -848,6 +871,10 @@ class DraftDryRunRequest(_Model):
 
     days: int = 30
     thresholds: list[float] | None = None
+    # Step 3's selection. Saved on the draft first, so the trial scans the
+    # topics the user kept (it used to scan every topic the seeds had) and
+    # a resumed draft shows the same ticks. None = keep the stored states.
+    selected_topic_ids: list[str] | None = None
     # A range of years instead of the last ``days``: the trial samples each
     # year, most cited first (gatherers/openalex.fetch_years).
     year_from: int | None = None
@@ -1004,3 +1031,7 @@ class RerankerComparisonResponse(_Model):
     max_rank_up: int = 0
     max_rank_down: int = 0
     queries_used: list[str] = Field(default_factory=list)
+    # What the queries are: "article" (seed content), "title" (seed
+    # titles), "topic" (topic names) or "terms" (research topics). None
+    # without a reranker.
+    query_mode: str | None = None

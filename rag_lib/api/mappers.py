@@ -76,11 +76,14 @@ def bucket_for_similarity(
     a threshold to compare against, fall back to the rank percentile.
     """
     if similarity is not None and threshold is not None:
+        # The threshold first: a threshold set above the least typical seed
+        # made a paper under it "high", so the feed's "Below the bar" filter
+        # dropped it and "Like your seeds" (passing papers only) never had it.
+        if similarity < threshold:
+            return "low"
         if seed_sim_min is not None and similarity >= seed_sim_min:
             return "high"
-        if similarity >= threshold:
-            return "medium"
-        return "low"
+        return "medium"
     if percentile is not None:
         return _bucket_for(percentile)
     if similarity is not None:

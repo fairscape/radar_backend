@@ -56,3 +56,24 @@ def list_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT id, email, mailto, created_at FROM users ORDER BY id"
     ).fetchall()
+
+
+def contact_mailto(conn: sqlite3.Connection, user_id: int | None, default: str) -> str:
+    """The address sent to OpenAlex as ``mailto`` for this user's requests.
+
+    The one rule for every OpenAlex call made for a user: the contact email
+    they set in Settings, else their login email, else the deployment's
+    default. Only the scheduled scans used to apply it; trial scans,
+    imports, uploads and researcher refreshes always sent the default,
+    though Settings says the address goes with every request.
+    """
+    return mailto_from_row(get(conn, int(user_id)) if user_id is not None else None, default)
+
+
+def mailto_from_row(row: sqlite3.Row | None, default: str) -> str:
+    """``contact_mailto`` for a ``users`` row already in hand."""
+    if row is not None and row["mailto"]:
+        return row["mailto"]
+    if row is not None and row["email"]:
+        return row["email"]
+    return default

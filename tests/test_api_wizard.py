@@ -410,3 +410,37 @@ def test_a_trial_over_a_year_range_samples_each_year(app, tmp_path):
 
     bad = _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run", json={"year_from": 2022, "year_to": 2019})
     assert bad.status_code == 400
+
+
+def test_the_trial_scans_only_the_topics_kept_in_step_3(app, tmp_path):
+    """Step 3's ticks lived only in the browser until commit, so the trial
+    queried every topic the seeds had: the suggested threshold and preview
+    came from topics the user had just thrown out."""
+    from rag_lib.api.routers.profiles import get_wizard_gatherer
+    from rag_lib.openalex_tiers import enabled_topic_ids
+    from tests.fixture_gatherer import FixtureGatherer
+
+    class Recording(FixtureGatherer):
+        seen = []
+
+        def fetch(self, profile, *, since, limit):
+            Recording.seen.append(sorted(enabled_topic_ids(profile.topic_filters)))
+            return super().fetch(profile, since=since, limit=limit)
+
+    app.dependency_overrides[get_wizard_gatherer] = lambda: Recording(seed=42, n_candidates=12)
+    db = str(tmp_path / "radar.db")
+    slug = _request(app, "POST", "/api/profiles/draft",
+                    json={"name": "Neonatal", "embedding_model": "placeholder-v1"}).json()["slug"]
+    _attach_seeds(db, user_id=1, slug=slug)
+    assert {"T100", "T101"} <= {t["id"] for t in _request(app, "GET", f"/api/profiles/draft/{slug}/topics").json()}
+
+    resp = _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run", json={"selected_topic_ids": ["T100"]})
+    assert resp.status_code == 200, resp.text
+    assert [ids for ids in Recording.seen][-1] in (["T100"], ["https://openalex.org/T100"])
+    # Saved: a resumed draft shows the same ticks.
+    by_id = {t["id"]: t["on"] for t in _request(app, "GET", f"/api/profiles/draft/{slug}/topics").json()}
+    assert by_id["T100"] is True and by_id["T101"] is False
+
+    # Nothing kept is refused, here and at commit.
+    assert _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run", json={"selected_topic_ids": []}).status_code == 400
+    assert _request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.85, "selected_topic_ids": []}).status_code == 400

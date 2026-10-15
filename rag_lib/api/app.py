@@ -51,6 +51,14 @@ async def lifespan(app: FastAPI):
             log.info("migrations.applied", versions=applied)
         else:
             log.info("migrations.up_to_date")
+        # Only a process that runs the jobs owns the open runs: one started
+        # with the scheduler off (tests, a second API worker) leaves them.
+        if settings.RADAR_SCHEDULER_ENABLED:
+            from ..db.repos.gather_runs import close_interrupted
+
+            n_closed = close_interrupted(conn)
+            if n_closed:
+                log.warning("gather_runs.closed_interrupted", n=n_closed)
     finally:
         conn.close()
 

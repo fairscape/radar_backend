@@ -40,6 +40,7 @@ def insert_dedup(
     score_reranker_norm: float | None = None,
     score_blended: float | None = None,
     sourced_by_topic_id: str | None = None,
+    reranker_query_key: str | None = None,
 ) -> int:
     """Insert one candidate. Returns 1 if new, 0 if already present.
 
@@ -72,8 +73,8 @@ def insert_dedup(
           (profile_id, openalex_id, score, tier_used, gather_run_id,
            score_raw, score_max_seed, score_pct,
            score_reranker_raw, score_reranker_norm, score_blended,
-           sourced_by_topic_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           sourced_by_topic_id, reranker_query_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (profile_id, openalex_id) DO UPDATE SET
           score              = excluded.score,
           score_raw          = excluded.score_raw,
@@ -83,6 +84,10 @@ def insert_dedup(
           -- reranked again; keep its logit for if the threshold drops.
           score_reranker_raw = COALESCE(excluded.score_reranker_raw,
                                         profile_candidates.score_reranker_raw),
+          -- The key goes with the logit it describes.
+          reranker_query_key = CASE WHEN excluded.score_reranker_raw IS NOT NULL
+                                    THEN excluded.reranker_query_key
+                                    ELSE profile_candidates.reranker_query_key END,
           score_reranker_norm= excluded.score_reranker_norm,
           score_blended      = excluded.score_blended,
           tier_used          = excluded.tier_used,
@@ -99,7 +104,7 @@ def insert_dedup(
             profile_id, openalex_id, score, tier_used, gather_run_id,
             score_raw, score_max_seed, score_pct,
             score_reranker_raw, score_reranker_norm, score_blended,
-            sourced_by_topic_id,
+            sourced_by_topic_id, reranker_query_key,
         ),
     )
     conn.commit()
@@ -331,8 +336,14 @@ def top_for_profile(
     *,
     limit: int = 50,
     year_from: int | None = None,
+    below: bool = False,
 ) -> list[sqlite3.Row]:
     """Top-N candidates for the daily radar (no shown/dismissed filter).
+
+    ``below``: the papers under the threshold instead (the feed's "Below
+    the bar" filter), closest to it first. They are stored but not in the
+    pool, so they have no blend; that filter only ever read the feed's
+    passing rows and so was always empty.
 
     Joins papers so the API mapper has title / doi / abstract / venue /
     year in one row, and carries the score breakdown so callers can show
@@ -359,10 +370,10 @@ def top_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES} AND {IN_YEARS}
+          AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS}
           -- The feed's own "published since" filter, on top of the interest's range.
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
-        ORDER BY COALESCE(pc.score_blended, pc.score) DESC
+        ORDER BY {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
         LIMIT ?
         """,
         (profile_id, year_from, year_from, limit),

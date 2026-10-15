@@ -37,6 +37,7 @@ from ...db.repos import (
     papers as papers_repo,
     profiles as profiles_repo,
     researchers as researchers_repo,
+    users as users_repo,
 )
 from ...openalex_client import OpenAlexClient
 from ...prosopia_client import DEFAULT_BASE_URL
@@ -209,7 +210,7 @@ def prepare_researcher_import(
             wanted = {orcid_service._strip_openalex(i) for i in paper_ids if (i or "").strip()}
             if not wanted:
                 raise ValueError("select at least one work to import")
-        client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+        client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
         # No registry call: this path builds an import plan and never
         # looks at claimed / duplicate_of. See orcid.prepare_import.
         listing = orcid_service.list_works(oid, client, check_registry=False)
@@ -324,7 +325,7 @@ def works_for_refresh(
     saved_doi = {d for d in (normalize_doi(r["doi"]) for r in saved) if d}
 
     if row["source"] == "orcid":
-        client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+        client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
         listing = orcid_service.list_works(row["key"], client)
         works = listing["works"]
         known = {
@@ -384,8 +385,9 @@ def get_researcher(
 def delete_researcher(
     conn: sqlite3.Connection, user_id: int, researcher_id: int
 ) -> None:
-    """Forget the person. Their papers stay in the vault, and any interest
-    built from them keeps its seeds; it just no longer points back."""
+    """Forget the person. Any interest built from them keeps its seeds (and
+    so those papers stay in the vault); it just no longer points back.
+    Their other papers leave the vault with them."""
     _require(conn, user_id, researcher_id)
     researchers_repo.delete(conn, researcher_id)
 

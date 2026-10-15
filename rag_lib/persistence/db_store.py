@@ -285,6 +285,7 @@ def dedup_and_insert_candidates(
                 score_reranker_norm=_breakdown_float(breakdown, "score_reranker_norm"),
                 score_blended=_breakdown_float(breakdown, "score_blended"),
                 sourced_by_topic_id=(source_topics or {}).get(paper.openalex_id),
+                reranker_query_key=(breakdown or {}).get("reranker_query_key"),
             )
             if n_counted is not None and i >= n_counted:
                 pass

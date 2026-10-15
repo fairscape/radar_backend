@@ -45,6 +45,7 @@ from ..schemas import (
     ProsopiaWorksResponse,
 )
 from ..settings import Settings
+from ...db.repos import users as _users_repo
 
 log = structlog.get_logger("rag_lib.api.routers.prosopia")
 
@@ -262,7 +263,7 @@ def orcid_works(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000)",
         )
-    client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+    client = openalex_client or OpenAlexClient(mailto=_users_repo.mailto_from_row(user, settings.RADAR_DEFAULT_MAILTO))
     try:
         listing = orcid_service.list_works(oid, client)
     except Exception as exc:  # noqa: BLE001 — upstream trouble is a 502

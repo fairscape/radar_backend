@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 
 from ...db.repos import gather_runs as gather_runs_repo
+from ...db.repos import users as users_repo
 from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, fetch_claimed
 from ...paper import normalize_title, title_key
@@ -438,7 +439,7 @@ def prepare_import(
     if inflight is not None:
         raise ImportAlreadyRunning(inflight["slug"], int(inflight["run_id"]))
 
-    client = openalex_client or OpenAlexClient(mailto=settings.RADAR_DEFAULT_MAILTO)
+    client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
     # check_registry=False: records_for reads only id/title/doi/year/venue,
     # so the annotations would be an uncached HTTP round trip to
     # pub.orcid.org inside this POST for an answer nobody reads. The user

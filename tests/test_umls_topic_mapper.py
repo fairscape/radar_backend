@@ -268,3 +268,60 @@ def test_base_filters_not_mutated():
     per_paper = [[_mt("https://openalex.org/T900", "Retinal Diseases", 0.9)]]
     merge_umls_topics(base, per_paper, max_additions=4)
     assert len(base["topics"]) == before
+
+
+# --------------------------------------------------------------------------
+# The index must come from the embedder the mapper uses
+# --------------------------------------------------------------------------
+
+
+def _write_index(d, dim: int, model: str | None):
+    import json
+
+    from rag_lib.umls.cache import META_FILE
+
+    topics = [{"id": f"https://openalex.org/T{i}", "display_name": f"Topic {i}"} for i in range(3)]
+    (d / "openalex_topics.json").write_text(json.dumps(topics))
+    np.savez_compressed(d / "openalex_topic_embeddings.npz", embeddings=np.eye(3, dim, dtype=np.float32))
+    if model:
+        (d / META_FILE).write_text(json.dumps({"embedding_model": model, "dim": dim}))
+
+
+@pytest.fixture()
+def fresh_index(monkeypatch):
+    from rag_lib import embedders
+    from rag_lib.umls import cache
+
+    monkeypatch.setattr(cache, "_index", None)
+    dims = {"model-1024": 1024, "model-768": 768}
+    monkeypatch.setattr(embedders, "get_embedder",
+                        lambda name: (lambda text: [1.0] + [0.0] * (dims[name] - 1)))
+
+
+def _concept():
+    from rag_lib.umls.extractor import UmlsConcept
+    return UmlsConcept(cui="C1", name="diabetes", tui="T047", semantic_type="Disease", confidence=0.9)
+
+
+def test_an_index_built_with_the_mappers_model_maps(tmp_path, fresh_index):
+    _write_index(tmp_path, 1024, "model-1024")
+    out = topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
+    assert [m.topic_id for m in out] == ["https://openalex.org/T0"]
+
+
+def test_an_index_built_with_another_model_is_refused_by_name(tmp_path, fresh_index):
+    from rag_lib.umls.cache import TopicIndexMismatch
+
+    # Same dimension, different model: used to match nonsense silently.
+    _write_index(tmp_path, 1024, "other-1024")
+    with pytest.raises(TopicIndexMismatch, match="build_topic_index.py --embedding-model model-1024"):
+        topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
+
+
+def test_an_old_index_without_meta_is_refused_on_dimension(tmp_path, fresh_index):
+    from rag_lib.umls.cache import TopicIndexMismatch
+
+    # The default rebuild wrote 768-d specter2 vectors; mxbai gives 1024-d.
+    _write_index(tmp_path, 768, None)
+    with pytest.raises(TopicIndexMismatch, match="768-d"):
+        topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))

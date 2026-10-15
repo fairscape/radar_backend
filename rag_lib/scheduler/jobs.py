@@ -127,11 +127,27 @@ class _ProgressReporter:
 
 
 def _resolve_mailto(user_row, default_mailto: str) -> str:
-    if user_row is not None and user_row["mailto"]:
-        return user_row["mailto"]
-    if user_row is not None and user_row["email"]:
-        return user_row["email"]
-    return default_mailto
+    return users_repo.mailto_from_row(user_row, default_mailto)
+
+
+def _paper_from_row(prow) -> Paper:
+    """A ``papers`` row as a domain ``Paper`` (text and topics, no vectors)."""
+    topics = papers_repo.decode_topics(prow)
+    return Paper.from_dict(
+        {
+            "doi": prow["doi"],
+            "openalex_id": prow["openalex_id"],
+            "title": prow["title"],
+            "abstract": prow["abstract"],
+            "year": prow["year"],
+            "venue": prow["venue"],
+            "primary_topic": topics.get("primary_topic"),
+            "topics": topics.get("topics") or [],
+            "local_path": prow["local_path"],
+            "body_text": prow["body_text"],
+            "source": prow["source"],
+        }
+    )
 
 
 def _load_profile(conn, profile_row) -> Profile:
@@ -154,22 +170,7 @@ def _load_profile(conn, profile_row) -> Profile:
         prow = papers_repo.get_by_openalex_id(conn, oa_id)
         if prow is None:
             continue
-        topics = papers_repo.decode_topics(prow)
-        paper = Paper.from_dict(
-            {
-                "doi": prow["doi"],
-                "openalex_id": prow["openalex_id"],
-                "title": prow["title"],
-                "abstract": prow["abstract"],
-                "year": prow["year"],
-                "venue": prow["venue"],
-                "primary_topic": topics.get("primary_topic"),
-                "topics": topics.get("topics") or [],
-                "local_path": prow["local_path"],
-                "body_text": prow["body_text"],
-                "source": prow["source"],
-            }
-        )
+        paper = _paper_from_row(prow)
         vec = embeddings_repo.get(conn, oa_id, embedding_model)
         if vec is not None:
             paper.embeddings[embedding_model] = vec.tolist()
@@ -242,11 +243,189 @@ def rescore_pool(conn, profile_id: int, settings=None, *, reranker=None) -> int:
     if reranker is None:
         prow = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
         reranker = _build_reranker(prow, settings)
+    # The pool may now hold papers never reranked, or reranked against
+    # queries that just changed; rerank those in the background.
+    if reranker.name != "noop":
+        request_rerank_refresh(profile_id)
     return rescore_profile_pool(
         conn, profile_id,
         alpha=float(getattr(reranker, "alpha", getattr(settings, "RADAR_RERANKER_ALPHA", 0.4))),
         beta=float(getattr(reranker, "beta", getattr(settings, "RADAR_RERANKER_BETA", 0.6))),
     )
+
+
+# Papers reranked per ``refresh_reranker`` call. The whole live pool was
+# ~1,500 rows on 2026-10-14, so one call normally clears an interest; the
+# cap bounds a GPU pass and the sweep picks up the rest.
+RERANK_REFRESH_LIMIT = 600
+
+# The live BackgroundScheduler, set by ``runner.start``; None in tests and
+# the CLI, where a refresh request is a no-op and the sweep never runs.
+_SCHEDULER = None
+_refresh_locks: dict[int, Any] = {}
+# Interests asked for while their refresh was running: APScheduler skips a
+# job whose previous run is still going, so the job re-runs itself instead.
+_refresh_again: set[int] = set()
+
+
+def stale_rerank_ids(conn, profile_id: int, key: str, limit: int | None = None) -> list[str]:
+    """Pool rows (what the feed can show) whose reranker logit is missing or
+    was computed against another query set, best cosine first."""
+    from ..db.repos.candidates import IN_YEARS, PASSES
+
+    sql = f"""
+        SELECT pc.openalex_id
+        FROM profile_candidates pc
+        JOIN profiles pr ON pr.id = pc.profile_id
+        JOIN papers p ON p.openalex_id = pc.openalex_id
+        WHERE pc.profile_id = ? AND {PASSES} AND {IN_YEARS}
+          AND (pc.score_reranker_raw IS NULL OR pc.reranker_query_key IS NULL
+               OR pc.reranker_query_key != ?)
+        ORDER BY pc.score_raw DESC
+    """
+    params: list = [profile_id, key]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [r[0] for r in conn.execute(sql, params).fetchall()]
+
+
+def refresh_reranker(conn, profile_id: int, settings=None, *, reranker=None,
+                     profile: Profile | None = None, limit: int = RERANK_REFRESH_LIMIT) -> int:
+    """Rerank the pool rows whose logit is stale or missing, then rescore the pool.
+
+    Two ways a pool row ended up without a current logit. Its queries
+    changed (a seed, topic or research-topic edit) after it was reranked,
+    so its logit was on another scale but normalised with the rest. Or it
+    started passing after its scan (a lowered threshold, a refit, a wider
+    year range): a scan reranks only what passes at the time, so it stood
+    at the pool's median for good. Returns the number reranked.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+    import threading
+
+    lock = _refresh_locks.setdefault(profile_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        # One is running for this interest: have it go round once more,
+        # since what it read may predate whatever asked for this one.
+        _refresh_again.add(profile_id)
+        return 0
+    try:
+        n = 0
+        for _ in range(3):      # bounded: each pass reranks only what went stale
+            _refresh_again.discard(profile_id)
+            n += _refresh_once(conn, profile_id, settings, reranker=reranker, profile=profile, limit=limit)
+            if profile_id not in _refresh_again:
+                break
+            # Asked again meanwhile: the queries may have changed since
+            # ``reranker`` / ``profile`` were built, so rebuild both.
+            reranker = profile = None
+        return n
+    finally:
+        lock.release()
+
+
+def _refresh_once(conn, profile_id: int, settings, *, reranker=None,
+                  profile: Profile | None = None, limit: int = RERANK_REFRESH_LIMIT) -> int:
+    """One ``refresh_reranker`` pass; the caller holds the interest's lock."""
+    prow = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    if prow is None or prow["is_draft"]:
+        return 0
+    if reranker is None:
+        reranker = _build_reranker(prow, settings)
+    if reranker.name == "noop" or not hasattr(reranker, "query_key"):
+        return 0
+    if profile is None:
+        profile = _load_profile(conn, prow)
+    key = reranker.query_key(profile)
+    if key is None:
+        return 0
+    ids = stale_rerank_ids(conn, profile_id, key, limit)
+    if not ids:
+        return 0
+    rows = {r["openalex_id"]: r for r in conn.execute(
+        f"SELECT pc.openalex_id, pc.score_raw, pc.score, pc.reranker_query_key FROM profile_candidates pc "
+        f"WHERE pc.profile_id = ? AND pc.openalex_id IN ({','.join('?' * len(ids))})",
+        (profile_id, *ids),
+    ).fetchall()}
+    entries = []
+    for oa in ids:
+        prow_p = papers_repo.get_by_openalex_id(conn, oa)
+        if prow_p is None:
+            continue
+        raw = rows[oa]["score_raw"] if rows[oa]["score_raw"] is not None else rows[oa]["score"]
+        entries.append((float(raw or 0.0), _paper_from_row(prow_p), {"score_raw": raw}))
+    out = reranker.rerank(entries, profile, conn=None)
+    # Only rows nobody rewrote meanwhile: a scan that reranked a paper
+    # against newer queries while this ran must keep its logit.
+    conn.executemany(
+        "UPDATE profile_candidates SET score_reranker_raw = ?, reranker_query_key = ? "
+        "WHERE profile_id = ? AND openalex_id = ? AND reranker_query_key IS ?",
+        [(bd["score_reranker_raw"], bd.get("reranker_query_key", key), profile_id, p.openalex_id,
+          rows[p.openalex_id]["reranker_query_key"])
+         for _, p, bd in out if bd.get("score_reranker_raw") is not None],
+    )
+    conn.commit()
+    rescore_profile_pool(
+        conn, profile_id,
+        alpha=float(getattr(reranker, "alpha", 0.4)), beta=float(getattr(reranker, "beta", 0.6)),
+    )
+    log.info("scheduler.rerank_refreshed", profile_id=profile_id, n=len(out))
+    return len(out)
+
+
+def refresh_reranker_job(profile_id: int) -> None:
+    """Background entry point for ``refresh_reranker`` (own connection; logs, never raises)."""
+    from ..api.settings import get_settings
+
+    settings = get_settings()
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        refresh_reranker(conn, profile_id, settings)
+    except Exception:  # noqa: BLE001 -- a failed refresh leaves the old logits
+        log.exception("scheduler.rerank_refresh_failed", profile_id=profile_id)
+    finally:
+        conn.close()
+
+
+def refresh_rerankers_sweep() -> None:
+    """Every live interest with stale logits: the net under ``request_rerank_refresh``
+    (a request made while a refresh ran, a restart, rows from before 0019)."""
+    from ..api.settings import get_settings
+
+    settings = get_settings()
+    if not getattr(settings, "RADAR_RERANKER_ENABLED", False):
+        return
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        pids = [int(r[0]) for r in conn.execute("SELECT id FROM profiles WHERE is_draft = 0").fetchall()]
+    finally:
+        conn.close()
+    for pid in pids:
+        refresh_reranker_job(pid)
+
+
+def request_rerank_refresh(profile_id: int) -> None:
+    """Refresh an interest's reranker logits soon, in the background.
+
+    Called wherever the pool or the queries change. A no-op without a
+    running scheduler; a request while one is pending replaces it, and one
+    while it runs makes it run again when done.
+    """
+    if _SCHEDULER is None:
+        return
+    from datetime import datetime, timezone
+
+    try:
+        _SCHEDULER.add_job(
+            refresh_reranker_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
+            args=[profile_id], id=f"rerank-refresh:{profile_id}",
+            replace_existing=True, max_instances=1,
+        )
+    except Exception:  # noqa: BLE001 -- the sweep catches up
+        log.exception("scheduler.rerank_refresh_request_failed", profile_id=profile_id)
 
 
 def _build_reranker(profile_row, settings):
@@ -484,7 +663,34 @@ def gather_for_profile(
             # The blend and percentile just written are relative to this
             # batch only; the feed ranks the whole pool. Put every row back
             # on one scale (see scoring/pool.py for what went wrong).
-            rescore_pool(conn, profile_id, settings, reranker=reranker)
+            # Seeds changed while this ran (a refit rewrote the fit): this
+            # batch was scored against the old centroid, and its rows went
+            # in after the refit had rescored the pool. Score every stored
+            # candidate against the current seeds again, and rerank with
+            # queries rebuilt from them.
+            now_row = profiles_repo.get(conn, profile_id)
+            if now_row is not None and now_row["selector_config_json"] != profile_row["selector_config_json"]:
+                from ..scoring.rescore import rescore_candidates
+
+                log.info("scheduler.gather_seeds_changed", profile_id=profile_id, run_id=run_id)
+                rescore_candidates(conn, profile_id)
+                reranker, profile = _build_reranker(now_row, settings), None
+            # Pool papers this batch did not rerank (they started passing
+            # since their own scan, or their queries changed) get a current
+            # logit now; the rest of the pool was blended at the median.
+            if reranker.name != "noop":
+                reporter.step("reranking", message="Reranking older papers in the pool")
+                try:
+                    if not refresh_reranker(conn, profile_id, settings, reranker=reranker, profile=profile):
+                        # Nothing stale, or a background refresh holds the
+                        # interest: have it go round once more after this.
+                        request_rerank_refresh(profile_id)
+                except Exception:  # noqa: BLE001 -- the scan itself succeeded; the sweep retries
+                    log.exception("scheduler.rerank_refresh_failed", profile_id=profile_id)
+            rescore_profile_pool(
+                conn, profile_id,
+                alpha=float(getattr(reranker, "alpha", 0.4)), beta=float(getattr(reranker, "beta", 0.6)),
+            )
             api_calls = gatherer.cost().get("api_calls", 0)
             gather_runs_repo.finish(
                 conn,
@@ -533,6 +739,7 @@ def dry_run_for_draft(
     thresholds: list[float] | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
+    selected_topic_ids: list[str] | None = None,
     run_id: int,
 ) -> int | None:
     """Async dry-run body for the wizard's calibrate step.
@@ -583,6 +790,7 @@ def dry_run_for_draft(
                     thresholds=thresholds,
                     year_from=year_from,
                     year_to=year_to,
+                    selected_topic_ids=selected_topic_ids,
                     reporter=reporter,
                 )
             reporter.step("persisting", message="Saving dry-run result")
@@ -715,6 +923,37 @@ def _backfill_import_umls(conn, settings, plan) -> None:
         log.exception("prosopia_import.umls_backfill_failed", slug=plan.slug)
 
 
+# Interests whose seeds ``extract_seed_umls_job`` is working through.
+SEED_UMLS_RUNNING: set[int] = set()
+
+
+def extract_seed_umls_job(profile_id: int, settings: Any | None = None) -> int:
+    """Extract UMLS for every seed of one interest that has none yet.
+
+    Wizard step 3 starts this and waits for it, so the topic list is built
+    from every seed's concepts. Step 3 used to extract inside its own
+    request within a 30-second budget and show whatever had landed; an
+    import's extraction ran after the import reported done, and what
+    finished later never reached the draft's topics.
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+    from ..api.services.vault import backfill_seed_umls
+
+    SEED_UMLS_RUNNING.add(profile_id)
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
+        return backfill_seed_umls(conn, settings, openalex_ids=ids, limit=max(1, len(ids)))
+    except Exception:  # noqa: BLE001 -- the seeds stay pending; the sweep retries
+        log.exception("scheduler.seed_umls_failed", profile_id=profile_id)
+        return 0
+    finally:
+        conn.close()
+        SEED_UMLS_RUNNING.discard(profile_id)
+
+
 def backfill_seed_umls_job(settings: Any | None = None) -> int:
     """Periodic: extract UMLS for seeds that have never been extracted.
 
@@ -739,4 +978,4 @@ def backfill_seed_umls_job(settings: Any | None = None) -> int:
 
 
 __all__ = ["gather_for_profile", "dry_run_for_draft", "import_prosopia_profile",
-           "backfill_seed_umls_job"]
+           "backfill_seed_umls_job", "extract_seed_umls_job"]

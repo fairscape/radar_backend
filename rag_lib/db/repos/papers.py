@@ -45,6 +45,10 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
 
     topics_json = _encode_topics(paper)
     authors_json = _encode_authors(paper)
+    before = conn.execute(
+        "SELECT title, abstract, body_text, umls_concepts_json FROM papers WHERE openalex_id = ?",
+        (paper["openalex_id"],),
+    ).fetchone()
     fields = (
         paper["openalex_id"],
         paper.get("doi"),
@@ -76,13 +80,16 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
         ON CONFLICT(openalex_id) DO UPDATE SET
           doi                 = COALESCE(excluded.doi, doi),
           title               = excluded.title,
-          abstract            = COALESCE(excluded.abstract, abstract),
+          -- NULLIF: a gather passes '' for "OpenAlex has none" (and for
+          -- body text it never has), which COALESCE took as a value -- a
+          -- re-fetched seed lost its PDF body text or its Prosopia abstract.
+          abstract            = COALESCE(NULLIF(excluded.abstract, ''), abstract),
           year                = COALESCE(excluded.year, year),
           venue               = COALESCE(excluded.venue, venue),
           publication_date    = COALESCE(excluded.publication_date, publication_date),
           topics_json         = COALESCE(excluded.topics_json, topics_json),
           local_path          = COALESCE(excluded.local_path, local_path),
-          body_text           = COALESCE(excluded.body_text, body_text),
+          body_text           = COALESCE(NULLIF(excluded.body_text, ''), body_text),
           file_hash           = COALESCE(excluded.file_hash, file_hash),
           uploaded_by_user_id = COALESCE(excluded.uploaded_by_user_id, uploaded_by_user_id),
           n_pages             = COALESCE(excluded.n_pages, n_pages),
@@ -92,8 +99,36 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
         """,
         fields,
     )
+    if before is not None and before[3] is not None:     # extracted before
+        _forget_umls_if_text_changed(
+            conn, paper, dict(zip(("title", "abstract", "body_text"), before[:3])))
     conn.commit()
     return paper["openalex_id"]
+
+
+def _forget_umls_if_text_changed(conn: sqlite3.Connection, paper: dict[str, Any], before) -> None:
+    """Clear a paper's UMLS results when the text they were read from changed.
+
+    Every extraction path only picks papers whose concepts are NULL, and an
+    update never touched them, so a seed imported without an abstract
+    (concepts from the title alone) kept them after its PDF's body text or
+    a later abstract arrived. NULL sends it back to extraction. Compared
+    on the text extraction reads, mirroring the COALESCEs above, so a
+    re-import of the same record changes nothing.
+    """
+    from ...umls.text import umls_input_text
+
+    def merged(key):     # as the upsert's COALESCE(NULLIF(new, ''), old)
+        return paper.get(key) if paper.get(key) else before[key]
+
+    old = umls_input_text(before["title"], before["abstract"], before["body_text"])
+    new = umls_input_text(paper.get("title") or "", merged("abstract"), merged("body_text"))
+    if new != old:
+        conn.execute(
+            "UPDATE papers SET umls_concepts_json = NULL, umls_mapped_topics_json = NULL "
+            "WHERE openalex_id = ?",
+            (paper["openalex_id"],),
+        )
 
 
 def get_by_user_hash(

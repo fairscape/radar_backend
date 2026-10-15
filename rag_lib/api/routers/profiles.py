@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
+    SeedUmlsStatus,
     CommitDraftRequest,
     Draft,
     DraftCoherence,
@@ -233,6 +234,63 @@ def draft_coherence(
         ) from exc
 
 
+def _seed_umls_status(db, settings, profile_id: int):
+    from rag_lib.api.services.vault import seed_umls_status
+    from rag_lib.db.repos import profiles as profiles_repo
+    from rag_lib.scheduler.jobs import SEED_UMLS_RUNNING
+
+    ids = profiles_repo.list_seed_openalex_ids(db, profile_id)
+    merge = wizard_service.umls_topics_state(profile_id)
+    return SeedUmlsStatus(**seed_umls_status(db, settings, ids), running=profile_id in SEED_UMLS_RUNNING,
+                          topics_available=merge["available"], topics_reason=merge["reason"],
+                          topics_n=merge["n"])
+
+
+@router.get("/{key}/umls", response_model=SeedUmlsStatus)
+def seed_umls(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SeedUmlsStatus:
+    """How far UMLS extraction is over a draft's (or interest's) seeds."""
+    return _seed_umls_status(db, settings, _resolve_profile_id(db, int(user["id"]), key))
+
+
+@router.post("/{key}/umls", response_model=SeedUmlsStatus)
+def start_seed_umls(
+    key: str,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SeedUmlsStatus:
+    """Extract UMLS for the seeds that have none yet, in the background.
+
+    Wizard step 3 calls this on entry and polls ``GET`` until nothing is
+    pending, then builds the topic list. Seeds added after going back to
+    step 1 are pending again, and so is a seed whose text changed (the
+    papers repo clears its results). Without a scheduler (tests) it runs
+    inline.
+    """
+    from rag_lib.scheduler.jobs import SEED_UMLS_RUNNING, extract_seed_umls_job
+
+    profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    st = _seed_umls_status(db, settings, profile_id)
+    if st.pending == 0 or profile_id in SEED_UMLS_RUNNING:
+        return st
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        extract_seed_umls_job(profile_id, settings)
+    else:
+        SEED_UMLS_RUNNING.add(profile_id)    # visible to the poll before the job starts
+        scheduler.add_job(
+            extract_seed_umls_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
+            args=[profile_id], id=f"seed-umls:{profile_id}", replace_existing=True, max_instances=1,
+        )
+    return _seed_umls_status(db, settings, profile_id)
+
+
 @router.get("/draft/{slug}/topics", response_model=list[Topic])
 def draft_topics(
     slug: str,
@@ -300,6 +358,12 @@ def draft_dry_run(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
     profile_id = int(profile_row["id"])
+    if body.selected_topic_ids is not None:
+        try:
+            wizard_service.save_topics(db, user_id=int(user["id"]), slug=slug,
+                                       selected_topic_ids=body.selected_topic_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     # Open the audit row eagerly so we can echo a real run_id even when
     # the inline / test path runs synchronously.
@@ -320,6 +384,7 @@ def draft_dry_run(
             user_id=int(user["id"]), slug=slug,
             days=body.days, thresholds=body.thresholds,
             year_from=body.year_from, year_to=body.year_to,
+            selected_topic_ids=body.selected_topic_ids,
             gatherer=gatherer,
         )
         gather_runs_repo.finish(
@@ -358,6 +423,7 @@ def draft_dry_run(
             "thresholds": body.thresholds,
             "year_from": body.year_from,
             "year_to": body.year_to,
+            "selected_topic_ids": body.selected_topic_ids,
         },
         id=f"dry-run:{profile_id}:{run_id}",
         replace_existing=False,
@@ -617,6 +683,8 @@ def commit_draft(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    except ValueError as exc:   # no topic left on
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     # Not Depends(get_scheduler): that 503s when the scheduler is off, and a
     # commit must succeed either way -- the row is there for the next boot.
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -844,6 +912,9 @@ def update_terms(
     record["removed"] = [t.model_dump() for t in body.removed if t.label.strip() and t.label not in kept]
     record["not_interests"] = [s for s in body.not_interests if s.strip()]
     interest_terms.save(db, int(row["id"]), record)
+    # Research topics are the reranker's queries in terms mode.
+    from rag_lib.scheduler.jobs import request_rerank_refresh
+    request_rerank_refresh(int(row["id"]))
     return _terms_view(db, row, record)
 
 
@@ -897,6 +968,8 @@ def recompute_topics(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
+    from rag_lib.scheduler.jobs import request_rerank_refresh
+    request_rerank_refresh(_resolve_profile_id(db, int(user["id"]), key))
     out: list[Topic] = []
     for entry in (topic_filters.get("topics") or []):
         tid = entry.get("id") or ""
@@ -1248,6 +1321,16 @@ def update_schedule(
     )
 
 
+def _reranker_mode_for(profile_row) -> str | None:
+    """The configured reranker's ``query_mode`` (None for no reranker)."""
+    try:
+        from ...scheduler.jobs import _build_reranker
+
+        return getattr(_build_reranker(profile_row, get_settings()), "query_mode", None)
+    except Exception:  # noqa: BLE001 -- diagnostics only
+        return None
+
+
 def _reranker_queries_for(db: sqlite3.Connection, profile_row) -> list[str]:
     """The queries the configured reranker would actually issue.
 
@@ -1289,6 +1372,7 @@ def reranker_comparison(
 
     profile_row = profiles_repo.get(db, profile_id)
     _queries_used = _reranker_queries_for(db, profile_row)
+    _query_mode = _reranker_mode_for(profile_row) if profile_row is not None else None
 
     # Load candidates that have reranker scores.
     # Use score_raw (original selector cosine) for "before" ranking,
@@ -1320,7 +1404,8 @@ def reranker_comparison(
     ).fetchall()
 
     if not all_rows:
-        return RerankerComparisonResponse(ok=True, key=key, n=0, queries_used=_queries_used)
+        return RerankerComparisonResponse(ok=True, key=key, n=0, queries_used=_queries_used,
+                                          query_mode=_query_mode)
 
     by_selector = sorted(all_rows, key=lambda r: r["score_raw"], reverse=True)
     by_blended = sorted(all_rows, key=lambda r: r["score_blended"], reverse=True)
@@ -1365,6 +1450,7 @@ def reranker_comparison(
         max_rank_up=max_up,
         max_rank_down=max_down,
         queries_used=_queries_used,
+        query_mode=_query_mode,
     )
 
 

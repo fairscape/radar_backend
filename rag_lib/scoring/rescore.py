@@ -11,9 +11,10 @@ vectors they compute from 2026-10-01 on (selectors attach them to the
 paper, db_store persists them); older ones are filled by
 ``scripts/backfill_candidate_embeddings.py``.
 
-The reranker's raw score is not recomputed. Its queries come from the
-seeds too, but it is a cross-encoder pass per paper -- too slow for a
-click. The next scan that fetches the paper again refreshes it.
+The reranker's raw score is not recomputed here: it is a cross-encoder
+pass per paper, too slow for a click. ``jobs.rescore_pool`` asks for a
+background ``jobs.refresh_reranker``, which reranks the pool rows whose
+logit is missing or was computed against other queries.
 """
 
 from __future__ import annotations

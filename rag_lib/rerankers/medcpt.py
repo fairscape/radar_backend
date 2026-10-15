@@ -197,6 +197,7 @@ class MedCPTReranker:
 
         # Score all (query, article) pairs
         all_logits = self._batch_score(queries, articles)
+        qkey = self._key_for(queries)
 
         # Aggregate per-candidate raw scores first, then normalize
         n_q = len(queries)
@@ -243,6 +244,7 @@ class MedCPTReranker:
             bd["score_selector_norm"] = sel_norm
             bd["score_blended"] = blended
             bd["reranker_queries_used"] = n_q
+            bd["reranker_query_key"] = qkey
             best_q = queries[best_idx]
             bd["reranker_best_query"] = (
                 best_q[:120] + "\u2026" if len(best_q) > 120 else best_q
@@ -342,6 +344,28 @@ class MedCPTReranker:
 
     def diagnostics(self) -> dict:
         return dict(self._last_diagnostics)
+
+    def query_key(self, profile: Profile) -> str | None:
+        """Fingerprint of what a paper's ``score_reranker_raw`` is relative to.
+
+        The stored logit is a function of the paper *and* this query set
+        (and the model and aggregation). A seed, topic or research-topic
+        edit changes the queries, so logits stored before it are on another
+        scale; the pool normalised them together with new ones anyway.
+        Stored next to each logit (``reranker_query_key``) so stale ones
+        can be found and recomputed (``jobs.refresh_reranker``). None when
+        there are no queries (nothing would be reranked).
+        """
+        queries = self._load_queries(profile)
+        return self._key_for(queries) if queries else None
+
+    def _key_for(self, queries: list[str]) -> str:
+        import hashlib
+        import json as _json
+
+        blob = _json.dumps([self.model_id, self.query_mode, self.aggregation, queries],
+                           ensure_ascii=False)
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Query construction

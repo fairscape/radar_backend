@@ -127,6 +127,21 @@ def start(scheduler, settings) -> None:
         # which APScheduler read as UTC -- on this EDT host, ~4 hours ago.
         next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3),
     )
+    # Reranker logits that went stale (queries changed) or were never
+    # computed (papers that started passing after their scan); requests
+    # from the routes run at once, this catches whatever they missed.
+    from . import jobs as jobs_module
+
+    scheduler.add_job(
+        jobs_module.refresh_rerankers_sweep,
+        trigger=IntervalTrigger(minutes=30),
+        id="rerank-refresh-sweep",
+        name="rerank-refresh-sweep",
+        replace_existing=True,
+        max_instances=1,
+        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    jobs_module._SCHEDULER = scheduler
     scheduler.start()
     log.info("scheduler.started", n_jobs=len(rows))
 
@@ -135,6 +150,10 @@ def stop(scheduler) -> None:
     """Graceful shutdown for the FastAPI lifespan teardown."""
     if scheduler is None:
         return
+    from . import jobs as jobs_module
+
+    if jobs_module._SCHEDULER is scheduler:
+        jobs_module._SCHEDULER = None
     try:
         scheduler.shutdown(wait=False)
     except Exception:  # noqa: BLE001 — log-and-swallow during teardown

@@ -3,6 +3,16 @@
 Loads the precomputed topic metadata + embedding matrix created by
 ``scripts/build_topic_index.py``. The index is loaded lazily on first
 access and cached in memory for the lifetime of the process.
+
+The vectors are only comparable with concept vectors from the *same*
+embedder. The index files used to record nothing about it, and the build
+script defaulted to specter2 (768-d) while the mapper embeds with
+``RADAR_UMLS_EMBEDDING_MODEL`` (mxbai-embed-large, 1024-d): a rebuild with
+the defaults made every search raise inside the extractor, which swallowed
+it, so no paper got UMLS topics and every seed was retried every sweep. A
+same-dimension wrong model would have matched nonsense without an error.
+The build now writes ``META_FILE`` naming its model, and both a named
+mismatch and a dimension mismatch raise ``TopicIndexMismatch``.
 """
 
 from __future__ import annotations
@@ -23,11 +33,19 @@ log = logging.getLogger(__name__)
 _index: TopicIndex | None = None
 _index_lock = Lock()
 
+META_FILE = "openalex_topic_index.meta.json"
+
+
+class TopicIndexMismatch(ValueError):
+    """The topic index was built with a different embedder than the one asked for."""
+
 
 class TopicIndex:
     """In-memory OpenAlex topic index for cosine similarity search."""
 
-    def __init__(self, topics: list[dict], embeddings: np.ndarray):
+    def __init__(self, topics: list[dict], embeddings: np.ndarray, *, embedding_model: str | None = None):
+        # None for an index built before META_FILE existed.
+        self.embedding_model = embedding_model
         self.topics = topics  # [{id, display_name, subfield, field, domain}, ...]
         # Row-normalize for fast cosine via dot product
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
@@ -46,6 +64,22 @@ class TopicIndex:
         """
         row = self._row_by_id.get(topic_id)
         return None if row is None else self.embeddings[row]
+
+    def check_compatible(self, embedding_model: str | None, dim: int | None = None) -> None:
+        """Raise ``TopicIndexMismatch`` unless vectors from ``embedding_model``
+        (of length ``dim``, when known) can be searched against this index."""
+        if embedding_model and self.embedding_model and embedding_model != self.embedding_model:
+            raise TopicIndexMismatch(
+                f"topic index was built with {self.embedding_model!r} but concepts are embedded "
+                f"with {embedding_model!r}; rebuild it: "
+                f"python scripts/build_topic_index.py --embedding-model {embedding_model}"
+            )
+        if dim is not None and dim != self.dim:
+            raise TopicIndexMismatch(
+                f"topic index has {self.dim}-d vectors but {embedding_model or 'the embedder'} "
+                f"gives {dim}-d; rebuild it: "
+                f"python scripts/build_topic_index.py --embedding-model {embedding_model}"
+            )
 
     def search(
         self, query_vec: np.ndarray, *, top_k: int = 3, min_similarity: float = 0.40
@@ -97,6 +131,12 @@ def get_topic_index(cache_dir: str | Path) -> TopicIndex:
         with open(topics_path, encoding="utf-8") as fh:
             topics = json.load(fh)
         embeddings = np.load(embeddings_path)["embeddings"]
+        meta_path = cache_dir / META_FILE
+        built_with = None
+        if meta_path.exists():
+            built_with = json.loads(meta_path.read_text(encoding="utf-8")).get("embedding_model")
+        else:
+            log.warning("Topic index in %s has no %s; cannot check which model built it", cache_dir, META_FILE)
 
         if embeddings.shape[0] != len(topics):
             raise ValueError(
@@ -104,6 +144,6 @@ def get_topic_index(cache_dir: str | Path) -> TopicIndex:
                 f"{embeddings.shape[0]} embeddings"
             )
 
-        _index = TopicIndex(topics, embeddings)
+        _index = TopicIndex(topics, embeddings, embedding_model=built_with)
         log.info("Topic index loaded: %d topics, %dd vectors", len(topics), _index.dim)
         return _index
