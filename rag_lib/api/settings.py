@@ -128,6 +128,9 @@ class Settings(BaseSettings):
     RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 10
     RADAR_UMLS_MIN_TOPIC_SIMILARITY: float = 0.40
     RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"
+    # Topics for an upload OpenAlex does not have, read from the PDF's own
+    # text against the same topic index (rag_lib.content_topics).
+    RADAR_CONTENT_TOPICS_ENABLED: bool = True
     RADAR_UMLS_CACHE_DIR: Path = Path("data/umls_cache")
 
     # MedCPT cross-encoder reranker. Disabled by default; enable after

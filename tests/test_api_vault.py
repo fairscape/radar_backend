@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import sqlite3
 
 import httpx
@@ -254,6 +255,33 @@ def test_a_pdf_without_a_title_is_named_after_the_uploaded_file(app, monkeypatch
     resp = _upload(app, b"untitled-bytes", filename="Lab scan 2024.pdf")
     assert resp.status_code == 200, resp.text
     assert resp.json()["title"] == "Lab scan 2024"
+
+
+def test_an_unmatched_upload_gets_topics_from_its_own_text(app, tmp_path, monkeypatch):
+    """OpenAlex has no record of it (the stub client finds nothing), so the
+    PDF's text is read for topics; an embedder failure still uploads."""
+    from rag_lib import content_topics
+    from rag_lib.db import connect as _connect
+
+    read = []
+    monkeypatch.setattr(content_topics, "topics_from_text", lambda title, body, settings: read.append(body) or [
+        {"id": "https://openalex.org/T9", "display_name": "Lab Notes", "subfield": None,
+         "field": None, "domain": None, "score": 0.7}])
+    resp = _upload(app, b"unmatched-bytes", filename="notes.pdf")
+    assert resp.status_code == 200, resp.text
+    oa = resp.json()["id"]
+    assert oa.startswith("local:") and read == ["hello world from a fake pdf"]
+    conn = _connect(tmp_path / "radar.db")
+    stored = json.loads(conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa,)).fetchone()[0])
+    conn.close()
+    assert stored["source"] == content_topics.SOURCE
+    assert [t["display_name"] for t in stored["topics"]] == ["Lab Notes"]
+
+    def down(*a, **k):
+        raise RuntimeError("ollama down")
+    monkeypatch.setattr(content_topics, "topics_from_text", down)
+    resp = _upload(app, b"other-unmatched-bytes", filename="more.pdf")
+    assert resp.status_code == 200, resp.text
 
 
 def test_upload_size_limit(app, monkeypatch):

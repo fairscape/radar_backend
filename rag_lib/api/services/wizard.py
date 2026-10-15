@@ -326,11 +326,15 @@ def aggregate_draft_topics(
 def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool) -> dict:
     """The seeds' aggregated topics, carrying forward prior on/off states.
 
-    Writes nothing. ``new_on`` is the state of a topic not seen before.
+    Writes nothing to the profile. ``new_on`` is the state of a topic not
+    seen before. (A seed OpenAlex does not have may get its content topics
+    stored on its paper row here; see ``_content_topics``.)
     """
     prior_on = _prior_topic_states(conn, profile_id)
+    from_content = _content_topics(conn, profile_id)
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
+    _keep_content_topics(topic_filters, from_content)
 
     # Best-effort UMLS topic merge: read the per-paper mapped topics
     # that vault.upload() stored and merge novel ones into the filters.
@@ -340,6 +344,65 @@ def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool
         if t.get("id"):
             t["on"] = prior_on.get(t["id"], new_on)
     return topic_filters
+
+
+def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict]:
+    """Topics read from the text of the seeds OpenAlex does not have.
+
+    Returns ``{topic_id: topic}`` for the topics no OpenAlex-matched seed
+    has. A ``local:`` seed with no topics yet (uploaded before this
+    existed, or while the embedder was down) is read now and stored on its
+    paper row; there are only ever a few, so this stays cheap.
+    """
+    from ... import content_topics
+    from ..settings import get_settings
+
+    rows = []
+    for oa_id in profiles_repo.list_seed_openalex_ids(conn, profile_id):
+        prow = papers_repo.get_by_openalex_id(conn, oa_id)
+        if prow is None:
+            continue
+        raw = prow["topics_json"]
+        if content_topics.is_local(oa_id) and not raw:
+            raw = content_topics.try_topics_json(prow["title"], prow["body_text"], settings=get_settings())
+            if raw is not None:
+                conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (raw, oa_id))
+                conn.commit()
+        rows.append(raw)
+    matched: set[str] = set()
+    found: dict[str, dict] = {}
+    for raw in rows:
+        ids = content_topics.ids_from_content(raw)
+        if ids:
+            for t in json.loads(raw).get("topics") or []:
+                if t.get("id") in ids:
+                    found.setdefault(t["id"], t)
+            continue
+        d = json.loads(raw) if raw else {}
+        for t in (d.get("topics") or []) + [d.get("primary_topic")]:
+            if isinstance(t, dict) and t.get("id"):
+                matched.add(t["id"])
+    return {tid: t for tid, t in found.items() if tid not in matched}
+
+
+def _keep_content_topics(topic_filters: dict, from_content: dict[str, dict]) -> None:
+    """Mark the content topics, and add back any the top-8 cut dropped.
+
+    ``aggregate_topic_filters`` keeps the 8 most common topics; one read
+    from a single PDF has a count of 1 and lost to the matched seeds' --
+    the same squeeze that kept that paper out of the search before.
+    """
+    from ... import content_topics
+
+    topics = topic_filters.setdefault("topics", [])
+    have = {t.get("id") for t in topics}
+    for t in topics:
+        if t.get("id") in from_content:
+            t["source"] = content_topics.SOURCE
+    for tid, t in from_content.items():
+        if tid not in have:
+            topics.append({"id": tid, "display_name": t.get("display_name") or "", "count": 1,
+                           "source": content_topics.SOURCE})
 
 
 def preview_topics(conn: sqlite3.Connection, *, user_id: int, slug: str) -> tuple[dict, set[str]]:

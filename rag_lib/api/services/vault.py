@@ -49,6 +49,7 @@ from ...db.repos import (
     users as users_repo,
     vault as vault_repo,
 )
+from ... import content_topics
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
 from ...openalex_client import OpenAlexClient
@@ -214,6 +215,12 @@ def upload(
         "local_path": str(pdf_path),
         "body_text": None if keep_text else record.body_text,
     })
+    if content_topics.is_local(openalex_id) and not (prior is not None and prior["topics_json"]):
+        # OpenAlex does not have it, so nothing says what it is about: read
+        # that from the PDF itself (rag_lib.content_topics).
+        found = content_topics.try_topics_json(paper_dict.get("title"), record.body_text, settings=settings)
+        if found is not None:
+            paper_dict["topics_json"] = found
     papers_repo.upsert(conn, paper_dict)
     papers_repo.record_upload(
         conn, user_id=user_id, openalex_id=openalex_id, file_hash=file_hash,
