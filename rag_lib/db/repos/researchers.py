@@ -127,6 +127,16 @@ def mark_imported(
     conn.commit()
 
 
+def set_last_run(conn: sqlite3.Connection, researcher_id: int, run_id: int) -> None:
+    """The run to watch, at kick-off. ``imported_at`` waits for ``mark_imported``:
+    stamped here it read "imported just now" for an import still running."""
+    conn.execute(
+        "UPDATE researchers SET last_run_id = ?, updated_at = datetime('now') WHERE id = ?",
+        (run_id, researcher_id),
+    )
+    conn.commit()
+
+
 def delete(conn: sqlite3.Connection, researcher_id: int) -> None:
     """Drop the researcher and its paper links. Papers and interests stay.
 

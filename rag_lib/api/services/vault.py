@@ -467,11 +467,15 @@ def _attach_to_profile(
     if profile is None:
         return
     profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id)
+    from . import wizard as wizard_service
+
+    # The upload embedded under the default model; a draft under another
+    # model (the default changed since it was created) had a seed with no
+    # vector, which coherence then counted as no seed at all.
+    wizard_service.embed_missing(conn, profile["embedding_model"], [openalex_id])
     # Even when the seed was already there: re-uploading the PDF is then how
     # a refit that failed after an earlier attach gets another go.
     if not profile["is_draft"]:
-        from . import wizard as wizard_service
-
         wizard_service.refit_profile(conn, user_id=user_id, slug=profile_slug)
 
 

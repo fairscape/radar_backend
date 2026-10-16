@@ -86,7 +86,7 @@ def test_a_merge_that_cannot_run_keeps_the_stored_umls_topics_and_says_so(app, t
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(wizard, "_merge_umls_topics", locked)
-    topics = _request(app, "GET", "/api/profiles/draft/chromatin/topics").json()
+    topics = _request(app, "POST", "/api/profiles/chromatin/recompute-topics").json()
     kept = [t for t in topics if t["id"] == "https://openalex.org/T9"]
     assert kept and kept[0]["on"] is False and kept[0]["source"] == "umls"   # kept, still switched off
     st = _request(app, "GET", "/api/profiles/chromatin/umls").json()
@@ -100,7 +100,7 @@ def test_an_unreadable_seed_is_sent_back_to_extraction_and_reported(app, tmp_pat
                  "WHERE openalex_id = 'W0'")
     conn.commit()
     conn.close()
-    _request(app, "GET", "/api/profiles/draft/chromatin/topics")
+    _request(app, "POST", "/api/profiles/chromatin/recompute-topics")
     st = _request(app, "GET", "/api/profiles/chromatin/umls").json()
     assert (st["topics_available"], st["topics_reason"], st["topics_n"]) == (False, "bad_data", 1)
     conn = connect(tmp_path / "radar.db")

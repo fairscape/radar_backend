@@ -198,7 +198,7 @@ def launch_import(
     if plan.researcher_id is not None:
         # Point the researcher at its run right away, so a listing made
         # while the job is still resolving papers can say "importing".
-        researchers_repo.mark_imported(db, plan.researcher_id, run_id=run_id)
+        researchers_repo.set_last_run(db, plan.researcher_id, run_id)
 
     if openalex_client is not None:
         # Test path: run synchronously with the injected client so tests

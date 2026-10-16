@@ -840,7 +840,7 @@ class ResearcherInterestRequest(_Model):
     """Body of ``POST /api/researchers/{id}/interests``: a draft named
     ``name`` seeded with ``openalex_ids`` (omitted = every paper)."""
 
-    name: str
+    name: str = Field(min_length=1, max_length=MAX_NAME)
     openalex_ids: list[str] | None = None
     embedding_model: str | None = None
 

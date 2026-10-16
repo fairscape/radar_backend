@@ -300,6 +300,20 @@ def find_inflight_researcher_import(
 INTERRUPTED = "Interrupted: the backend restarted while this was running."
 
 
+def open_scan_profiles(conn: sqlite3.Connection) -> list[int]:
+    """Profiles with a scan (not a trial or an import) still open."""
+    placeholders = ",".join("?" * len(IMPORT_TIERS))
+    return [int(r[0]) for r in conn.execute(
+        f"""
+        SELECT DISTINCT profile_id FROM gather_runs
+         WHERE finished_at IS NULL AND profile_id IS NOT NULL
+           AND COALESCE(tier_used, '') != 'dry_run'
+           AND COALESCE(tier_used, '') NOT IN ({placeholders})
+        """,
+        IMPORT_TIERS,
+    ).fetchall()]
+
+
 def close_interrupted(conn: sqlite3.Connection) -> int:
     """Close every run still open, at boot. Returns how many.
 

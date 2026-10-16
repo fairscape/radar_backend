@@ -55,11 +55,21 @@ async def lifespan(app: FastAPI):
         # Only a process that runs the jobs owns the open runs: one started
         # with the scheduler off (tests, a second API worker) leaves them.
         if settings.RADAR_SCHEDULER_ENABLED:
-            from ..db.repos.gather_runs import close_interrupted
+            from ..db.repos.gather_runs import close_interrupted, open_scan_profiles
 
+            # Before closing: the scans a restart cut off had committed part
+            # of their batch with the batch's own percentiles (as a failed
+            # scan does, which re-scores before closing).
+            cut_off = open_scan_profiles(conn)
             n_closed = close_interrupted(conn)
             if n_closed:
                 log.warning("gather_runs.closed_interrupted", n=n_closed)
+            for pid in cut_off:
+                try:
+                    from ..scheduler.jobs import rescore_pool
+                    rescore_pool(conn, pid, settings)
+                except Exception:  # noqa: BLE001 -- best effort at boot
+                    log.exception("gather_runs.interrupted_rescore_failed", profile_id=pid)
     finally:
         conn.close()
 

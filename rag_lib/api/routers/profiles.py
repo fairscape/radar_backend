@@ -222,6 +222,10 @@ def draft_coherence(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> DraftCoherence:
     try:
+        wizard_service._require_draft(db, int(user["id"]), slug)   # drafts only, as dry-run
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    try:
         return wizard_service.compute_draft_coherence(
             db, user_id=int(user["id"]), slug=slug,
         )
@@ -301,6 +305,10 @@ def draft_topics(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> list[Topic]:
+    try:
+        wizard_service._require_draft(db, int(user["id"]), slug)   # drafts only, as dry-run
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     try:
         topic_filters = wizard_service.aggregate_draft_topics(
             db, user_id=int(user["id"]), slug=slug,
@@ -473,7 +481,8 @@ def draft_dry_run_status(
         ) from exc
 
     row = gather_runs_repo.get(db, run_id)
-    if row is None or int(row["profile_id"]) != int(profile_row["id"]):
+    # A researcher import's run has no profile: int(None) was a 500.
+    if row is None or row["profile_id"] is None or int(row["profile_id"]) != int(profile_row["id"]):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"dry-run {run_id} not found for draft '{slug}'",

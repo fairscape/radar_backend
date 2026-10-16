@@ -151,17 +151,24 @@ def _unique_slug(
     did, renamed an interest because another user had one of that name,
     and so told the user it existed.
     """
-    n = 1
-    while True:
-        slug = base if n == 1 else f"{base}-{n}"
-        final_name = None if name is None else (name if n == 1 else f"{name} ({n})")
-        taken = conn.execute(
-            "SELECT 1 FROM profiles WHERE user_id = ? AND (slug = ? OR name = ?) LIMIT 1",
-            (user_id, slug, final_name),
+    def _taken(col: str, value: str) -> bool:
+        return conn.execute(
+            f"SELECT 1 FROM profiles WHERE user_id = ? AND {col} = ? LIMIT 1", (user_id, value),
         ).fetchone() is not None
-        if not taken:
-            return slug, 0 if n == 1 else n
+
+    # The slug and the name are suffixed independently: two different names
+    # that slugify alike (slugs are cut at 80 characters) used to get the
+    # second renamed "<name> (2)" although that name was free.
+    n = 1
+    while _taken("slug", base if n == 1 else f"{base}-{n}"):
         n += 1
+    slug = base if n == 1 else f"{base}-{n}"
+    if name is None:
+        return slug, 0
+    m = 1
+    while _taken("name", name if m == 1 else f"{name} ({m})"):
+        m += 1
+    return slug, 0 if m == 1 else m
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +214,7 @@ def compute_draft_coherence(
               seed_sim_min      = NULL,
               seed_sim_median   = NULL,
               seed_sim_max      = NULL,
-              n_seed            = 0,
+              n_seed            = (SELECT COUNT(*) FROM profile_seeds s WHERE s.profile_id = profiles.id),
               updated_at        = datetime('now')
             WHERE id = ?
             """,

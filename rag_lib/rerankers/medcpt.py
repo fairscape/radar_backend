@@ -149,12 +149,6 @@ class MedCPTReranker:
     ) -> list[tuple[float, Paper, dict]]:
         t0 = time.time()
 
-        # [rerank-probe] 临时诊断 — 确认后整块删除（本文件共四处：三处输入 + 一处输出）
-        if ranked:
-            _raws = [r[2].get("score_raw", r[0]) for r in ranked]
-            print(f"\n[rerank] 收到 {len(ranked)} 个候选（selector 已按 θ 过滤过）, "
-                  f"score_raw {min(_raws):.4f} - {max(_raws):.4f}", flush=True)
-
         if not ranked:
             self._last_cost = {"wall_seconds": 0.0}
             return ranked
@@ -182,18 +176,6 @@ class MedCPTReranker:
                 if paper.abstract:
                     text = f"{text}. {paper.abstract}" if text else paper.abstract
                 articles.append(text)
-
-        # [rerank-probe] 临时诊断 — 确认输入后整块删除
-        print(f"[rerank] --- query 侧: {len(queries)} 条, mode={self.query_mode} ---",
-              flush=True)
-        for _i, _q in enumerate(queries):
-            print(f"[rerank]   Q{_i}: {len(_q):6d} chars | {_q[:220]!r}", flush=True)
-        print(f"[rerank] --- article 侧: {len(articles)} 条（前 3 条）---", flush=True)
-        for _i, _a in enumerate(articles[:3]):
-            print(f"[rerank]   A{_i}: {len(_a):6d} chars | {_a[:220]!r}", flush=True)
-        _no_abs = sum(1 for _, _p, _ in ranked if not (_p.abstract or "").strip())
-        print(f"[rerank]   其中 {_no_abs}/{len(ranked)} 篇候选没有 abstract"
-              f"（这些只能靠标题打分）", flush=True)
 
         # Score all (query, article) pairs
         all_logits = self._batch_score(queries, articles)
@@ -254,51 +236,6 @@ class MedCPTReranker:
         result.sort(key=lambda r: r[0], reverse=True)
         attach_percentile(result)
 
-        # [rerank-probe] 临时诊断 — 确认后整块删除。输出侧：两个分量各自的
-        # 跨度、混合权重的实际效果、以及相对 selector 原序的位移。
-        _before = {id(p): i + 1 for i, (_, p, _) in enumerate(ranked)}
-        _after = sorted(result, key=lambda r: -r[0])
-        _rr = [r[0] for r in raw_scores]
-        _sn = [bd.get("score_selector_norm", 0.0) for _, _, bd in result]
-        _rn = [bd.get("score_reranker_norm", 0.0) for _, _, bd in result]
-        print("[rerank] " + "=" * 70, flush=True)
-        print(f"[rerank] logit 原始范围 {min(_rr):.3f} - {max(_rr):.3f}"
-              f"  (aggregation={self.aggregation}, 每候选 {n_q} 个 query)", flush=True)
-        print(f"[rerank] 归一化前跨度: selector {sel_span:.4f} / reranker {rr_span:.4f}"
-              f"   -> 归一化后两边都是 [0,1]", flush=True)
-        print(f"[rerank] 权重 alpha={self.alpha} (selector) beta={self.beta} (reranker)"
-              f"   -> 有效影响 = 权重 x 跨度 = "
-              f"{self.alpha:.2f} vs {self.beta:.2f}", flush=True)
-        print(f"[rerank] 归一化后实际分布: sel_norm "
-              f"{min(_sn):.3f}-{max(_sn):.3f}  rr_norm {min(_rn):.3f}-{max(_rn):.3f}",
-              flush=True)
-        _moved = 0
-        _shift = []
-        for _i, (_s, _p, _bd) in enumerate(_after, 1):
-            _b = _before.get(id(_p))
-            if _b is not None and _b != _i:
-                _moved += 1
-                _shift.append(abs(_b - _i))
-        if _shift:
-            print(f"[rerank] 名次变动 {_moved}/{len(result)}, "
-                  f"平均位移 {sum(_shift) / len(_shift):.1f}, 最大 {max(_shift)}",
-                  flush=True)
-        print(f"[rerank] 前 10 名 (rank  原名次  blended = "
-              f"{self.alpha}*sel + {self.beta}*rr):", flush=True)
-        for _i, (_s, _p, _bd) in enumerate(_after[:10], 1):
-            print(f"[rerank]   {_i:3d}  <-#{_before.get(id(_p), 0):<4d} "
-                  f"{_s:.4f} = {self.alpha}*{_bd.get('score_selector_norm', 0):.3f}"
-                  f" + {self.beta}*{_bd.get('score_reranker_norm', 0):.3f}"
-                  f"  (logit {_bd.get('score_reranker_raw', 0):+.2f}, "
-                  f"cos {_bd.get('score_raw', 0):.4f})  {(_p.title or '')[:44]}",
-                  flush=True)
-        print(f"[rerank] selector 原前 5 名现在排第几:", flush=True)
-        _now = {id(p): i + 1 for i, (_, p, _) in enumerate(_after)}
-        for _, _p, _bd in ranked[:5]:
-            print(f"[rerank]   #{_before[id(_p)]:<4d} -> #{_now.get(id(_p), 0):<4d} "
-                  f"rr_norm={_bd.get('score_reranker_norm', 0):.3f}  "
-                  f"{(_p.title or '')[:52]}", flush=True)
-        print("[rerank] " + "=" * 70, flush=True)
 
         self._last_diagnostics = {
             "status": "ok",
