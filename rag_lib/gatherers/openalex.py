@@ -43,6 +43,11 @@ from ..openalex_tiers import (
 from ..paper import Paper, title_key
 from ..profile import Profile
 
+# OpenAlex: an OR-list of more than 10 topics.id values is limited to one
+# request a second per client.
+WIDE_OR_TERMS = 10
+WIDE_OR_SECONDS = 1.0
+
 
 log = structlog.get_logger("rag_lib.gatherers.openalex")
 
@@ -252,25 +257,38 @@ class OpenAlexGatherer:
 
         chosen: list[Paper] = []
         seen = _Deduper()
-        if parts:
-            per_page = max(1, min(200, per_year))
-            for year in range(int(year_from), int(year_to) + 1):
-                filter_str = build_filter_string(
-                    parts, f"{year}-01-01", until=f"{year}-12-31", extras=self.extras,
-                )
-                if self.last_filter_str is None:
-                    self.last_filter_str = filter_str
-                works = client.paginate_filter(
-                    filter_str, limit=per_year, per_page=per_page, sort="cited_by_count:desc",
-                )
-                n_new = 0
-                for w in works:
-                    p = client.paper_from_work(w, source="openalex_gatherer")
-                    if p.openalex_id and seen.take(p):
-                        chosen.append(p)
-                        n_new += 1
-                log.info("openalex_gatherer.year_fetch", profile=profile.name,
-                         year=year, n=len(works), new=n_new)
+        # OpenAlex allows a query that ORs more than WIDE_OR_TERMS topics
+        # once a second (each topic matches a large share of the index).
+        # The years go out back to back, so the second year's query was
+        # refused (429) unless the first happened to take over a second.
+        # The client sleeps after every request; make that a second here.
+        wide = max((len(vals) for _, vals, op in parts if op == "or"), default=0) > WIDE_OR_TERMS
+        usual_sleep = getattr(client, "rate_limit_sleep", None)
+        if wide and usual_sleep is not None:
+            client.rate_limit_sleep = max(float(usual_sleep), WIDE_OR_SECONDS)
+        try:
+            if parts:
+                per_page = max(1, min(200, per_year))
+                for year in range(int(year_from), int(year_to) + 1):
+                    filter_str = build_filter_string(
+                        parts, f"{year}-01-01", until=f"{year}-12-31", extras=self.extras,
+                    )
+                    if self.last_filter_str is None:
+                        self.last_filter_str = filter_str
+                    works = client.paginate_filter(
+                        filter_str, limit=per_year, per_page=per_page, sort="cited_by_count:desc",
+                    )
+                    n_new = 0
+                    for w in works:
+                        p = client.paper_from_work(w, source="openalex_gatherer")
+                        if p.openalex_id and seen.take(p):
+                            chosen.append(p)
+                            n_new += 1
+                    log.info("openalex_gatherer.year_fetch", profile=profile.name,
+                             year=year, n=len(works), new=n_new)
+        finally:
+            if wide and usual_sleep is not None:
+                client.rate_limit_sleep = usual_sleep
         self._last_cost = {
             "wall_seconds": time.time() - t0,
             "api_calls": int(client.api_calls - calls_before),

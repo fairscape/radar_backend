@@ -79,3 +79,35 @@ def test_ranges_are_checked_and_a_backfill_is_capped():
     now = years_rules.this_year()
     assert years_rules.fetch_span(1990, None) == (now - years_rules.MAX_BACKFILL_YEARS + 1, now)
     assert years_rules.fetch_span(2018, 2020) == (2018, 2020)
+
+
+class _SleepRecordingClient(_RecordingClient):
+    def __init__(self):
+        super().__init__()
+        self.rate_limit_sleep = 0.15
+        self.sleeps_at_call = []
+
+    def paginate_filter(self, filter_str, **kw):
+        self.sleeps_at_call.append(self.rate_limit_sleep)
+        return super().paginate_filter(filter_str, **kw)
+
+
+def _profile_with(n_topics: int) -> Profile:
+    return Profile(name="p", topic_filters={"topics": [
+        {"id": f"https://openalex.org/T{i}", "on": True} for i in range(n_topics)]})
+
+
+def test_a_wide_or_list_is_queried_once_a_second():
+    """OpenAlex refuses the second of two back-to-back queries that OR more
+    than 10 topics; the client's pause after each request is raised to a
+    second for the fetch and put back after."""
+    client = _SleepRecordingClient()
+    _gatherer(client).fetch_years(_profile_with(11), 2019, 2021, per_year=50)
+    assert client.sleeps_at_call == [1.0, 1.0, 1.0]
+    assert client.rate_limit_sleep == 0.15
+
+
+def test_ten_topics_keep_the_usual_pace():
+    client = _SleepRecordingClient()
+    _gatherer(client).fetch_years(_profile_with(10), 2019, 2021, per_year=50)
+    assert client.sleeps_at_call == [0.15, 0.15, 0.15]
