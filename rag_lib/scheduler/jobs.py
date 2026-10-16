@@ -419,6 +419,11 @@ def request_rerank_refresh(profile_id: int) -> None:
         return
     from datetime import datetime, timezone
 
+    # Also for a refresh already running: APScheduler skips (and, the
+    # trigger being a date, drops) the job below while one with its id is
+    # mid-execution, so the request was lost until the 30-minute sweep.
+    # The running loop goes round once more when it sees this.
+    _refresh_again.add(profile_id)
     try:
         _SCHEDULER.add_job(
             refresh_reranker_job, trigger="date", run_date=datetime.now(tz=timezone.utc),

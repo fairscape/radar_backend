@@ -1465,17 +1465,6 @@ def _merge_umls_topics(
     if not umls_per_paper:
         return _keep_stored_umls(conn, profile_id, topic_filters, unread) if unread else topic_filters
 
-    # [umls-probe] 临时诊断 — 确认后整块删除。阶段 3：这是用户在
-    # step 3 真正看到的那一层。打印 base、候选数，以及合并后 UMLS
-    # 实际补进去了哪几个。
-    _base_names = [t.get("display_name") or ""
-                   for t in (topic_filters.get("topics") or [])]
-    _n_cand = len({m.topic_id for p in umls_per_paper for m in p})
-    print(f"\n[umls] 阶段3 profile_id={profile_id}", flush=True)
-    print(f"[umls]   {len(umls_per_paper)} 篇种子, 去重后 {_n_cand} 个候选 topic, "
-          f"max_additions={settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}", flush=True)
-    print(f"[umls]   OpenAlex base ({len(_base_names)}): {_base_names}", flush=True)
-
     _merged = merge_umls_topics(
         topic_filters,
         umls_per_paper,
@@ -1483,16 +1472,6 @@ def _merge_umls_topics(
         cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
     )
 
-    # [umls-probe] 排序键是 (similarity, count)，相似度优先。把 count 一起
-    # 打出来，是因为这两个信号在种子少的时候会给出很不一样的顺序。
-    _added = [t for t in (_merged.get("topics") or []) if t.get("source") == "umls"]
-    print(f"[umls]   补进去 {len(_added)} 个:", flush=True)
-    for _t in _added:
-        print(f"[umls]     n={_t.get('count', 0)}  {_t.get('display_name', '')[:56]}",
-              flush=True)
-    if _n_cand > len(_added):
-        print(f"[umls]   另外 {_n_cand - len(_added)} 个候选没进去"
-              f"（被判为已有 topic 的近重复，或超出 max_additions）", flush=True)
     # Which seeds each UMLS topic came from, so that a later merge that
     # cannot read some seeds keeps only their topics (_keep_stored_umls).
     by_topic: dict[str, list[str]] = {}

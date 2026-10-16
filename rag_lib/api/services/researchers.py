@@ -464,6 +464,11 @@ def create_interest(
     researcher, ``ResearcherNotFound`` for a bad id.
     """
     _require(conn, user_id, researcher_id)
+    # The draft would be seeded with what has arrived so far, have no import
+    # run of its own to wait for, and the rest would go to the researcher
+    # only. The stored paper count was 0 until the import finished, which
+    # hid this; the count is live now.
+    _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
     if not name.strip():
         raise ValueError("interest name must be non-empty")
     have = researchers_repo.paper_ids(conn, researcher_id)
