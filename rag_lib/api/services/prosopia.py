@@ -38,6 +38,8 @@ a look.
 
 from __future__ import annotations
 
+from ..schemas import MAX_NAME
+
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
@@ -320,7 +322,7 @@ def prepare_import(
     )
     draft_row = open_draft(
         conn, settings, user_id=user_id, target=target,
-        name=(name or profile.name or slug).strip(), embedding_model=model,
+        name=(name or profile.name or slug).strip()[:MAX_NAME], embedding_model=model,
         researcher_id=researcher_id,
     )
 

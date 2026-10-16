@@ -455,6 +455,7 @@ def import_prosopia_status(
         n_processed=row["n_processed"],
         n_total=row["n_total"],
         last_message=row["last_message"],
+        progress_updated_at=row["progress_updated_at"],
     )
 
     result: ProsopiaImportResult | None = None

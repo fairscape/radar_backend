@@ -22,6 +22,8 @@ the works themselves, so there is no second request to ``/authors``.
 
 from __future__ import annotations
 
+from ..schemas import MAX_NAME
+
 import re
 import sqlite3
 import threading
@@ -505,7 +507,7 @@ def prepare_import(
     )
     draft_row = open_draft(
         conn, settings, user_id=user_id, target=target,
-        name=(name or listing["name"] or f"ORCID {oid}").strip(), embedding_model=model,
+        name=(name or listing["name"] or f"ORCID {oid}").strip()[:MAX_NAME], embedding_model=model,
         researcher_id=researcher_id,
     )
     draft = {"slug": draft_row["slug"], "name": draft_row["name"]}

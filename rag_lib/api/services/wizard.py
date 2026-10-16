@@ -54,6 +54,7 @@ from ...profile import Profile
 from ...selectors import get_selector
 from ..mappers import _read_minutes, bucket_for_similarity
 from ..schemas import (
+    MAX_NAME,
     Card,
     DraftCoherence,
     DraftDryRun,
@@ -122,7 +123,7 @@ def create_draft(
 
     base_slug = profiles_repo.slugify(name)
     slug, suffix = _unique_slug(conn, user_id, base_slug, name)
-    final_name = name if suffix == 0 else f"{name} ({suffix})"
+    final_name = name if suffix == 0 else _suffixed(name, suffix)
     profile_id = profiles_repo.create_draft(
         conn,
         user_id=user_id,
@@ -166,9 +167,16 @@ def _unique_slug(
     if name is None:
         return slug, 0
     m = 1
-    while _taken("name", name if m == 1 else f"{name} ({m})"):
+    while _taken("name", name if m == 1 else _suffixed(name, m)):
         m += 1
     return slug, 0 if m == 1 else m
+
+
+def _suffixed(name: str, n: int) -> str:
+    """``name (n)`` within MAX_NAME: the suffix shortens the name, it does
+    not push a 120-character one to 124."""
+    tail = f" ({n})"
+    return f"{name[:MAX_NAME - len(tail)].rstrip()}{tail}"
 
 
 # ---------------------------------------------------------------------------

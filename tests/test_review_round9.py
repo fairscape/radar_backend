@@ -20,6 +20,7 @@ from rag_lib.db.repos import (
     researchers as researchers_repo,
 )
 from tests.test_review_round3 import _requests, app  # noqa: F401  (fixture)
+from tests.test_researchers import StubProsopia, _app, _import, _stub_openalex, _stub_profile, env  # noqa: F401
 from tests.test_review_round4 import _db, _live
 
 ORCID = "0000-0001-5643-4068"
@@ -85,7 +86,7 @@ def test_a_taken_slug_does_not_rename_a_free_name(tmp_path):
     assert second["name"] == "a" * 119 + "b"
     # The same name again is still renamed.
     third = wizard.create_draft(conn, user_id=uid, name="a" * 120, embedding_model="placeholder-v1")
-    assert third["name"] == "a" * 120 + " (2)"
+    assert third["name"] == "a" * 116 + " (2)"      # suffixed within the 120-character bound
 
 
 def test_imported_at_waits_for_the_import_to_finish(tmp_path):
@@ -125,14 +126,13 @@ def test_legacy_candidates_get_a_raw_score(tmp_path):
                  " VALUES (1, 'W1', 0.83, NULL, datetime('now'))")
     conn.commit()
     assert "0022_score_raw_backfill" in apply_migrations(conn)
-    assert conn.execute("SELECT score_raw FROM profile_candidates").fetchone()[0] == 0.83
+    assert abs(conn.execute("SELECT score_raw FROM profile_candidates").fetchone()[0] - 0.66) < 1e-9   # 2*0.83-1
 
 
-def test_an_import_stamps_imported_at_once_when_it_finishes(monkeypatch):
+def test_an_import_stamps_imported_at_once_when_it_finishes(env, monkeypatch):  # noqa: F811 -- env: temp DB, scheduler off
     """The kick-off used to call mark_imported too, so the researcher read
     "imported just now" while the import ran (or after it failed)."""
     from rag_lib.db.repos import researchers as repo
-    from tests.test_researchers import StubProsopia, _app, _import, _stub_openalex, _stub_profile
 
     calls = []
     real = repo.mark_imported

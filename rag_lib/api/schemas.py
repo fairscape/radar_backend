@@ -454,6 +454,9 @@ class GatherRun(_Model):
     n_processed: int | None = None
     n_total: int | None = None
     last_message: str | None = None
+    # When the run last reported progress; the client gives a run up on the
+    # same staleness the server applies (30 min imports, 120 min scans).
+    progress_updated_at: str | None = None
 
 
 class GatherNowResponse(_Model):

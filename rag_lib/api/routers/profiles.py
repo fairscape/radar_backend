@@ -505,6 +505,7 @@ def draft_dry_run_status(
         n_processed=row["n_processed"],
         n_total=row["n_total"],
         last_message=row["last_message"],
+        progress_updated_at=row["progress_updated_at"],
     )
 
     result: DraftDryRun | None = None
@@ -1357,6 +1358,7 @@ def list_runs(
             n_processed=r["n_processed"],
             n_total=r["n_total"],
             last_message=r["last_message"],
+            progress_updated_at=r["progress_updated_at"],
         )
         for r in rows
     ]
