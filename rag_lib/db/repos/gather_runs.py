@@ -143,7 +143,7 @@ def recent_for_profile(
         """
         SELECT * FROM gather_runs
         WHERE profile_id = ?
-        ORDER BY started_at DESC
+        ORDER BY started_at DESC, id DESC
         LIMIT ?
         """,
         (profile_id, limit),

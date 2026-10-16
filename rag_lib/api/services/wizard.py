@@ -917,6 +917,8 @@ def remove_seed(
     if row is None:
         raise LookupError(f"profile '{slug}' not found for current user")
     profile_id = int(row["id"])
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
     stored = _as_seed_id(conn, profile_id, openalex_id)
     if stored is None:
         return False

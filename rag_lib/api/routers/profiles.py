@@ -177,7 +177,7 @@ def list_drafts(
                            if r["import_run_id"] is not None else None),
             # Built by the query all along and never passed on: a failed
             # import resumed with no word of why.
-            import_error=r["import_error"] if r["phase"] == "failed" else None,
+            import_error=r["import_error"],
         )
         for r in rows
     ]
@@ -582,6 +582,11 @@ def add_draft_seeds(
         attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=slug, openalex_ids=body.openalex_ids,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -608,6 +613,11 @@ def add_seeds(
         attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=key, openalex_ids=body.openalex_ids,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -632,6 +642,11 @@ def remove_seed(
         removed = wizard_service.remove_seed(
             db, user_id=int(user["id"]), slug=key, openalex_id=openalex_id,
         )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1159,7 +1174,14 @@ def gather_now(
     from rag_lib.db.repos import gather_runs as gather_runs_repo
     from rag_lib.scheduler.jobs import gather_for_profile
 
-    profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    row = profiles_repo.get_by_slug(db, int(user["id"]), key)
+    if row is None or row["is_draft"]:
+        # A draft has no fit: the scan would store candidates scored
+        # against a throwaway centroid that commit never rescores.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
+    profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
     # Open the audit row eagerly so we can echo a real run_id; the
     # background job reuses it via the ``run_id`` kwarg.

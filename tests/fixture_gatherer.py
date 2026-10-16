@@ -50,6 +50,13 @@ class FixtureGatherer:
         self._last_cost = {"wall_seconds": time.time() - t0, "api_calls": 0}
         return out
 
+    def fetch_years(self, profile: Profile, year_from: int, year_to: int, *, per_year: int) -> list[Paper]:
+        """The same papers as ``fetch``, spread over the years asked for."""
+        out = self.fetch(profile, f"{year_from}-01-01", limit=per_year * max(1, year_to - year_from + 1))
+        for i, p in enumerate(out):
+            p.year = year_from + (i % max(1, year_to - year_from + 1))
+        return out
+
     def diagnostics(self) -> dict:
         return {
             "note": "fixture gatherer, for testing only",

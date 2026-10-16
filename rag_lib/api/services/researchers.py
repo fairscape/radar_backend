@@ -515,6 +515,10 @@ def attach_seeds(
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None:
         raise LookupError(f"interest '{slug}' not found for current user")
+    if gather_runs_repo.has_unfinished_import(conn, int(row["id"])):
+        # As coherence, the trial and commit: the import is filling the seeds.
+        from .wizard import ImportInProgress
+        raise ImportInProgress(slug)
     wanted = [i.strip() for i in openalex_ids if (i or "").strip()]
     if not wanted:
         raise ValueError("select at least one paper")

@@ -114,6 +114,10 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
                      so it gets its own state and ``import_error``
       ``seeded``     seeds are attached; the coherence step is next
       ``empty``      nothing attached yet; the upload/pick step is next
+
+    ``import_error`` is the *latest* import's error whatever the phase: an
+    import that died after attaching part of its papers left a draft that
+    read "30 seeds" with no word that 50 were missing.
     """
     # An open run that has not moved for STALE_IMPORT_MINUTES is dead (the
     # backend stopped under it), not importing: without the cutoff such a
@@ -148,18 +152,21 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
                                  AND (g.error IS NOT NULL OR g.finished_at IS NULL)) THEN 'failed'
                  ELSE 'empty'
                END AS phase,
-               (SELECT COALESCE(g.error, 'The import stopped without finishing.')
+               (SELECT CASE
+                         WHEN g.error IS NOT NULL THEN g.error
+                         WHEN g.finished_at IS NULL AND NOT ({live})
+                           THEN 'The import stopped without finishing.'
+                       END
                   FROM gather_runs g
                  WHERE g.profile_id = p.id
                    AND g.tier_used IN ({tiers})
-                   AND (g.error IS NOT NULL OR g.finished_at IS NULL)
                  ORDER BY g.id DESC LIMIT 1) AS import_error
           FROM profiles p
           LEFT JOIN researchers r ON r.id = p.researcher_id
          WHERE p.user_id = ? AND p.is_draft = 1
          ORDER BY p.id DESC
         """,
-        (*IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, *IMPORT_TIERS, user_id),
+        (*IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, user_id),
     ).fetchall()
 
 
@@ -279,7 +286,14 @@ def update_fit(
 
 
 def delete(conn: sqlite3.Connection, profile_id: int) -> None:
-    """Hard-delete a profile. ``profile_seeds`` rows go via ON DELETE CASCADE."""
+    """Hard-delete a profile. ``profile_seeds`` rows go via ON DELETE CASCADE.
+
+    The runs that imported a researcher's papers into it are kept, detached:
+    they are that researcher's import history (``researchers.last_run_id``
+    pointed at a cascaded row).
+    """
+    conn.execute("UPDATE gather_runs SET profile_id = NULL WHERE profile_id = ? AND researcher_id IS NOT NULL",
+                 (profile_id,))
     conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
     conn.commit()
 

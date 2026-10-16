@@ -48,6 +48,7 @@ from ...db.repos import (
     profiles as profiles_repo,
     users as users_repo,
     vault as vault_repo,
+    gather_runs as gather_runs_repo,
 )
 from ... import content_topics
 from ...embed import build_embedding_input
@@ -155,6 +156,16 @@ def upload(
         )
 
     file_hash = compute_file_hash(data)
+
+    if profile_slug:
+        target = profiles_repo.get_by_slug(conn, user_id, profile_slug)
+        if target is not None and gather_runs_repo.has_unfinished_import(conn, int(target["id"])):
+            # The Vault's "upload to <draft>" while that draft's import runs:
+            # the wizard holds its own buttons, this path had no guard.
+            raise UploadRejected(
+                f"'{profile_slug}' is still importing papers; add seeds to it once that finishes.",
+                status_code=409,
+            )
 
     existing = papers_repo.get_by_user_hash(conn, user_id, file_hash)
     if existing is not None:

@@ -255,10 +255,14 @@ def scores_for_profile(
     comparing the two produced an all-or-nothing slider. Rows from
     before ``score_raw`` existed fall back to ``score``.
     """
+    # Within the interest's years, as the feed: the suggestion was drawn
+    # from backfilled papers the feed would never show.
     rows = conn.execute(
         f"""
         SELECT COALESCE(pc.score_raw, pc.score) AS s FROM profile_candidates pc
-        WHERE pc.profile_id = ? AND {NOT_SEED}
+        JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
         ORDER BY s DESC
         """,
         (profile_id,),
@@ -280,7 +284,8 @@ def scored_papers_for_profile(
                p.title, p.venue, p.year
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
-        WHERE pc.profile_id = ? AND {NOT_SEED}
+        JOIN profiles pr ON pr.id = pc.profile_id
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
         ORDER BY s DESC
         """,
         (profile_id,),
