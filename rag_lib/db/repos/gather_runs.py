@@ -212,6 +212,15 @@ def has_unfinished_import(conn: sqlite3.Connection, profile_id: int) -> bool:
     ).fetchone() is not None
 
 
+def is_inflight(conn: sqlite3.Connection, run_id: int) -> bool:
+    """Open and recently reporting progress (the staleness rule of every
+    other in-flight check): a run whose thread died unclosed is not running."""
+    return conn.execute(
+        f"SELECT 1 FROM gather_runs g WHERE g.id = ? AND {_INFLIGHT_PREDICATE}",
+        (run_id, _stale_cutoff()),
+    ).fetchone() is not None
+
+
 def find_inflight_import(
     conn: sqlite3.Connection, user_id: int, *, orcid: str | None = None,
     researcher_id: int | None = None,

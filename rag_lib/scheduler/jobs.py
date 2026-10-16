@@ -535,6 +535,25 @@ SCAN_BUSY = "Skipped: another scan of this interest was running."
 _scan_locks: dict[int, threading.Lock] = {}
 
 
+def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseException) -> None:
+    """Close a scan's run as failed, with the pool on one scale.
+
+    The candidates are committed a hundred at a time, each chunk carrying
+    the batch's own ``score_pct``/``score_blended``; a failure between
+    chunks left those rows ranked against the pool on another scale until
+    the next clean scan. The pool is re-scored first, best effort.
+    """
+    try:
+        rescore_pool(conn, profile_id, settings)
+    except Exception:  # noqa: BLE001 -- the failure being reported comes first
+        log.exception("scheduler.gather_failed.rescore_failed", profile_id=profile_id, run_id=run_id)
+    gather_runs_repo.finish(
+        conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+        error=f"{type(exc).__name__}: {exc}",
+    )
+    log.exception("scheduler.gather_failed", profile_id=profile_id, run_id=run_id)
+
+
 def _gather_for_profile_locked(
     user_id: int,
     profile_id: int,
@@ -774,19 +793,7 @@ def _gather_for_profile_locked(
             )
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
-            gather_runs_repo.finish(
-                conn,
-                run_id,
-                n_fetched=0,
-                n_new=0,
-                n_redup=0,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            log.exception(
-                "scheduler.gather_failed",
-                profile_id=profile_id,
-                run_id=run_id,
-            )
+            _close_failed_scan(conn, profile_id, run_id, settings, exc)
             return run_id
     finally:
         conn.close()

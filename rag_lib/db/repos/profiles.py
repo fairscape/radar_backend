@@ -146,10 +146,11 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
                                  AND g.finished_at IS NULL AND {live}) THEN 'importing'
                  WHEN EXISTS (SELECT 1 FROM profile_seeds s
                                WHERE s.profile_id = p.id) THEN 'seeded'
-                 WHEN EXISTS (SELECT 1 FROM gather_runs g
-                               WHERE g.profile_id = p.id
-                                 AND g.tier_used IN ({tiers})
-                                 AND (g.error IS NOT NULL OR g.finished_at IS NULL)) THEN 'failed'
+                 WHEN (SELECT g.error IS NOT NULL OR (g.finished_at IS NULL AND NOT ({live}))
+                         FROM gather_runs g
+                        WHERE g.profile_id = p.id
+                          AND g.tier_used IN ({tiers})
+                        ORDER BY g.id DESC LIMIT 1) THEN 'failed'
                  ELSE 'empty'
                END AS phase,
                (SELECT CASE
@@ -166,7 +167,11 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
          WHERE p.user_id = ? AND p.is_draft = 1
          ORDER BY p.id DESC
         """,
-        (*IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, user_id),
+        # In textual order: the two EXISTS put the tiers before the cutoff,
+        # the two latest-run subqueries put the cutoff (in their SELECT)
+        # before the tiers (in their WHERE).
+        (*IMPORT_TIERS, cutoff, *IMPORT_TIERS, cutoff,
+         cutoff, *IMPORT_TIERS, cutoff, *IMPORT_TIERS, user_id),
     ).fetchall()
 
 

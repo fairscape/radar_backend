@@ -275,7 +275,17 @@ def _to_researcher(conn: sqlite3.Connection, row: sqlite3.Row) -> Researcher:
     last_run = None
     if row["last_run_id"] is not None:
         last_run = gather_runs_repo.get(conn, int(row["last_run_id"]))
-    importing = bool(last_run is not None and not last_run["finished_at"])
+    # The staleness cutoff as everywhere else: a run left open by a dead
+    # thread (closed at the next boot) showed "Importing" with Forget and
+    # Check-for-new-papers disabled until then.
+    importing = bool(last_run is not None and not last_run["finished_at"]
+                     and gather_runs_repo.is_inflight(conn, int(last_run["id"])))
+    # Counted, not the stored column: that is written only when an import
+    # finishes cleanly, so one that died half-way read "0 papers" and the
+    # New-interest button was disabled over papers that were stored.
+    n_papers = conn.execute(
+        "SELECT COUNT(*) FROM researcher_papers WHERE researcher_id = ?", (int(row["id"]),),
+    ).fetchone()[0]
     return Researcher(
         id=int(row["id"]),
         source=row["source"],
@@ -285,7 +295,7 @@ def _to_researcher(conn: sqlite3.Connection, row: sqlite3.Row) -> Researcher:
         affiliation=row["affiliation"],
         url=row["url"],
         base_url=row["base_url"],
-        n_papers=int(row["n_papers"] or 0),
+        n_papers=int(n_papers),
         n_interests=int(n_interests),
         imported_at=row["imported_at"],
         last_run_id=int(row["last_run_id"]) if row["last_run_id"] is not None else None,
@@ -483,6 +493,9 @@ def create_interest(
     n = 0
     for openalex_id in chosen:
         n += profiles_repo.attach_seed(conn, profile_id, openalex_id)
+    # As attach_seeds: the papers were embedded when imported, under the
+    # model of that day; a draft under another model needs its own vectors.
+    wizard_service.embed_missing(conn, model, list(chosen))
     log.info(
         "researchers.create_interest",
         researcher_id=researcher_id, draft_slug=draft["slug"], n_seeds=n,
