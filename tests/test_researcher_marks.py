@@ -172,3 +172,22 @@ def test_marking_is_one_transaction(env, monkeypatch):
         other.close()
     finally:
         conn.close()
+
+
+def test_marking_refuses_a_connection_with_a_transaction_open(env):
+    """The helper commits; a caller's open work is not its to commit."""
+    import pytest
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_stub_profile()), _both_stubs())
+    nathan, justin = _two(app)
+    conn = connect(env)
+    try:
+        conn.execute("INSERT INTO users (email) VALUES ('pending@example.com')")
+        with pytest.raises(RuntimeError):
+            repo.set_mark(conn, 1, nathan, "self")
+        with pytest.raises(RuntimeError):
+            repo.reorder(conn, 1, [nathan, justin])
+        conn.rollback()
+        assert repo.get(conn, nathan)["mark"] is None
+    finally:
+        conn.close()

@@ -464,14 +464,21 @@ def test_the_profile_being_unreadable_for_a_moment_does_not_drop_it(env, monkeyp
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
     assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    applied = {t["id"]: t for t in _topics(app, slug).values()}
     monkeypatch.setattr(wizard, "_researcher_topics_for", lambda conn, pid: None)
     during = _topics(app, slug)
-    assert set(during) == {"T10001"} and during["T10001"]["profile"] is None
+    # Kept as last stored: the profile-only topics, the marks, the states.
+    assert {k: (v["on"], v["source"], v["profile"]) for k, v in during.items()} == \
+        {k: (v["on"], v["source"], v["profile"]) for k, v in applied.items()}
+    assert _stored(env, slug)["topics"][0]["on_before_profile"] is True
     view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
     assert view["applied"] is True and view["topics"]["available"] is False
     monkeypatch.undo()
     after = _topics(app, slug)
     assert "https://openalex.org/T10222" in after and after["T10001"]["profile"] == "not_interest"
+    # And removing after the outage still puts the seeds' topic back.
+    off = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert off["T10001"]["on"] is True
 
 
 def test_kept_umls_topics_do_not_carry_old_marks():
@@ -509,3 +516,112 @@ def test_label_mapping_remembers_a_miss_and_backs_off_after_a_failure(monkeypatc
     assert len(calls) == n
     rt.reset_label_cache()
     assert [t["label"] for t in rt.with_labels(rt.read(doc), settings=settings)["unwanted"]] == ["phylogenomics"]
+
+
+# --- after the second review ------------------------------------------------------
+
+
+def test_a_topic_marked_later_is_put_back_too(env):
+    """A not-wanted topic a new seed brings in after the apply is marked and
+    switched off by the next aggregation; removing the profile puts it back
+    to what it would have started as (on, on a draft)."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    conn = connect(env)
+    try:
+        oa_id = conn.execute("SELECT openalex_id FROM profile_seeds ps JOIN profiles p ON p.id = ps.profile_id "
+                             "WHERE p.slug = ? AND openalex_id LIKE 'https://openalex.org/W%' LIMIT 1", (slug,)).fetchone()[0]
+        raw = json.loads(conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa_id,)).fetchone()[0])
+        raw["topics"].append({"id": "https://openalex.org/T11986", "display_name": "Scientific Computing", "score": 0.5,
+                              "subfield": None, "field": None, "domain": None})
+        conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (json.dumps(raw), oa_id))
+        conn.commit()
+    finally:
+        conn.close()
+    later = _topics(app, slug)["https://openalex.org/T11986"]
+    assert later["on"] is False and later["profile"] == "not_interest"
+    stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    assert stored["https://openalex.org/T11986"]["on_before_profile"] is True
+    off = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert off["https://openalex.org/T11986"]["on"] is True and off["https://openalex.org/T11986"]["profile"] is None
+
+
+def test_re_applying_keeps_the_original_pre_apply_state(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    for _ in range(2):
+        assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    assert stored["T10001"]["on"] is False and stored["T10001"]["on_before_profile"] is True
+    off = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert off["T10001"]["on"] is True
+
+
+def test_forgetting_the_researcher_takes_the_profile_off_a_saved_interest(env):
+    """A saved interest's list is what every scan reads and nothing rebuilds
+    it on its own, so forgetting the researcher cleans it there and then."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    stored = _stored(env, slug)
+    assert stored["researcher_topics"] is False
+    assert [t["id"] for t in stored["topics"]] == ["T10001"]
+    assert stored["topics"][0]["on"] is True and "profile" not in stored["topics"][0]
+    detail = _request(app, "GET", f"/api/profiles/{slug}/detail").json()
+    assert [(t["id"], t["on"], t["profile"]) for t in detail["topics"]] == [("T10001", True, None)]
+
+
+def test_a_list_read_that_overlaps_an_apply_does_not_undo_it(env, monkeypatch):
+    """Step 3's GET rebuilds the list and writes it. One that started before
+    "Use profile topics" and finished after used to write its older list over
+    the apply. Now it notices the flag changed and rebuilds."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    real = wizard._aggregate_topics
+    hits = []
+
+    def racing(conn, profile_id, **kw):
+        out = real(conn, profile_id, **kw)
+        if not hits:
+            hits.append(1)
+            # The apply lands on another connection while the read is in flight.
+            other = connect(env)
+            try:
+                wizard.set_researcher_topics(other, user_id=1, slug=slug, enabled=True)
+            finally:
+                other.close()
+        return out
+
+    monkeypatch.setattr(wizard, "_aggregate_topics", racing)
+    topics = _topics(app, slug)
+    stored = _stored(env, slug)
+    assert stored["researcher_topics"] is True
+    assert "https://openalex.org/T10222" in topics and topics["T10001"]["on"] is False
+    assert len(hits) == 1 and wizard._aggregate_topics is racing
+
+
+def test_a_researcher_removed_underneath_restores_the_seeds_topics_on_the_next_read(env):
+    """Forgetting through the API cleans the list at once; a row that went
+    some other way (the repo, a hand edit) is met by the next aggregation:
+    no profile to read and nobody to read it from, so the marked topics go
+    back as they were and the flag goes."""
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    assert _topics(app, slug)["T10001"]["on"] is False
+    conn = connect(env)
+    try:
+        repo.delete(conn, rid)
+    finally:
+        conn.close()
+    topics = _topics(app, slug)
+    assert set(topics) == {"T10001"} and topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
+    assert _stored(env, slug).get("researcher_topics") is not True

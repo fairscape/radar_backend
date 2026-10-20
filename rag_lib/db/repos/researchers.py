@@ -107,19 +107,21 @@ def _whole_list(conn: sqlite3.Connection) -> Iterator[None]:
     """One write transaction around a read of the list and the positions
     written from it. Two tabs marking at once each computed their order from
     a list the other's write was missing; the lock makes the second wait and
-    read the first's result."""
-    own = not conn.in_transaction
-    if own:
-        conn.execute("BEGIN IMMEDIATE")
+    read the first's result.
+
+    The connection must have no transaction open: this commits, and a
+    caller's uncommitted work is not this helper's to commit (or to leave
+    uncommitted alongside a write that then looked done)."""
+    if conn.in_transaction:
+        raise RuntimeError("set_mark/reorder need a connection with no open transaction")
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield
     except BaseException:
-        if own:
-            conn.rollback()
+        conn.rollback()
         raise
     else:
-        if own:
-            conn.commit()
+        conn.commit()
 
 
 def _write_positions(conn: sqlite3.Connection, ids: list[int]) -> None:

@@ -332,13 +332,50 @@ def aggregate_draft_topics(
     if gather_runs_repo.has_unfinished_import(conn, profile_id):
         raise ImportInProgress(slug)
     # Topics we've never seen start on.
-    topic_filters = _aggregate_topics(conn, profile_id, new_on=True)
+    return _write_rebuilt_topics(
+        conn, profile_id, lambda: _aggregate_topics(conn, profile_id, new_on=True),
+    )
 
+
+def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> dict:
+    """Store the list ``build()`` makes from the seeds, unless the profile's
+    topics were applied or removed while it was being built: then build it
+    again, reading the new flag, and store that.
+
+    The build can take seconds (UMLS extraction, label mapping), and the
+    step-3 list is re-read on focus and by other tabs, so a read that
+    started before "Use profile topics" used to write its older list over
+    the apply -- flag, added topics and marks gone, with the toast saying
+    they were applied. The flag is compared under the write lock; the build
+    itself runs without it, so the lock is held for one UPDATE.
+    """
+    topic_filters = build()
+    for _ in range(3):
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = _stored_topic_filters(conn, profile_id)
+            same = researcher_topics.is_applied(stored) == researcher_topics.is_applied(topic_filters)
+            if same:
+                conn.execute(
+                    "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+                    (json.dumps(topic_filters), profile_id),
+                )
+                conn.commit()
+                return topic_filters
+            conn.rollback()
+        except BaseException:
+            conn.rollback()
+            raise
+        log.info("wizard.topics_rebuilt_after_profile_change", profile_id=profile_id)
+        topic_filters = build()
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(topic_filters), profile_id),
     )
     conn.commit()
+    return topic_filters
     return topic_filters
 
 
@@ -376,22 +413,54 @@ def _aggregate_topics(
         _carry_before_states(stored, topic_filters)
     elif applied and _has_researcher(conn, profile_id):
         # The profile could not be read just now (the label mapper is down,
-        # say): still applied; the next aggregation that can read it folds it
-        # in again. Only a forgotten researcher drops the flag.
-        topic_filters[researcher_topics.FLAG] = True
+        # say): still applied. What the last readable aggregation stored --
+        # the profile-only topics, the marks, the remembered states -- is
+        # kept as it was, so nothing is lost across the outage.
+        topic_filters = _keep_stored_profile(stored, topic_filters)
+    elif applied:
+        # The researcher was forgotten: the profile goes with them, and the
+        # marked topics go back as they were before it was applied.
+        for t in stored.get("topics") or []:
+            if t.get("id") and researcher_topics.BEFORE in t:
+                prior_on[t["id"]] = bool(t[researcher_topics.BEFORE])
 
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
             t["on"] = prior_on.get(t["id"], new_on)
             # A topic the profile has an opinion on and the user has not
             # seen before starts as the profile says, whatever other new
-            # topics start as; a choice the user made since is kept.
-            if from_profile is not None and t["id"] not in prior_on:
-                if t.get("profile") == researcher_topics.NOT_INTEREST:
-                    t["on"] = False
-                elif t.get("profile") == researcher_topics.INTEREST:
-                    t["on"] = True
+            # topics start as; a choice the user made since is kept. Either
+            # way the state it would have had is remembered, so removing
+            # the profile can put it back (``set_researcher_topics``).
+            if from_profile is not None and t.get("profile"):
+                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], new_on))
+                if t["id"] not in prior_on:
+                    t["on"] = t["profile"] == researcher_topics.INTEREST
     return topic_filters
+
+
+def _keep_stored_profile(stored: dict, topic_filters: dict) -> dict:
+    """``topic_filters`` plus what the stored list says of the profile: its
+    own topics (source ``researcher``), and each topic's mark and remembered
+    state; the flag stays set. For an aggregation that cannot read the
+    profile right now."""
+    out = dict(topic_filters)
+    topics = [dict(t) for t in out.get("topics") or []]
+    have = {t.get("id") for t in topics}
+    by_id = {t.get("id"): t for t in stored.get("topics") or [] if t.get("id")}
+    for t in topics:
+        old = by_id.get(t.get("id"))
+        if old is None:
+            continue
+        for key in ("profile", researcher_topics.BEFORE):
+            if key in old:
+                t[key] = old[key]
+    for tid, old in by_id.items():
+        if old.get("source") == researcher_topics.SOURCE and tid not in have:
+            topics.append(dict(old))
+    out["topics"] = topics
+    out[researcher_topics.FLAG] = True
+    return out
 
 
 def _stored_topic_filters(conn: sqlite3.Connection, profile_id: int) -> dict:
@@ -434,6 +503,30 @@ def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int) -> dict | 
 
 class NoTopicOn(ValueError):
     """Applying the profile's topics would leave none switched on."""
+
+
+def drop_profile_topics(conn: sqlite3.Connection, profile_id: int, *, live: bool) -> bool:
+    """Take an applied profile off the stored list without rebuilding it:
+    marked topics back as they were, profile-only topics gone, flag off.
+    Returns whether anything was applied. For forgetting the researcher."""
+    stored = _stored_topic_filters(conn, profile_id)
+    if not researcher_topics.is_applied(stored):
+        return False
+    topics = [dict(t) for t in stored.get("topics") or []]
+    for t in topics:
+        if researcher_topics.BEFORE in t:
+            t["on"] = bool(t[researcher_topics.BEFORE])
+    out = researcher_topics.strip({**stored, "topics": topics})
+    conn.execute(
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(out), profile_id),
+    )
+    conn.commit()
+    if live:
+        from rag_lib.scheduler.jobs import request_rerank_refresh
+        request_rerank_refresh(profile_id)
+    log.info("wizard.researcher_topics_dropped", profile_id=profile_id)
+    return True
 
 
 def researcher_topics_view(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
@@ -610,17 +703,16 @@ def save_topics(
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
-    full = _aggregate_topics(conn, profile_id, new_on=False)
-    ids = {t["id"] for t in full.get("topics") or [] if t.get("id")}
-    selected = set(selected_topic_ids) & ids
-    if ids and not selected:
-        raise ValueError("switch on at least one topic: a scan searches by them")
-    pruned = _prune_topic_filters(full, selected)
-    conn.execute(
-        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(pruned), profile_id),
-    )
-    conn.commit()
+
+    def build() -> dict:
+        full = _aggregate_topics(conn, profile_id, new_on=False)
+        ids = {t["id"] for t in full.get("topics") or [] if t.get("id")}
+        selected = set(selected_topic_ids) & ids
+        if ids and not selected:
+            raise ValueError("switch on at least one topic: a scan searches by them")
+        return _prune_topic_filters(full, selected)
+
+    pruned = _write_rebuilt_topics(conn, profile_id, build)
     # Topic names are the reranker's queries in topic mode.
     from rag_lib.scheduler.jobs import request_rerank_refresh
     request_rerank_refresh(profile_id)

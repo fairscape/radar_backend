@@ -472,6 +472,11 @@ def delete_researcher(
     # filling lost its "still importing" state and could be committed half
     # done.
     _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
+    # Their profile topics, where applied, go with them: the saved list is
+    # what every scan reads, and with the researcher gone nothing else
+    # would rebuild it (the box that offers "Remove" needs the researcher).
+    for prow in researchers_repo.interests_for(conn, researcher_id):
+        wizard_service.drop_profile_topics(conn, int(prow["id"]), live=not prow["is_draft"])
     researchers_repo.delete(conn, researcher_id)
 
 
