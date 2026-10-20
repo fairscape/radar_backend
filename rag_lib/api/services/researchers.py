@@ -447,9 +447,13 @@ def set_mark(
     for another user's or an unknown researcher, ``ValueError`` for a mark
     that is neither."""
     _require(conn, user_id, researcher_id)
-    researchers_repo.set_mark(conn, user_id, researcher_id, mark)
+    try:
+        researchers_repo.set_mark(conn, user_id, researcher_id, mark)
+    except LookupError as exc:   # forgotten between the check and the write
+        raise ResearcherNotFound(str(exc)) from exc
     row = researchers_repo.get(conn, researcher_id)
-    assert row is not None
+    if row is None:
+        raise ResearcherNotFound(f"researcher {researcher_id} not found")
     return _to_researcher(conn, row)
 
 
@@ -472,12 +476,15 @@ def delete_researcher(
     # filling lost its "still importing" state and could be committed half
     # done.
     _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
+    interests = [(int(p["id"]), not p["is_draft"]) for p in researchers_repo.interests_for(conn, researcher_id)]
+    researchers_repo.delete(conn, researcher_id)
     # Their profile topics, where applied, go with them: the saved list is
     # what every scan reads, and with the researcher gone nothing else
     # would rebuild it (the box that offers "Remove" needs the researcher).
-    for prow in researchers_repo.interests_for(conn, researcher_id):
-        wizard_service.drop_profile_topics(conn, int(prow["id"]), live=not prow["is_draft"])
-    researchers_repo.delete(conn, researcher_id)
+    # After the delete, so a delete that fails changes no list; a drop that
+    # fails is met by the next aggregation, which finds the researcher gone.
+    for profile_id, live in interests:
+        wizard_service.drop_profile_topics(conn, profile_id, live=live)
 
 
 # ---------------------------------------------------------------------------

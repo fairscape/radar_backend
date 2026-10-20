@@ -349,6 +349,7 @@ def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> d
     they were applied. The flag is compared under the write lock; the build
     itself runs without it, so the lock is held for one UPDATE.
     """
+    seen = researcher_topics.is_applied(_stored_topic_filters(conn, profile_id))
     topic_filters = build()
     for _ in range(3):
         if conn.in_transaction:
@@ -356,7 +357,10 @@ def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> d
         conn.execute("BEGIN IMMEDIATE")
         try:
             stored = _stored_topic_filters(conn, profile_id)
-            same = researcher_topics.is_applied(stored) == researcher_topics.is_applied(topic_filters)
+            now = researcher_topics.is_applied(stored)
+            # The stored flag, not the built one: a build that found the
+            # researcher gone drops the flag on purpose and must not loop.
+            same = now == seen
             if same:
                 conn.execute(
                     "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
@@ -369,6 +373,7 @@ def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> d
             conn.rollback()
             raise
         log.info("wizard.topics_rebuilt_after_profile_change", profile_id=profile_id)
+        seen = now
         topic_filters = build()
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
@@ -410,16 +415,25 @@ def _aggregate_topics(
     from_profile = _researcher_topics_for(conn, profile_id) if applied else None
     if from_profile is not None:
         topic_filters = researcher_topics.apply(topic_filters, from_profile)
+        if from_profile.get("labels_unmapped"):
+            # Part of the profile (its text labels) could not be mapped just
+            # now: the topics they gave, their marks and states, are kept
+            # as the last full read stored them rather than dropped for the
+            # duration -- a scan in between would search without them and
+            # the user's switches on them would be lost.
+            topic_filters = _keep_stored_profile(stored, topic_filters)
         _carry_before_states(stored, topic_filters)
     elif applied and _has_researcher(conn, profile_id):
-        # The profile could not be read just now (the label mapper is down,
-        # say): still applied. What the last readable aggregation stored --
-        # the profile-only topics, the marks, the remembered states -- is
-        # kept as it was, so nothing is lost across the outage.
+        # The profile lists no topics Radar can read just now (re-imported
+        # without them, or only text labels and the mapper is down): still
+        # applied. What the last readable aggregation stored -- the
+        # profile-only topics, the marks, the remembered states -- is kept
+        # as it was; "Remove profile topics" is the way out.
         topic_filters = _keep_stored_profile(stored, topic_filters)
     elif applied:
         # The researcher was forgotten: the profile goes with them, and the
         # marked topics go back as they were before it was applied.
+        topic_filters[researcher_topics.FLAG] = False
         for t in stored.get("topics") or []:
             if t.get("id") and researcher_topics.BEFORE in t:
                 prior_on[t["id"]] = bool(t[researcher_topics.BEFORE])
@@ -584,6 +598,11 @@ def set_researcher_topics(
             raise ValueError(
                 "this interest was not built from a researcher whose profile lists topics"
             )
+    stored = _stored_topic_filters(conn, profile_id)
+    if not enabled and not researcher_topics.is_applied(stored):
+        # Nothing applied, nothing to take off: the stored list stays as it
+        # is (a rebuild here would bring in topics the user has not seen).
+        return stored
     prior_on = _prior_topic_states(conn, profile_id)
     # Folded in and marked either way: dropping needs the marks to know
     # which topics to put back.
@@ -602,6 +621,11 @@ def set_researcher_topics(
             if researcher_topics.BEFORE in t:
                 t["on"] = bool(t[researcher_topics.BEFORE])
         full = researcher_topics.strip(full)
+        kept = full.get("topics") or []
+        # On a saved interest the list is what the next scan searches by; a
+        # draft's is settled on step 3, which says so when nothing is ticked.
+        if not row["is_draft"] and kept and not any(t.get("on", True) for t in kept):
+            raise NoTopicOn("removing the profile's topics would leave none on: switch one on first")
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(full), profile_id),

@@ -144,6 +144,7 @@ def public(view: dict) -> dict:
         "unwanted": [_t(t) for t in view.get("unwanted") or []],
         "wanted_labels": list(view.get("wanted_labels") or []),
         "unwanted_labels": list(view.get("unwanted_labels") or []),
+        "labels_unmapped": bool(view.get("labels_unmapped")),
     }
 
 
@@ -276,17 +277,25 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     side it was on (``not_interests`` → ``unwanted``), carrying the label
     in ``label``; a topic the profile already asserts outright is not
     added again, and a topic a label would add to both sides is left out.
+
+    ``labels_unmapped`` on the result says the labels should have been
+    mapped but could not be just now (the mapper failed, or is being left
+    alone after a failure): the view is then only part of the profile, and
+    an aggregation keeps what its last full read stored of it. With UMLS
+    off there is nothing to map against, which is not an outage.
     """
     import time
 
     global _DOWN_UNTIL
+    labels = bool(view.get("wanted_labels") or view.get("unwanted_labels"))
     # The topic-name index is part of the UMLS cache: without it there is
     # nothing to map against.
     if settings is None or not getattr(settings, "RADAR_UMLS_ENABLED", False):
-        return view
+        return {**view, "labels_unmapped": False}
     if time.monotonic() < _DOWN_UNTIL:
-        return view
-    out = {k: list(v) for k, v in view.items()}
+        return {**view, "labels_unmapped": labels}
+    out = {k: (list(v) if isinstance(v, list) else v) for k, v in view.items()}
+    out["labels_unmapped"] = False
     have = {t["id"] for t in (*out["wanted"], *out["unwanted"])}
     mapped: dict[str, tuple[str, dict]] = {}
     clashes: set[str] = set()
@@ -300,7 +309,7 @@ def with_labels(view: dict, *, settings: Any) -> dict:
                 structlog.get_logger("rag_lib.researcher_topics").warning(
                     "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160],
                     retry_in_s=LABEL_RETRY_SECONDS)
-                return view
+                return {**view, "labels_unmapped": labels}
             if hit is None or hit["id"] in have:
                 continue
             if hit["id"] in mapped and mapped[hit["id"]][0] != side:

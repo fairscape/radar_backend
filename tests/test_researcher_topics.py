@@ -161,8 +161,10 @@ def test_a_label_mapping_to_both_sides_is_left_out_and_a_dead_embedder_changes_n
         raise RuntimeError("ollama down")
     monkeypatch.setattr("rag_lib.embedders.get_embedder", boom)
     rt.reset_label_cache()
-    assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == rt.read(DOCUMENT)
-    assert rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False)) == rt.read(DOCUMENT)
+    # The view comes back as read, saying its labels are not mapped; with
+    # UMLS off there is nothing to map, which is not an outage.
+    assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == {**rt.read(DOCUMENT), "labels_unmapped": True}
+    assert rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False)) == {**rt.read(DOCUMENT), "labels_unmapped": False}
 
 
 def test_the_mapper_carries_the_profile_mark():
@@ -350,7 +352,8 @@ def test_a_profile_without_interests_reads_as_unavailable(env):
     app = _app(StubProsopia(_stub_profile()), _stub_openalex())
     rid = _import_prosopia(app)
     assert _request(app, "GET", f"/api/researchers/{rid}").json()["topics"] == {
-        "available": False, "wanted": [], "unwanted": [], "wanted_labels": [], "unwanted_labels": []}
+        "available": False, "wanted": [], "unwanted": [], "wanted_labels": [], "unwanted_labels": [],
+        "labels_unmapped": False}
 
 
 def _import_prosopia(app) -> int:
@@ -508,12 +511,14 @@ def test_label_mapping_remembers_a_miss_and_backs_off_after_a_failure(monkeypatc
         raise RuntimeError("ollama down")
     monkeypatch.setattr("rag_lib.embedders.get_embedder", boom)
     rt.reset_label_cache()
-    assert rt.with_labels(rt.read(doc), settings=settings) == rt.read(doc)
+    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True}
     # Backing off: nothing is asked for a while, so the next call does not raise and maps nothing.
     monkeypatch.setattr("rag_lib.embedders.get_embedder", lambda m: (lambda text: calls.append(text) or np.array([ord(c) for c in text], dtype=np.float32)))
     n = len(calls)
-    assert rt.with_labels(rt.read(doc), settings=settings) == rt.read(doc)
+    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True}
     assert len(calls) == n
+    # No labels at all: nothing to map, not an outage.
+    assert rt.with_labels(rt.read({"research_interests": []}), settings=settings)["labels_unmapped"] is False
     rt.reset_label_cache()
     assert [t["label"] for t in rt.with_labels(rt.read(doc), settings=settings)["unwanted"]] == ["phylogenomics"]
 
@@ -625,3 +630,105 @@ def test_a_researcher_removed_underneath_restores_the_seeds_topics_on_the_next_r
     topics = _topics(app, slug)
     assert set(topics) == {"T10001"} and topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
     assert _stored(env, slug).get("researcher_topics") is not True
+
+
+# --- after the third review -------------------------------------------------------
+
+
+def test_label_topics_stay_while_the_mapper_is_down(env, monkeypatch):
+    """The profile's text labels map to topics only while the mapper is up.
+    A read made while it is down must not drop those topics from the list,
+    nor forget the user's switch on them."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    mapped = {"id": "https://openalex.org/T10434", "display_name": "Genomics and Phylogenetic Studies",
+              "weight": None, "method": "label", "label": "Lab notebooks"}
+    state = {"up": True}
+
+    def with_labels(view, *, settings):
+        if state["up"]:
+            return {**view, "wanted": [*view["wanted"], dict(mapped)], "labels_unmapped": False}
+        return {**view, "labels_unmapped": True}
+
+    monkeypatch.setattr(wizard.researcher_topics, "with_labels", with_labels)
+    on = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    assert on[mapped["id"]]["source"] == "researcher" and on[mapped["id"]]["on"] is True
+    # The user switches the label topic off.
+    conn = connect(env)
+    try:
+        stored = _stored(env, slug)
+        for t in stored["topics"]:
+            if t["id"] == mapped["id"]:
+                t["on"] = False
+        conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE slug = ?", (json.dumps(stored), slug))
+        conn.commit()
+    finally:
+        conn.close()
+    state["up"] = False
+    during = _topics(app, slug)
+    assert during[mapped["id"]]["on"] is False and during[mapped["id"]]["source"] == "researcher"
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    assert view["applied"] is True and view["topics"]["available"] is True and view["topics"]["labels_unmapped"] is True
+    state["up"] = True
+    assert _topics(app, slug)[mapped["id"]]["on"] is False
+
+
+def test_removing_that_would_leave_nothing_on_is_refused_on_a_saved_interest(env):
+    """Profile wants only a topic no seed has; the user switched the seeds'
+    topic off and saved. Removing the profile would leave nothing on, and
+    the saved list is what the next scan searches by."""
+    profile = _stub_profile()
+    profile.metadata = {"research_interests": [_topic("T10515", "Cancer-related", weight=0.5, method="declared")]}
+    profile.rid = "0000-0001-5643-4068"
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    assert {t["id"] for t in applied if t["on"]} == {"T10001", "https://openalex.org/T10515"}
+    _commit(app, slug, ["https://openalex.org/T10515"])            # T10001 off
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False})
+    assert resp.status_code == 409 and "switch one on first" in resp.json()["detail"]
+    stored = _stored(env, slug)
+    assert stored["researcher_topics"] is True and any(t["on"] for t in stored["topics"])
+
+
+def test_removing_what_was_never_applied_writes_nothing(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    before = _stored(env, slug)
+    # A new seed topic arrives; a remove with nothing applied must not pull it in unseen.
+    conn = connect(env)
+    try:
+        oa_id = conn.execute("SELECT openalex_id FROM profile_seeds ps JOIN profiles p ON p.id = ps.profile_id "
+                             "WHERE p.slug = ? AND openalex_id LIKE 'https://openalex.org/W%' LIMIT 1", (slug,)).fetchone()[0]
+        raw = json.loads(conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa_id,)).fetchone()[0])
+        raw["topics"].append({"id": "https://openalex.org/T12345", "display_name": "Something New", "score": 0.5,
+                              "subfield": None, "field": None, "domain": None})
+        conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (json.dumps(raw), oa_id))
+        conn.commit()
+    finally:
+        conn.close()
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False})
+    assert resp.status_code == 200 and [t["id"] for t in resp.json()] == ["T10001"]
+    assert _stored(env, slug) == before
+
+
+def test_a_read_after_the_researcher_vanished_rebuilds_once(env, monkeypatch):
+    from rag_lib.api.services import wizard
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    conn = connect(env)
+    try:
+        repo.delete(conn, rid)
+    finally:
+        conn.close()
+    calls = []
+    real = wizard._aggregate_topics
+    monkeypatch.setattr(wizard, "_aggregate_topics", lambda *a, **k: calls.append(1) or real(*a, **k))
+    _topics(app, slug)
+    assert len(calls) == 1
+    assert _stored(env, slug)["researcher_topics"] is False

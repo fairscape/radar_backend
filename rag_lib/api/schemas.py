@@ -737,6 +737,9 @@ class ResearcherTopics(_Model):
     unwanted: list[ResearcherTopic] = Field(default_factory=list)
     wanted_labels: list[str] = Field(default_factory=list)
     unwanted_labels: list[str] = Field(default_factory=list)
+    # The labels could not be mapped to topics just now (the mapper is down);
+    # ``wanted``/``unwanted`` then hold only the topics the profile asserts outright.
+    labels_unmapped: bool = False
 
 
 class ProfileResearcherTopics(_Model):

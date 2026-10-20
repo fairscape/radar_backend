@@ -191,3 +191,18 @@ def test_marking_refuses_a_connection_with_a_transaction_open(env):
         assert repo.get(conn, nathan)["mark"] is None
     finally:
         conn.close()
+
+
+def test_a_mark_on_a_researcher_forgotten_meanwhile_is_a_404(env, monkeypatch):
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_stub_profile()), _both_stubs())
+    nathan, _ = _two(app)
+    real = repo.set_mark
+
+    def vanishing(conn, user_id, researcher_id, mark):
+        repo.delete(conn, researcher_id)          # another tab forgot them just now
+        return real(conn, user_id, researcher_id, mark)
+
+    monkeypatch.setattr(repo, "set_mark", vanishing)
+    resp = _request(app, "PATCH", f"/api/researchers/{nathan}", json={"mark": "self"})
+    assert resp.status_code == 404
