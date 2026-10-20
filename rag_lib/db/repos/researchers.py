@@ -13,7 +13,8 @@ because ownership is per user and the vault listing follows it.
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 
 def get(conn: sqlite3.Connection, researcher_id: int) -> sqlite3.Row | None:
@@ -72,18 +73,19 @@ def set_mark(
     """
     if mark is not None and mark not in MARKS:
         raise ValueError(f"mark must be one of {', '.join(MARKS)}, or null")
-    rows = list_for_user(conn, user_id)
-    ids = [int(r["id"]) for r in rows]
-    if researcher_id not in ids:
-        raise LookupError(f"researcher {researcher_id} not found")
-    marks = {int(r["id"]): r["mark"] for r in rows}
-    ids.remove(researcher_id)
-    marks[researcher_id] = mark
-    rank = {"self": 0, "followed": 1, None: 2}
-    at = next((i for i, oid in enumerate(ids) if rank[marks[oid]] >= rank[mark]), len(ids))
-    ids.insert(at, researcher_id)
-    conn.execute("UPDATE researchers SET mark = ? WHERE id = ?", (mark, researcher_id))
-    _write_positions(conn, ids)
+    with _whole_list(conn):
+        rows = list_for_user(conn, user_id)
+        ids = [int(r["id"]) for r in rows]
+        if researcher_id not in ids:
+            raise LookupError(f"researcher {researcher_id} not found")
+        marks = {int(r["id"]): r["mark"] for r in rows}
+        ids.remove(researcher_id)
+        marks[researcher_id] = mark
+        rank = {"self": 0, "followed": 1, None: 2}
+        at = next((i for i, oid in enumerate(ids) if rank[marks[oid]] >= rank[mark]), len(ids))
+        ids.insert(at, researcher_id)
+        conn.execute("UPDATE researchers SET mark = ? WHERE id = ?", (mark, researcher_id))
+        _write_positions(conn, ids)
 
 
 def reorder(conn: sqlite3.Connection, user_id: int, ids: list[int]) -> None:
@@ -93,10 +95,31 @@ def reorder(conn: sqlite3.Connection, user_id: int, ids: list[int]) -> None:
     partial list would leave the rest unplaced and the drag the user just
     made would not stick); ``ValueError`` otherwise.
     """
-    have = sorted(int(r["id"]) for r in list_for_user(conn, user_id))
-    if sorted(ids) != have or len(set(ids)) != len(ids):
-        raise ValueError("ids must list each of your researchers exactly once")
-    _write_positions(conn, ids)
+    with _whole_list(conn):
+        have = sorted(int(r["id"]) for r in list_for_user(conn, user_id))
+        if sorted(ids) != have or len(set(ids)) != len(ids):
+            raise ValueError("ids must list each of your researchers exactly once")
+        _write_positions(conn, ids)
+
+
+@contextmanager
+def _whole_list(conn: sqlite3.Connection) -> Iterator[None]:
+    """One write transaction around a read of the list and the positions
+    written from it. Two tabs marking at once each computed their order from
+    a list the other's write was missing; the lock makes the second wait and
+    read the first's result."""
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        if own:
+            conn.rollback()
+        raise
+    else:
+        if own:
+            conn.commit()
 
 
 def _write_positions(conn: sqlite3.Connection, ids: list[int]) -> None:
@@ -104,7 +127,6 @@ def _write_positions(conn: sqlite3.Connection, ids: list[int]) -> None:
         "UPDATE researchers SET position = ? WHERE id = ?",
         [(i, rid) for i, rid in enumerate(ids)],
     )
-    conn.commit()
 
 
 def upsert(

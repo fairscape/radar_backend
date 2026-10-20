@@ -342,14 +342,21 @@ def aggregate_draft_topics(
     return topic_filters
 
 
-def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool) -> dict:
+def _aggregate_topics(
+    conn: sqlite3.Connection, profile_id: int, *, new_on: bool, profile_topics: bool | None = None,
+) -> dict:
     """The seeds' aggregated topics, carrying forward prior on/off states.
 
     Writes nothing to the profile. ``new_on`` is the state of a topic not
     seen before. (A seed OpenAlex does not have may get its content topics
     stored on its paper row here; see ``_content_topics``.)
+
+    ``profile_topics`` says whether the researcher's profile topics are folded
+    in: None reads the stored flag, True/False overrides it (the apply and
+    remove paths, which then write what this returns in one go).
     """
     prior_on = _prior_topic_states(conn, profile_id)
+    stored = _stored_topic_filters(conn, profile_id)
     from_content = _content_topics(conn, profile_id)
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
@@ -362,19 +369,53 @@ def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool
     # The researcher's own profile topics, once the user has applied them
     # (``set_researcher_topics``): the list is rebuilt from the seeds every
     # time, so they are folded in again here, from the profile as stored now.
-    from_profile = _applied_researcher_topics(conn, profile_id)
+    applied = researcher_topics.is_applied(stored) if profile_topics is None else bool(profile_topics)
+    from_profile = _researcher_topics_for(conn, profile_id) if applied else None
     if from_profile is not None:
         topic_filters = researcher_topics.apply(topic_filters, from_profile)
+        _carry_before_states(stored, topic_filters)
+    elif applied and _has_researcher(conn, profile_id):
+        # The profile could not be read just now (the label mapper is down,
+        # say): still applied; the next aggregation that can read it folds it
+        # in again. Only a forgotten researcher drops the flag.
+        topic_filters[researcher_topics.FLAG] = True
 
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
             t["on"] = prior_on.get(t["id"], new_on)
-            # A topic the profile does not want starts off, whatever new
+            # A topic the profile has an opinion on and the user has not
+            # seen before starts as the profile says, whatever other new
             # topics start as; a choice the user made since is kept.
-            if (from_profile is not None and t.get("profile") == researcher_topics.NOT_INTEREST
-                    and t["id"] not in prior_on):
-                t["on"] = False
+            if from_profile is not None and t["id"] not in prior_on:
+                if t.get("profile") == researcher_topics.NOT_INTEREST:
+                    t["on"] = False
+                elif t.get("profile") == researcher_topics.INTEREST:
+                    t["on"] = True
     return topic_filters
+
+
+def _stored_topic_filters(conn: sqlite3.Connection, profile_id: int) -> dict:
+    try:
+        return profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:  # noqa: BLE001 -- never aggregated, or unreadable
+        return {}
+
+
+def _has_researcher(conn: sqlite3.Connection, profile_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM profiles p JOIN researchers r ON r.id = p.researcher_id WHERE p.id = ?",
+        (profile_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _carry_before_states(stored: dict, topic_filters: dict) -> None:
+    """Keep each marked topic's recorded pre-apply state across a rebuild."""
+    before = {t.get("id"): t[researcher_topics.BEFORE] for t in stored.get("topics") or []
+              if t.get("id") and researcher_topics.BEFORE in t}
+    for t in topic_filters.get("topics") or []:
+        if t.get("profile") and t.get("id") in before:
+            t[researcher_topics.BEFORE] = before[t["id"]]
 
 
 def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int) -> dict | None:
@@ -391,30 +432,20 @@ def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int) -> dict | 
     return view if researcher_topics.available(view) else None
 
 
-def _applied_researcher_topics(conn: sqlite3.Connection, profile_id: int) -> dict | None:
-    """``_researcher_topics_for`` when the interest has them applied, else None.
-
-    Applied is a flag in the stored ``topic_filters``; a researcher since
-    forgotten (``profiles.researcher_id`` is set NULL) leaves nothing to
-    fold in, and the flag goes with the next write."""
-    try:
-        stored = profiles_repo.topic_filters(conn, profile_id) or {}
-    except Exception:  # noqa: BLE001 -- never aggregated, or unreadable
-        return None
-    if not researcher_topics.is_applied(stored):
-        return None
-    return _researcher_topics_for(conn, profile_id)
+class NoTopicOn(ValueError):
+    """Applying the profile's topics would leave none switched on."""
 
 
 def researcher_topics_view(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
     """What ``GET /researcher-topics`` shows: the researcher, their profile
-    topics, and whether the interest has them applied. Draft or saved."""
+    topics, and whether the interest has them applied. Draft or saved.
+
+    ``applied`` is the stored flag while the researcher is still there: it
+    stays true through a moment the profile cannot be read (the label
+    mapper down), when ``topics.available`` is false."""
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
-    try:
-        stored = profiles_repo.topic_filters(conn, profile_id) or {}
-    except Exception:  # noqa: BLE001
-        stored = {}
+    stored = _stored_topic_filters(conn, profile_id)
     rrow = None
     if row["researcher_id"] is not None:
         rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
@@ -422,7 +453,7 @@ def researcher_topics_view(conn: sqlite3.Connection, *, user_id: int, slug: str)
     return {
         "researcher_id": int(rrow["id"]) if rrow is not None else None,
         "researcher_name": rrow["name"] if rrow is not None else None,
-        "applied": bool(view is not None and researcher_topics.is_applied(stored)),
+        "applied": bool(rrow is not None and researcher_topics.is_applied(stored)),
         "topics": {"available": view is not None,
                    **researcher_topics.public(view or researcher_topics.read(None))},
     }
@@ -435,14 +466,18 @@ def set_researcher_topics(
 
     Applying folds the wanted topics in switched on and switches the
     not-wanted ones off -- an explicit choice, so it overrides what the
-    user had set on those topics before -- and records the flag so every
-    later re-aggregation does the same. Dropping clears the flag; the next
-    aggregation (done here) rebuilds the list from the seeds alone. The
-    profile's topics are the reranker's queries in topic mode, so a saved
-    interest's rerank is refreshed as after ``save_topics``.
+    user had set on those topics before, which is remembered on each
+    marked topic -- and records the flag so every later re-aggregation does
+    the same. Dropping puts every marked topic back as it was before the
+    profile was applied, removes the topics only the profile brought, and
+    clears the flag. One write either way. The profile's topics are the
+    reranker's queries in topic mode, so a saved interest's rerank is
+    refreshed as after ``save_topics``.
 
     Raises ``ValueError`` when the interest has no researcher with profile
-    topics, ``ImportInProgress`` while an import is filling the draft.
+    topics, :class:`NoTopicOn` (a ValueError) when applying would switch
+    every topic off -- a scan searches by them, as ``save_topics`` --
+    and ``ImportInProgress`` while an import is filling the draft.
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
@@ -456,25 +491,24 @@ def set_researcher_topics(
             raise ValueError(
                 "this interest was not built from a researcher whose profile lists topics"
             )
-    try:
-        stored = profiles_repo.topic_filters(conn, profile_id) or {}
-    except Exception:  # noqa: BLE001
-        stored = {}
-    stored[researcher_topics.FLAG] = bool(enabled)
-    conn.execute(
-        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(stored), profile_id),
-    )
-    conn.commit()
-    # With the flag off, the aggregation folds nothing in and marks nothing:
-    # that is the drop. With it on, the states are set here outright.
-    full = _aggregate_topics(conn, profile_id, new_on=bool(row["is_draft"]))
+    prior_on = _prior_topic_states(conn, profile_id)
+    # Folded in and marked either way: dropping needs the marks to know
+    # which topics to put back.
+    full = _aggregate_topics(conn, profile_id, new_on=bool(row["is_draft"]), profile_topics=True)
+    topics = full.get("topics") or []
     if enabled:
-        for t in full.get("topics") or []:
-            if t.get("profile") == researcher_topics.INTEREST:
-                t["on"] = True
-            elif t.get("profile") == researcher_topics.NOT_INTEREST:
-                t["on"] = False
+        for t in topics:
+            if t.get("profile"):
+                # The state before the profile had its say, kept across re-applies.
+                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], bool(t.get("on", True))))
+                t["on"] = t["profile"] == researcher_topics.INTEREST
+        if topics and not any(t.get("on", True) for t in topics):
+            raise NoTopicOn("the profile would switch every topic off: a scan searches by them")
+    else:
+        for t in topics:
+            if researcher_topics.BEFORE in t:
+                t["on"] = bool(t[researcher_topics.BEFORE])
+        full = researcher_topics.strip(full)
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(full), profile_id),
@@ -1485,6 +1519,11 @@ def _keep_stored_umls(conn: sqlite3.Connection, profile_id: int, topic_filters: 
             and (unread is None or not t.get("seeds") or unread & set(t["seeds"]))]
     if not keep:
         return topic_filters
+    # The researcher's marks are put on afresh by ``_aggregate_topics`` when
+    # the profile is applied; a kept copy must not carry them from a time it was.
+    for t in keep:
+        t.pop("profile", None)
+        t.pop(researcher_topics.BEFORE, None)
     return {**topic_filters, "topics": [*(topic_filters.get("topics") or []), *keep]}
 
 

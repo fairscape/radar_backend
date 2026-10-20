@@ -1075,9 +1075,11 @@ def set_researcher_topics(
 ) -> list[Topic]:
     """Apply (``enabled``) or drop the researcher's profile topics. Applied:
     the wanted topics join the list switched on, the not-wanted ones are
-    switched off; both marked. Works on drafts and saved interests; a
-    saved one applies it from the next scan. 400 when the interest has no
-    researcher with profile topics, 409 while an import fills the draft."""
+    switched off; both marked. Dropped: marked topics go back as they were.
+    Works on drafts and saved interests; a saved one applies it from the
+    next scan. 400 when the interest has no researcher with profile topics,
+    409 while an import fills the draft or when applying would leave no
+    topic on."""
     try:
         topic_filters = wizard_service.set_researcher_topics(
             db, user_id=int(user["id"]), slug=key, enabled=body.enabled,
@@ -1089,6 +1091,8 @@ def set_researcher_topics(
         ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except wizard_service.NoTopicOn as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return _topics_out(topic_filters)

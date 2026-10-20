@@ -28,6 +28,9 @@ SOURCE = "researcher"
 INTEREST = "interest"
 NOT_INTEREST = "not_interest"
 FLAG = "researcher_topics"          # topic_filters key: the profile's topics are applied
+# On a marked topic: its on/off before the profile was applied, restored when
+# the profile is removed again.
+BEFORE = "on_before_profile"
 
 _TOPIC_ID = re.compile(r"^(?:https://openalex\.org/)?(T\d+)$", re.IGNORECASE)
 
@@ -207,6 +210,7 @@ def strip(topic_filters: dict) -> dict:
             continue
         t = dict(t)
         t.pop("profile", None)
+        t.pop(BEFORE, None)
         kept.append(t)
     out["topics"] = kept
     out[FLAG] = False
@@ -221,20 +225,36 @@ def strip(topic_filters: dict) -> dict:
 # close enough to act on only above this; a real topic name is usually
 # above 0.7 against a paraphrase of itself.
 LABEL_MIN_SIMILARITY = 0.6
-_LABEL_CACHE: dict[str, dict | None] = {}
+# The mapping runs inside requests (a researcher page, a topic list). An
+# embedder that is down must not hold every one of them for its timeout:
+# after a failure nothing is mapped for this long, and a label that mapped
+# to nothing is not asked about again for as long either.
+LABEL_RETRY_SECONDS = 600.0
+_LABEL_CACHE: dict[tuple[str, str, str], tuple[dict | None, float]] = {}   # (model, index dir, label) -> (hit, when)
+_DOWN_UNTIL = 0.0
+
+
+def reset_label_cache() -> None:
+    global _DOWN_UNTIL
+    _LABEL_CACHE.clear()
+    _DOWN_UNTIL = 0.0
 
 
 def _nearest_topic(label: str, *, settings: Any) -> dict | None:
-    key = label.strip().lower()
-    if key in _LABEL_CACHE:
-        return _LABEL_CACHE[key]
+    import time
+
+    model = str(settings.RADAR_UMLS_EMBEDDING_MODEL)
+    cache_dir = str(settings.RADAR_UMLS_CACHE_DIR)
+    key = (model, cache_dir, label.strip().lower())
+    cached = _LABEL_CACHE.get(key)
+    if cached is not None and (cached[0] is not None or time.monotonic() - cached[1] < LABEL_RETRY_SECONDS):
+        return cached[0]
     import numpy as np
 
     from .embedders import get_embedder
     from .umls.cache import get_topic_index
 
-    model = settings.RADAR_UMLS_EMBEDDING_MODEL
-    index = get_topic_index(str(settings.RADAR_UMLS_CACHE_DIR))
+    index = get_topic_index(cache_dir)
     index.check_compatible(model)
     vec = np.array(get_embedder(model)(label.replace("-", " ")), dtype=np.float32)
     index.check_compatible(model, dim=int(vec.shape[-1]))
@@ -244,7 +264,7 @@ def _nearest_topic(label: str, *, settings: Any) -> dict | None:
             hit = {"id": t["id"], "display_name": (t.get("display_name") or "").strip() or t["id"],
                    "similarity": round(float(sim), 4)}
         break
-    _LABEL_CACHE[key] = hit
+    _LABEL_CACHE[key] = (hit, time.monotonic())
     return hit
 
 
@@ -257,7 +277,14 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     in ``label``; a topic the profile already asserts outright is not
     added again, and a topic a label would add to both sides is left out.
     """
+    import time
+
+    global _DOWN_UNTIL
+    # The topic-name index is part of the UMLS cache: without it there is
+    # nothing to map against.
     if settings is None or not getattr(settings, "RADAR_UMLS_ENABLED", False):
+        return view
+    if time.monotonic() < _DOWN_UNTIL:
         return view
     out = {k: list(v) for k, v in view.items()}
     have = {t["id"] for t in (*out["wanted"], *out["unwanted"])}
@@ -269,8 +296,10 @@ def with_labels(view: dict, *, settings: Any) -> dict:
                 hit = _nearest_topic(label, settings=settings)
             except Exception as exc:  # noqa: BLE001 -- the index or embedder is unavailable
                 import structlog
+                _DOWN_UNTIL = time.monotonic() + LABEL_RETRY_SECONDS
                 structlog.get_logger("rag_lib.researcher_topics").warning(
-                    "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160])
+                    "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160],
+                    retry_in_s=LABEL_RETRY_SECONDS)
                 return view
             if hit is None or hit["id"] in have:
                 continue

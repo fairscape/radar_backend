@@ -130,3 +130,45 @@ def test_rows_from_before_the_marks_sort_behind_the_placed_ones(env):
     # Marking anyone places every row.
     _request(app, "PATCH", f"/api/researchers/{justin}", json={"mark": "self"})
     assert _order(app) == [(justin, "self", 0), (nathan, None, 1)]
+
+
+def test_a_patch_without_the_field_is_not_a_clear(env):
+    app = _app(StubProsopia(_stub_profile()), _both_stubs())
+    nathan, _ = _two(app)
+    _request(app, "PATCH", f"/api/researchers/{nathan}", json={"mark": "self"})
+    assert _request(app, "PATCH", f"/api/researchers/{nathan}", json={}).status_code == 422
+    assert _request(app, "GET", f"/api/researchers/{nathan}").json()["researcher"]["mark"] == "self"
+    assert _request(app, "PATCH", f"/api/researchers/{nathan}", json={"mark": None}).status_code == 200
+    assert _request(app, "GET", f"/api/researchers/{nathan}").json()["researcher"]["mark"] is None
+
+
+def test_marking_is_one_transaction(env, monkeypatch):
+    """The list is read and every position written under one write lock, so
+    a second writer waits and reads the first's result: the read happens
+    inside the transaction, not before it."""
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_stub_profile()), _both_stubs())
+    nathan, justin = _two(app)
+    seen = []
+    real = repo.list_for_user
+    monkeypatch.setattr(repo, "list_for_user", lambda conn, uid: seen.append(conn.in_transaction) or real(conn, uid))
+    conn = connect(env)
+    try:
+        repo.set_mark(conn, 1, justin, "followed")
+        repo.reorder(conn, 1, [nathan, justin])
+        assert seen == [True, True]                # both reads were under the write lock
+        assert not conn.in_transaction             # and it was committed
+        assert [r["id"] for r in real(conn, 1)] == [nathan, justin]
+        # A writer that cannot get the lock fails cleanly, leaving nothing open.
+        other = connect(env)
+        other.execute("PRAGMA busy_timeout = 100")
+        conn.execute("BEGIN IMMEDIATE")
+        import sqlite3
+        import pytest
+        with pytest.raises(sqlite3.OperationalError):
+            repo.set_mark(other, 1, nathan, "self")
+        assert not other.in_transaction
+        conn.rollback()
+        other.close()
+    finally:
+        conn.close()

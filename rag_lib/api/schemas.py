@@ -757,9 +757,10 @@ class ResearcherTopicsUpdate(_Model):
 
 
 class ResearcherMarkUpdate(_Model):
-    """Body of ``PATCH /api/researchers/{id}``: ``self`` (the user), ``followed``, or null."""
+    """Body of ``PATCH /api/researchers/{id}``: ``self`` (the user), ``followed``,
+    or null to clear. The field is required: an empty body is not "clear"."""
 
-    mark: Literal["self", "followed"] | None = None
+    mark: Literal["self", "followed"] | None
 
 
 class ResearcherOrderRequest(_Model):

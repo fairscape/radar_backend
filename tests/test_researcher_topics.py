@@ -131,7 +131,7 @@ def _label_settings(monkeypatch, hits):
     monkeypatch.setattr("rag_lib.umls.cache.get_topic_index", lambda d: _Index(hits))
     monkeypatch.setattr("rag_lib.embedders.get_embedder",
                         lambda m: (lambda text: np.array([ord(c) for c in text], dtype=np.float32)))
-    rt._LABEL_CACHE.clear()
+    rt.reset_label_cache()
     return SimpleNamespace(RADAR_UMLS_ENABLED=True, RADAR_UMLS_EMBEDDING_MODEL="m", RADAR_UMLS_CACHE_DIR="x")
 
 
@@ -160,7 +160,7 @@ def test_a_label_mapping_to_both_sides_is_left_out_and_a_dead_embedder_changes_n
     def boom(*a, **k):
         raise RuntimeError("ollama down")
     monkeypatch.setattr("rag_lib.embedders.get_embedder", boom)
-    rt._LABEL_CACHE.clear()
+    rt.reset_label_cache()
     assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == rt.read(DOCUMENT)
     assert rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False)) == rt.read(DOCUMENT)
 
@@ -357,3 +357,155 @@ def _import_prosopia(app) -> int:
     resp = _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"})
     assert resp.status_code == 200, resp.text
     return resp.json()["researcher_id"]
+
+
+# --- after the first review -------------------------------------------------------
+
+
+def _commit(app, slug, selected):
+    resp = _request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.5, "selected_topic_ids": selected})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _stored(env, slug):
+    conn = connect(env)
+    try:
+        return json.loads(conn.execute("SELECT topic_filters_json FROM profiles WHERE slug = ?", (slug,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_applying_that_would_switch_every_topic_off_is_refused(env):
+    """A profile that wants nothing the seeds have and rejects what they do:
+    applied, a scan would search by nothing. Refused like save_topics."""
+    profile = _stub_profile()
+    profile.metadata = {"research_interests": [_topic("T10001", "Test Topic", weight=-0.5, method="declared")]}
+    profile.rid = "0000-0001-5643-4068"
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    before = _topics(app, slug)
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    assert resp.status_code == 409 and "every topic off" in resp.json()["detail"]
+    assert _topics(app, slug) == before                      # nothing was written
+    assert _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["applied"] is False
+
+
+def test_removing_puts_the_seeds_topics_back_as_they_were(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _topics(app, slug)["T10001"]["on"] is True
+    on = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    assert on["T10001"]["on"] is False
+    # Re-aggregation (step 3 reopened) keeps the pre-apply state around.
+    _topics(app, slug)
+    assert _stored(env, slug)["topics"][0]["on_before_profile"] is True
+    off = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert set(off) == {"T10001"} and off["T10001"]["on"] is True and off["T10001"]["profile"] is None
+    assert "on_before_profile" not in _stored(env, slug)["topics"][0]
+    assert _stored(env, slug)["researcher_topics"] is False
+
+    # Switched off by the user before the profile was applied: off again after it is removed.
+    conn = connect(env)
+    try:
+        stored = _stored(env, slug)
+        stored["topics"][0]["on"] = False
+        conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE slug = ?", (json.dumps(stored), slug))
+        conn.commit()
+    finally:
+        conn.close()
+    _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    assert _topics(app, slug)["T10001"]["on"] is False
+    back = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert back["T10001"]["on"] is False
+
+
+def test_a_saved_interest_keeps_the_profile_and_its_new_wanted_topics_start_on(env):
+    """Commit carries the flag and the profile-only topics; on the saved
+    interest, where new topics otherwise start off, a topic the profile
+    gains later (a re-import) still starts on, and a not-wanted one off."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    assert applied.status_code == 200
+    # Committed with step 3's ticks as the profile set them (T10001 off).
+    _commit(app, slug, [t["id"] for t in applied.json() if t["on"]])
+    stored = _stored(env, slug)
+    assert stored["researcher_topics"] is True
+    assert {t["id"] for t in stored["topics"] if t.get("source") == "researcher"} == {"https://openalex.org/T10222", "https://openalex.org/T10515"}
+    assert _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["applied"] is True
+
+    # The profile gains a declared wanted topic and a declared unwanted one the seeds carry.
+    conn = connect(env)
+    try:
+        doc = dict(DOCUMENT)
+        doc["research_interests"] = DOCUMENT["research_interests"] + [_topic("T77777", "Newly Declared", weight=0.9, method="declared")]
+        conn.execute("UPDATE researchers SET document_json = ? WHERE id = ?", (json.dumps(doc), rid))
+        conn.commit()
+    finally:
+        conn.close()
+    preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
+    assert preview["https://openalex.org/T77777"]["on"] is True and preview["https://openalex.org/T77777"]["new"] is True
+    assert preview["T10001"]["on"] is False
+    # Saving the preview's ticks keeps the flag and the profile-only topics.
+    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics",
+                     json={"selected_topic_ids": [i for i, t in preview.items() if t["on"]]})
+    assert saved.status_code == 200, saved.text
+    assert _stored(env, slug)["researcher_topics"] is True
+    assert "https://openalex.org/T77777" in {t["id"] for t in saved.json()}
+
+
+def test_the_profile_being_unreadable_for_a_moment_does_not_drop_it(env, monkeypatch):
+    """The label mapper down, say: the aggregation cannot read the profile, so
+    it folds nothing in this time, but the flag stays and the next read puts
+    everything back. Only a forgotten researcher drops it."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    monkeypatch.setattr(wizard, "_researcher_topics_for", lambda conn, pid: None)
+    during = _topics(app, slug)
+    assert set(during) == {"T10001"} and during["T10001"]["profile"] is None
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    assert view["applied"] is True and view["topics"]["available"] is False
+    monkeypatch.undo()
+    after = _topics(app, slug)
+    assert "https://openalex.org/T10222" in after and after["T10001"]["profile"] == "not_interest"
+
+
+def test_kept_umls_topics_do_not_carry_old_marks():
+    from rag_lib.api.services.wizard import _keep_stored_umls
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE profiles (id INTEGER PRIMARY KEY, topic_filters_json TEXT)")
+    conn.execute("INSERT INTO profiles VALUES (1, ?)", (json.dumps({"topics": [
+        {"id": "T9", "display_name": "Kept", "count": 1, "on": False, "source": "umls",
+         "profile": "not_interest", "on_before_profile": True}]}),))
+    out = _keep_stored_umls(conn, 1, {"topics": []})
+    assert out["topics"] == [{"id": "T9", "display_name": "Kept", "count": 1, "on": False, "source": "umls"}]
+
+
+def test_label_mapping_remembers_a_miss_and_backs_off_after_a_failure(monkeypatch):
+    calls = []
+    settings = _label_settings(monkeypatch, {"phylogenomics": ("https://openalex.org/T10434", "Genomics and Phylogenetic Studies", 0.74)})
+    monkeypatch.setattr("rag_lib.embedders.get_embedder",
+                        lambda m: (lambda text: calls.append(text) or np.array([ord(c) for c in text], dtype=np.float32)))
+    doc = {"not_interests": ["phylogenomics", "nothing-like-a-topic"]}
+    rt.with_labels(rt.read(doc), settings=settings)
+    rt.with_labels(rt.read(doc), settings=settings)
+    assert len(calls) == 2            # each label embedded once; the miss is remembered too
+
+    def boom(*a, **k):
+        raise RuntimeError("ollama down")
+    monkeypatch.setattr("rag_lib.embedders.get_embedder", boom)
+    rt.reset_label_cache()
+    assert rt.with_labels(rt.read(doc), settings=settings) == rt.read(doc)
+    # Backing off: nothing is asked for a while, so the next call does not raise and maps nothing.
+    monkeypatch.setattr("rag_lib.embedders.get_embedder", lambda m: (lambda text: calls.append(text) or np.array([ord(c) for c in text], dtype=np.float32)))
+    n = len(calls)
+    assert rt.with_labels(rt.read(doc), settings=settings) == rt.read(doc)
+    assert len(calls) == n
+    rt.reset_label_cache()
+    assert [t["label"] for t in rt.with_labels(rt.read(doc), settings=settings)["unwanted"]] == ["phylogenomics"]
