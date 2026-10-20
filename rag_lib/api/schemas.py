@@ -167,6 +167,9 @@ class Topic(_Model):
     source: str | None = None
     # Found by the seeds since the topics were last saved (topic preview only).
     new: bool | None = None
+    # What the researcher's profile says about it, when its topics are applied:
+    # ``interest`` or ``not_interest`` (rag_lib/researcher_topics.py).
+    profile: str | None = None
 
 
 class TopicSelection(_Model):
@@ -710,6 +713,61 @@ class ProsopiaImportStatus(_Model):
 # ---------------------------------------------------------------------------
 
 
+class ResearcherTopic(_Model):
+    """One OpenAlex topic a researcher's profile has an opinion on."""
+
+    id: str
+    name: str
+    weight: float | None = None
+    # ``declared`` by the owner, ``inferred`` from their papers, or ``label``:
+    # matched from a text concept the profile could not map itself.
+    method: str = "inferred"
+    label: str | None = None
+
+
+class ResearcherTopics(_Model):
+    """What a researcher's Prosopia profile says they do and do not want.
+
+    ``wanted`` / ``unwanted`` are topics; the labels are text concepts that
+    map to no topic. ``available`` is False for a researcher with no such
+    data (every ORCID-only one)."""
+
+    available: bool = False
+    wanted: list[ResearcherTopic] = Field(default_factory=list)
+    unwanted: list[ResearcherTopic] = Field(default_factory=list)
+    wanted_labels: list[str] = Field(default_factory=list)
+    unwanted_labels: list[str] = Field(default_factory=list)
+
+
+class ProfileResearcherTopics(_Model):
+    """``GET /api/profiles/{key}/researcher-topics``: the profile topics an
+    interest could take from the researcher it was built from, and whether
+    they are applied to its topic list now."""
+
+    researcher_id: int | None = None
+    researcher_name: str | None = None
+    applied: bool = False
+    topics: ResearcherTopics = Field(default_factory=ResearcherTopics)
+
+
+class ResearcherTopicsUpdate(_Model):
+    """Body of ``PUT /api/profiles/{key}/researcher-topics``."""
+
+    enabled: bool
+
+
+class ResearcherMarkUpdate(_Model):
+    """Body of ``PATCH /api/researchers/{id}``: ``self`` (the user), ``followed``, or null."""
+
+    mark: Literal["self", "followed"] | None = None
+
+
+class ResearcherOrderRequest(_Model):
+    """Body of ``PUT /api/researchers/order``: every researcher id, in the order wanted."""
+
+    ids: list[int] = Field(min_length=1)
+
+
 class Researcher(_Model):
     """One stored person, as ``GET /api/researchers`` lists them."""
 
@@ -730,6 +788,10 @@ class Researcher(_Model):
     importing: bool = False
     last_error: str | None = None
     created_at: str | None = None
+    # ``self`` (the user), ``followed``, or None; and where the user placed
+    # them in the list (lower first; None = never placed).
+    mark: Literal["self", "followed"] | None = None
+    position: int | None = None
 
 
 class ResearcherPaper(_Model):
@@ -759,6 +821,7 @@ class ResearcherDetail(_Model):
     grants: list[dict] = Field(default_factory=list)
     papers: list[ResearcherPaper] = Field(default_factory=list)
     interests: list[Profile] = Field(default_factory=list)
+    topics: ResearcherTopics = Field(default_factory=ResearcherTopics)
 
 
 class SuggestedInterest(_Model):

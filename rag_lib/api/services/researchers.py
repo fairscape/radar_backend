@@ -48,7 +48,9 @@ from ..schemas import (
     Researcher,
     ResearcherDetail,
     ResearcherPaper,
+    ResearcherTopics,
 )
+from ... import researcher_topics
 from . import wizard as wizard_service
 from .prosopia import ImportPlan, _resolve_profile, select_records
 from .profiles import _saves_dismisses
@@ -302,7 +304,17 @@ def _to_researcher(conn: sqlite3.Connection, row: sqlite3.Row) -> Researcher:
         importing=importing,
         last_error=(last_run["error"] if last_run is not None else None),
         created_at=row["created_at"],
+        mark=row["mark"],
+        position=int(row["position"]) if row["position"] is not None else None,
     )
+
+
+def _topics(row: sqlite3.Row) -> ResearcherTopics:
+    """What the researcher's stored profile document says they want and do
+    not want (rag_lib/researcher_topics.py); empty for an ORCID-only one."""
+    from ..settings import get_settings
+    view = researcher_topics.with_labels(researcher_topics.from_row(row), settings=get_settings())
+    return ResearcherTopics(available=researcher_topics.available(view), **researcher_topics.public(view))
 
 
 def _to_paper(row: sqlite3.Row) -> ResearcherPaper:
@@ -423,7 +435,29 @@ def get_researcher(
         grants=grants,
         papers=[_to_paper(p) for p in researchers_repo.list_papers(conn, researcher_id)],
         interests=[_to_profile(conn, p) for p in researchers_repo.interests_for(conn, researcher_id)],
+        topics=_topics(row),
     )
+
+
+def set_mark(
+    conn: sqlite3.Connection, user_id: int, researcher_id: int, mark: str | None
+) -> Researcher:
+    """Mark the person as the user (``self``), as followed, or neither; they
+    move to the top of that group (see the repo). ``ResearcherNotFound``
+    for another user's or an unknown researcher, ``ValueError`` for a mark
+    that is neither."""
+    _require(conn, user_id, researcher_id)
+    researchers_repo.set_mark(conn, user_id, researcher_id, mark)
+    row = researchers_repo.get(conn, researcher_id)
+    assert row is not None
+    return _to_researcher(conn, row)
+
+
+def reorder(conn: sqlite3.Connection, user_id: int, ids: list[int]) -> list[Researcher]:
+    """Store the order the user arranged their researchers in (every id,
+    once; ``ValueError`` otherwise) and return the list in that order."""
+    researchers_repo.reorder(conn, user_id, [int(i) for i in ids])
+    return list_researchers(conn, user_id)
 
 
 def delete_researcher(

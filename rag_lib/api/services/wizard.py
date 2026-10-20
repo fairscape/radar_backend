@@ -44,9 +44,11 @@ from ...db.repos import (
     gather_runs as gather_runs_repo,
     papers as papers_repo,
     profiles as profiles_repo,
+    researchers as researchers_repo,
     users as users_repo,
     schedules as schedules_repo,
 )
+from ... import researcher_topics
 from ...gatherers.openalex import OpenAlexGatherer
 from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
@@ -357,10 +359,133 @@ def _aggregate_topics(conn: sqlite3.Connection, profile_id: int, *, new_on: bool
     # that vault.upload() stored and merge novel ones into the filters.
     topic_filters = _try_merge_umls_topics(conn, profile_id, topic_filters)
 
+    # The researcher's own profile topics, once the user has applied them
+    # (``set_researcher_topics``): the list is rebuilt from the seeds every
+    # time, so they are folded in again here, from the profile as stored now.
+    from_profile = _applied_researcher_topics(conn, profile_id)
+    if from_profile is not None:
+        topic_filters = researcher_topics.apply(topic_filters, from_profile)
+
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
             t["on"] = prior_on.get(t["id"], new_on)
+            # A topic the profile does not want starts off, whatever new
+            # topics start as; a choice the user made since is kept.
+            if (from_profile is not None and t.get("profile") == researcher_topics.NOT_INTEREST
+                    and t["id"] not in prior_on):
+                t["on"] = False
     return topic_filters
+
+
+def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int) -> dict | None:
+    """The profile topics of the researcher this interest was built from, or
+    None when there is no researcher or their source listed none."""
+    row = conn.execute(
+        "SELECT r.* FROM researchers r JOIN profiles p ON p.researcher_id = r.id WHERE p.id = ?",
+        (profile_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    from ..settings import get_settings
+    view = researcher_topics.with_labels(researcher_topics.from_row(row), settings=get_settings())
+    return view if researcher_topics.available(view) else None
+
+
+def _applied_researcher_topics(conn: sqlite3.Connection, profile_id: int) -> dict | None:
+    """``_researcher_topics_for`` when the interest has them applied, else None.
+
+    Applied is a flag in the stored ``topic_filters``; a researcher since
+    forgotten (``profiles.researcher_id`` is set NULL) leaves nothing to
+    fold in, and the flag goes with the next write."""
+    try:
+        stored = profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:  # noqa: BLE001 -- never aggregated, or unreadable
+        return None
+    if not researcher_topics.is_applied(stored):
+        return None
+    return _researcher_topics_for(conn, profile_id)
+
+
+def researcher_topics_view(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
+    """What ``GET /researcher-topics`` shows: the researcher, their profile
+    topics, and whether the interest has them applied. Draft or saved."""
+    row = _require_profile(conn, user_id, slug)
+    profile_id = int(row["id"])
+    try:
+        stored = profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:  # noqa: BLE001
+        stored = {}
+    rrow = None
+    if row["researcher_id"] is not None:
+        rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
+    view = _researcher_topics_for(conn, profile_id) if rrow is not None else None
+    return {
+        "researcher_id": int(rrow["id"]) if rrow is not None else None,
+        "researcher_name": rrow["name"] if rrow is not None else None,
+        "applied": bool(view is not None and researcher_topics.is_applied(stored)),
+        "topics": {"available": view is not None,
+                   **researcher_topics.public(view or researcher_topics.read(None))},
+    }
+
+
+def set_researcher_topics(
+    conn: sqlite3.Connection, *, user_id: int, slug: str, enabled: bool,
+) -> dict:
+    """Apply or drop the researcher's profile topics on an interest's list.
+
+    Applying folds the wanted topics in switched on and switches the
+    not-wanted ones off -- an explicit choice, so it overrides what the
+    user had set on those topics before -- and records the flag so every
+    later re-aggregation does the same. Dropping clears the flag; the next
+    aggregation (done here) rebuilds the list from the seeds alone. The
+    profile's topics are the reranker's queries in topic mode, so a saved
+    interest's rerank is refreshed as after ``save_topics``.
+
+    Raises ``ValueError`` when the interest has no researcher with profile
+    topics, ``ImportInProgress`` while an import is filling the draft.
+    """
+    row = _require_profile(conn, user_id, slug)
+    profile_id = int(row["id"])
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
+    if enabled:
+        rrow = None
+        if row["researcher_id"] is not None:
+            rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
+        if rrow is None or _researcher_topics_for(conn, profile_id) is None:
+            raise ValueError(
+                "this interest was not built from a researcher whose profile lists topics"
+            )
+    try:
+        stored = profiles_repo.topic_filters(conn, profile_id) or {}
+    except Exception:  # noqa: BLE001
+        stored = {}
+    stored[researcher_topics.FLAG] = bool(enabled)
+    conn.execute(
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(stored), profile_id),
+    )
+    conn.commit()
+    # With the flag off, the aggregation folds nothing in and marks nothing:
+    # that is the drop. With it on, the states are set here outright.
+    full = _aggregate_topics(conn, profile_id, new_on=bool(row["is_draft"]))
+    if enabled:
+        for t in full.get("topics") or []:
+            if t.get("profile") == researcher_topics.INTEREST:
+                t["on"] = True
+            elif t.get("profile") == researcher_topics.NOT_INTEREST:
+                t["on"] = False
+    conn.execute(
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(full), profile_id),
+    )
+    conn.commit()
+    if not row["is_draft"]:
+        from rag_lib.scheduler.jobs import request_rerank_refresh
+        request_rerank_refresh(profile_id)
+    log.info("wizard.researcher_topics", profile_id=profile_id, enabled=enabled,
+             n_on=sum(1 for t in full.get("topics") or [] if t.get("on", True)))
+    return full
 
 
 def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict]:

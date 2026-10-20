@@ -329,6 +329,7 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
             count=int(it.get("count") or 0),
             on=bool(it.get("on", True)),
             source=it.get("source"),
+            profile=it.get("profile"),
         ))
     return out
 

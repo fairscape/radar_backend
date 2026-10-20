@@ -10,6 +10,10 @@
                                               built from them.
   ``DELETE /api/researchers/{id}``            forget the person (papers and
                                               interests stay).
+  ``PATCH  /api/researchers/{id}``            mark the person as the user
+                                              themself or as followed.
+  ``PUT    /api/researchers/order``           the order the user arranged
+                                              the list in.
   ``POST   /api/researchers/{id}/interests``  a draft seeded with the
                                               chosen papers, synchronously —
                                               they are already embedded.
@@ -38,6 +42,8 @@ from ..schemas import (
     ResearcherImportStart,
     ResearcherInterestRequest,
     ResearcherInterestResponse,
+    ResearcherMarkUpdate,
+    ResearcherOrderRequest,
     ResearcherSuggestions,
     ResearcherWorks,
 )
@@ -134,6 +140,43 @@ def list_researchers(
     from ..services import researchers as researchers_service
 
     return researchers_service.list_researchers(db, int(user["id"]))
+
+
+@router.put("/order", response_model=list[Researcher])
+def reorder_researchers(
+    body: ResearcherOrderRequest,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[Researcher]:
+    """Store the order the user dragged the list into. ``ids`` must name
+    each of their researchers exactly once (400 otherwise); the list comes
+    back in that order."""
+    from ..services import researchers as researchers_service
+
+    try:
+        return researchers_service.reorder(db, int(user["id"]), body.ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.patch("/{researcher_id}", response_model=Researcher)
+def mark_researcher(
+    researcher_id: int,
+    body: ResearcherMarkUpdate,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> Researcher:
+    """Mark the person as the user themself (``self``), as someone they
+    follow (``followed``), or clear the mark (null). A marked researcher
+    moves to the top of their group in the list."""
+    from ..services import researchers as researchers_service
+
+    try:
+        return researchers_service.set_mark(db, int(user["id"]), researcher_id, body.mark)
+    except researchers_service.ResearcherNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/{researcher_id}", response_model=ResearcherDetail)

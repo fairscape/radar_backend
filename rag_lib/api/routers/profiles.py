@@ -47,6 +47,8 @@ from ..schemas import (
     InterestTermsGenerate,
     InterestTermsUpdate,
     Topic,
+    ProfileResearcherTopics,
+    ResearcherTopicsUpdate,
     TopicSelection,
     YearRange,
     TopicYield,
@@ -333,6 +335,7 @@ def draft_topics(
             count=int(entry.get("count") or 0),
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            profile=entry.get("profile"),
         ))
     return out
 
@@ -863,6 +866,7 @@ def _topics_out(topic_filters: dict, new: set[str] | None = None) -> list[Topic]
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
             new=(tid in new) if new is not None else None,
+            profile=entry.get("profile"),
         ))
     return out
 
@@ -1040,8 +1044,54 @@ def recompute_topics(
             count=int(entry.get("count") or 0),
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            profile=entry.get("profile"),
         ))
     return out
+
+
+@router.get("/{key}/researcher-topics", response_model=ProfileResearcherTopics)
+def researcher_topics(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> ProfileResearcherTopics:
+    """The topics the researcher this interest was built from declares on
+    their Prosopia profile (wanted and not wanted), and whether they are
+    applied to the interest's topic list. ``topics.available`` is False
+    for an interest with no researcher, or one whose source lists none."""
+    try:
+        view = wizard_service.researcher_topics_view(db, user_id=int(user["id"]), slug=key)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return ProfileResearcherTopics(**view)
+
+
+@router.put("/{key}/researcher-topics", response_model=list[Topic])
+def set_researcher_topics(
+    key: str,
+    body: ResearcherTopicsUpdate,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[Topic]:
+    """Apply (``enabled``) or drop the researcher's profile topics. Applied:
+    the wanted topics join the list switched on, the not-wanted ones are
+    switched off; both marked. Works on drafts and saved interests; a
+    saved one applies it from the next scan. 400 when the interest has no
+    researcher with profile topics, 409 while an import fills the draft."""
+    try:
+        topic_filters = wizard_service.set_researcher_topics(
+            db, user_id=int(user["id"]), slug=key, enabled=body.enabled,
+        )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return _topics_out(topic_filters)
 
 
 @router.post("/{key}/refit", response_model=RefitResponse)

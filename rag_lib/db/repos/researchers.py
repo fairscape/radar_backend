@@ -40,11 +40,71 @@ def get_by_key(
     ).fetchone()
 
 
+MARKS = ("self", "followed")
+
+# The user's arrangement first (``position``), then the researchers never
+# placed: the user themself, the ones they follow, the rest, by name.
+_ORDER = (
+    "ORDER BY position IS NULL, position, "
+    "CASE mark WHEN 'self' THEN 0 WHEN 'followed' THEN 1 ELSE 2 END, name, id"
+)
+
+
 def list_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT * FROM researchers WHERE user_id = ? ORDER BY name, id",
-        (user_id,),
+        f"SELECT * FROM researchers WHERE user_id = ? {_ORDER}", (user_id,),
     ).fetchall()
+
+
+def set_mark(
+    conn: sqlite3.Connection, user_id: int, researcher_id: int, mark: str | None
+) -> None:
+    """Mark a researcher as the user themself (``self``), someone they follow
+    (``followed``) or neither, and move them to the top of that group.
+
+    A mark is meant to bring the person forward in the list, so the row
+    moves: before the first researcher whose group ranks the same or lower
+    (``self`` to the front; ``followed`` ahead of the followed and unmarked;
+    unmarked to the head of the unmarked). Every row then gets a position,
+    so the arrangement is explicit from here on and drag-and-drop
+    (:func:`reorder`) works over the whole list. Raises ``ValueError`` for
+    an unknown mark and ``LookupError`` when the researcher is not the user's.
+    """
+    if mark is not None and mark not in MARKS:
+        raise ValueError(f"mark must be one of {', '.join(MARKS)}, or null")
+    rows = list_for_user(conn, user_id)
+    ids = [int(r["id"]) for r in rows]
+    if researcher_id not in ids:
+        raise LookupError(f"researcher {researcher_id} not found")
+    marks = {int(r["id"]): r["mark"] for r in rows}
+    ids.remove(researcher_id)
+    marks[researcher_id] = mark
+    rank = {"self": 0, "followed": 1, None: 2}
+    at = next((i for i, oid in enumerate(ids) if rank[marks[oid]] >= rank[mark]), len(ids))
+    ids.insert(at, researcher_id)
+    conn.execute("UPDATE researchers SET mark = ? WHERE id = ?", (mark, researcher_id))
+    _write_positions(conn, ids)
+
+
+def reorder(conn: sqlite3.Connection, user_id: int, ids: list[int]) -> None:
+    """Store ``ids`` as the order of the user's researchers.
+
+    ``ids`` must name each of the user's researchers exactly once (a
+    partial list would leave the rest unplaced and the drag the user just
+    made would not stick); ``ValueError`` otherwise.
+    """
+    have = sorted(int(r["id"]) for r in list_for_user(conn, user_id))
+    if sorted(ids) != have or len(set(ids)) != len(ids):
+        raise ValueError("ids must list each of your researchers exactly once")
+    _write_positions(conn, ids)
+
+
+def _write_positions(conn: sqlite3.Connection, ids: list[int]) -> None:
+    conn.executemany(
+        "UPDATE researchers SET position = ? WHERE id = ?",
+        [(i, rid) for i, rid in enumerate(ids)],
+    )
+    conn.commit()
 
 
 def upsert(
