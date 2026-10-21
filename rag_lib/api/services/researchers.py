@@ -349,6 +349,15 @@ def _require(conn: sqlite3.Connection, user_id: int, researcher_id: int) -> sqli
     return row
 
 
+def repairable_excluded(saved: list) -> list:
+    """The researcher's papers minus those a refresh should offer again: a
+    work stored under its OpenAlex id but never read from OpenAlex (the
+    lookup failed at import, ``resolved_by`` none). Importing it once more
+    fills the row in. A record OpenAlex never held (synthetic id) stays."""
+    return [r for r in saved
+            if not (r["resolved_by"] == "none" and not str(r["openalex_id"]).startswith("prosopia:"))]
+
+
 def works_for_refresh(
     conn: sqlite3.Connection,
     settings: Any,
@@ -375,7 +384,7 @@ def works_for_refresh(
     from ...prosopia_seeds import normalize_doi
 
     row = _require(conn, user_id, researcher_id)
-    saved = researchers_repo.list_papers(conn, researcher_id)
+    saved = repairable_excluded(researchers_repo.list_papers(conn, researcher_id))
     saved_oa = {orcid_service._strip_openalex(r["openalex_id"]) for r in saved}
     saved_pid = {r["paper_id"] for r in saved if r["paper_id"]}
     saved_doi = {d for d in (normalize_doi(r["doi"]) for r in saved) if d}

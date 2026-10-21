@@ -19,6 +19,10 @@ runtime warning surfaces it.
 
 from __future__ import annotations
 
+import math
+
+import structlog
+
 import sqlite3
 import sys
 
@@ -76,6 +80,8 @@ class _BatchConn:
 # second (concurrent API writes only get a 5s busy timeout), large enough
 # that we aren't paying an fsync per row on NFS.
 _COMMIT_EVERY = 100
+
+log = structlog.get_logger("rag_lib.persistence.db_store")
 
 
 def resolve_user_id(conn: sqlite3.Connection, email: str) -> int:
@@ -270,6 +276,12 @@ def dedup_and_insert_candidates(
                 continue
             score, paper, breakdown = _unpack_entry(entry)
             if not paper.openalex_id:
+                continue
+            if not math.isfinite(float(score)):
+                # SQLite stores NaN as NULL and the column is NOT NULL: one
+                # such score (a reranker or embedder glitch) failed the
+                # whole chunk, and with it the scan.
+                log.warning("db_store.non_finite_score_skipped", openalex_id=paper.openalex_id, profile_id=profile_id)
                 continue
             added = candidates_repo.insert_dedup(
                 batch,

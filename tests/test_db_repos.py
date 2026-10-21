@@ -89,16 +89,19 @@ def test_profiles_attach_seed_idempotent(conn):
     assert profiles.list_seed_openalex_ids(conn, pid) == ["W1"]
 
 
-def test_profiles_slug_collision_raises(conn):
-    profiles.upsert(
+def test_profiles_slug_collision_gets_a_suffix(conn):
+    """Two names that slugify alike are two profiles; the second slug is
+    suffixed. It used to raise IntegrityError, which only the CLI path hit."""
+    a = profiles.upsert(
         conn, user_id=1, name="Alpha", embedding_model="x",
         n_seed=0, topic_filters={},
     )
-    with pytest.raises(sqlite3.IntegrityError):
-        profiles.upsert(
-            conn, user_id=1, name="ALPHA", embedding_model="x",
-            n_seed=0, topic_filters={},
-        )
+    b = profiles.upsert(
+        conn, user_id=1, name="ALPHA", embedding_model="x",
+        n_seed=0, topic_filters={},
+    )
+    assert a != b
+    assert profiles.get(conn, b)["slug"] == "alpha-2"
 
 
 # --------------------------------------------------------------------- papers

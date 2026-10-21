@@ -136,10 +136,13 @@ def create_draft(
                 embedding_model=embedding_model,
             )
             break
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
             # Another request took the name between the check and the
-            # insert (a double-clicked Create): the next free one.
+            # insert (a double-clicked Create): the next free one. Any
+            # other constraint is a real error.
             conn.rollback()
+            if "UNIQUE" not in str(exc):
+                raise
     else:
         raise ValueError(f"could not find a free name for {name!r}")
     # Stash the chosen selector type so dry-run + commit pick it up.
@@ -417,6 +420,7 @@ def _aggregate_topics(
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
     _keep_content_topics(topic_filters, from_content)
+    _keep_adopted_topics(stored, topic_filters)
 
     # Best-effort UMLS topic merge: read the per-paper mapped topics
     # that vault.upload() stored and merge novel ones into the filters.
@@ -536,8 +540,9 @@ def _restore_or_adopt(stored: dict, topic_filters: dict, prior_on: dict[str, boo
     have = {researcher_topics.code(t.get("id")) for t in topic_filters.get("topics") or [] if t.get("id")}
     for t in stored_topics:
         if t.get("source") == researcher_topics.SOURCE and researcher_topics.code(t["id"]) not in have:
-            topic_filters.setdefault("topics", []).append(
-                {k: v for k, v in t.items() if k not in ("source", "profile", researcher_topics.BEFORE)})
+            kept = {k: v for k, v in t.items() if k not in ("profile", researcher_topics.BEFORE)}
+            kept["source"] = researcher_topics.ADOPTED
+            topic_filters.setdefault("topics", []).append(kept)
 
 
 def _carry_before_states(stored: dict, topic_filters: dict) -> None:
@@ -731,6 +736,18 @@ def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict
             if isinstance(t, dict) and t.get("id"):
                 matched.add(t["id"])
     return {tid: t for tid, t in found.items() if tid not in matched}
+
+
+def _keep_adopted_topics(stored: dict, topic_filters: dict) -> None:
+    """Carry over the topics kept from a forgotten researcher's profile
+    (``source: adopted``): no seed brings them back, and a rebuild from the
+    seeds dropped them on the first save after the forget."""
+    topics = topic_filters.setdefault("topics", [])
+    have = {researcher_topics.code(t.get("id")) for t in topics if t.get("id")}
+    for t in stored.get("topics") or []:
+        if t.get("id") and t.get("source") == researcher_topics.ADOPTED and researcher_topics.code(t["id"]) not in have:
+            topics.append(dict(t))
+            have.add(researcher_topics.code(t["id"]))
 
 
 def _keep_content_topics(topic_filters: dict, from_content: dict[str, dict]) -> None:
@@ -1280,6 +1297,11 @@ def remove_seed(
         # vector, say -- used to answer an error with the seed already
         # gone and the old centroid still in use. Counting seeds was not
         # enough: what the fit needs is an *embedded* one.
+        if gather_runs_repo.running_scan(conn, profile_id) is not None:
+            # Before the detach: the refit that follows refuses under a
+            # scan, and a refused refit after the detach left the seed
+            # gone, the centroid stale and the request a 500.
+            raise ScanRunning(f"a scan of '{slug}' is still running; remove seeds when it has finished")
         remaining = [s for s in profiles_repo.list_seed_openalex_ids(conn, profile_id) if s != stored]
         if not remaining:
             raise ValueError("an interest needs at least one seed; add another before removing this one")

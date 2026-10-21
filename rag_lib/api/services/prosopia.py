@@ -356,6 +356,21 @@ def select_records(profile: Any, slug: str, paper_ids: list[str] | None) -> list
     return records
 
 
+def store_resolved_paper(conn: sqlite3.Connection, resolution) -> bool:
+    """Write the resolved paper's row; returns whether it was written.
+
+    Not when the record names a work OpenAlex could not be asked about just
+    now (rung ``none`` under its real id) and a row for it exists already
+    (an uploaded PDF, a gathered copy): the Prosopia-only row -- summary for
+    body text, no abstract -- would replace that one's title and text. The
+    researcher link is enough; a refresh offers the work again.
+    """
+    if not resolution.resolved and papers_repo.get_by_openalex_id(conn, resolution.openalex_id) is not None:
+        return False
+    papers_repo.upsert(conn, dict(resolution.paper))
+    return True
+
+
 def run_import(
     conn: sqlite3.Connection,
     settings: Any,
@@ -412,7 +427,7 @@ def run_import(
         # the researcher_papers link written below, which the vault list
         # and the seed ownership check both already read.
         row = dict(resolution.paper)
-        papers_repo.upsert(conn, row)
+        store_resolved_paper(conn, resolution)
 
         # A paper already embedded under this model (by an earlier
         # import, or a PDF upload) is not embedded again: that is what

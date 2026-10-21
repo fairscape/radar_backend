@@ -687,6 +687,8 @@ def remove_seed(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"an import is still filling draft '{exc.slug}'",
         ) from exc
+    except wizard_service.ScanRunning as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1585,6 +1587,7 @@ def reranker_comparison(
           -- "Was reranked" is the reranker's own score, not the blend: the
           -- pool rescore gives every row a blend once any row is reranked.
           AND pc.score_reranker_raw IS NOT NULL
+          AND pc.score_blended IS NOT NULL
           AND pc.score_raw IS NOT NULL
         """,
         (profile_id,),

@@ -27,7 +27,10 @@ from typing import Any
 SOURCE = "researcher"
 INTEREST = "interest"
 NOT_INTEREST = "not_interest"
-FLAG = "researcher_topics"          # topic_filters key: the profile's topics are applied
+FLAG = "researcher_topics"
+#: ``source`` of a profile topic kept after the researcher was forgotten:
+#: no seed carries it, so a rebuild from the seeds has to carry it over.
+ADOPTED = "adopted"          # topic_filters key: the profile's topics are applied
 # On a marked topic: its on/off before the profile was applied, restored when
 # the profile is removed again.
 BEFORE = "on_before_profile"
@@ -208,15 +211,16 @@ def code(topic_id: Any) -> str:
 
 
 def adopt(topic_filters: dict) -> dict:
-    """``topic_filters`` with the profile's topics kept as ordinary ones: the
-    marks and the flag gone, every state as it is. For a saved list that
-    ``strip`` would leave with nothing on; a new dict."""
+    """``topic_filters`` with the profile's topics kept as the interest's
+    own (source ``adopted``): the marks and the flag gone, every state as it
+    is. For a saved list that ``strip`` would leave with nothing on; a new
+    dict."""
     out = dict(topic_filters or {})
     kept = []
     for t in out.get("topics") or []:
         t = dict(t)
         if t.get("source") == SOURCE:
-            t.pop("source", None)
+            t["source"] = ADOPTED
         t.pop("profile", None)
         t.pop(BEFORE, None)
         kept.append(t)

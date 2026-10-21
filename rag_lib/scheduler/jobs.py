@@ -568,7 +568,29 @@ def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseEx
                 log.exception("scheduler.gather_failed.close_failed", profile_id=profile_id, run_id=run_id)
             else:
                 time.sleep(2)
-    log.exception("scheduler.gather_failed", profile_id=profile_id, run_id=run_id)
+    log.error("scheduler.gather_failed", profile_id=profile_id, run_id=run_id,
+              error=f"{type(exc).__name__}: {exc}")
+
+
+def _refit_if_seeds_changed(conn, user_id: int, profile_id: int, seeds_at_start: set[str], run_id: int | None) -> None:
+    """Seeds attached or removed while the scan ran (an upload, "add as
+    seeds") were not fitted -- the refit refuses under a running scan -- and
+    no later scan fits them either: it hydrates the stored fit. The run is
+    closed, so the refit can go ahead now. Best effort: the scan succeeded."""
+    try:
+        now = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+        if now == seeds_at_start:
+            return
+        row = profiles_repo.get(conn, profile_id)
+        if row is None or row["is_draft"]:
+            return
+        from ..api.services import wizard as wizard_service
+
+        log.info("scheduler.gather_seeds_added_refit", profile_id=profile_id, run_id=run_id,
+                 n_added=len(now - seeds_at_start), n_removed=len(seeds_at_start - now))
+        wizard_service.refit_profile(conn, user_id=user_id, slug=row["slug"])
+    except Exception:  # noqa: BLE001
+        log.exception("scheduler.gather_seeds_added_refit_failed", profile_id=profile_id, run_id=run_id)
 
 
 def _gather_for_profile_locked(
@@ -591,6 +613,10 @@ def _gather_for_profile_locked(
         if profile_row is None:
             log.error("scheduler.profile_missing", profile_id=profile_id)
             return None
+        # The seeds the fit in use was made from. A seed added while this
+        # runs cannot be fitted then (the refit refuses under a scan) and
+        # nothing else would fit it: this scan does, once its row is closed.
+        seeds_at_start = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
 
         since = _days_ago_iso(days)
         span = None
@@ -808,6 +834,7 @@ def _gather_for_profile_locked(
                 n_new=n_new,
                 n_redup=n_redup,
             )
+            _refit_if_seeds_changed(conn, user_id, profile_id, seeds_at_start, run_id)
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
             _close_failed_scan(conn, profile_id, run_id, settings, exc)

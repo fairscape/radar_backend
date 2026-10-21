@@ -843,3 +843,24 @@ def test_a_rebuild_overtaken_every_time_is_refused_rather_than_written(env, monk
     assert resp.status_code == 409 and "try again" in resp.json()["detail"]
     monkeypatch.undo()
     assert _stored(env, slug) == before
+
+
+def test_adopted_topics_survive_the_next_rebuild_and_a_save(env):
+    """After the forget, a rebuild from the seeds dropped the adopted topics
+    on the first save; the preview showed only the seed topics, all off."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    _topics(app, slug)
+    _switch(env, slug, {"T10001": False})
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    only_profile = [t["id"] for t in applied if t["on"]]
+    _commit(app, slug, only_profile)
+    assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
+    assert set(only_profile) <= set(preview) and all(preview[i]["on"] for i in only_profile)
+    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": only_profile})
+    assert saved.status_code == 200, saved.text
+    stored = _stored(env, slug)
+    assert {t["id"] for t in stored["topics"] if t["on"]} == set(only_profile)
+    assert all(t.get("source") == "adopted" for t in stored["topics"] if t["id"] in only_profile)

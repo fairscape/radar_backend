@@ -335,6 +335,12 @@ def upsert(
 
     existing = get_by_name(conn, user_id, name)
     if existing is None:
+        # Two names can slugify alike ("My Topic" / "my topic"): the slug is
+        # unique per user, so a taken one gets a suffix rather than failing.
+        base, n = slug, 1
+        while get_by_slug(conn, user_id, slug) is not None:
+            n += 1
+            slug = f"{base}-{n}"
         cur = conn.execute(
             """
             INSERT INTO profiles (

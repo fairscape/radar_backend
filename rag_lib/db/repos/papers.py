@@ -79,7 +79,9 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(openalex_id) DO UPDATE SET
           doi                 = COALESCE(excluded.doi, doi),
-          title               = excluded.title,
+          -- OpenAlex returns works with no title; a scan of another interest
+          -- then blanked a seed's title for every user of the paper.
+          title               = COALESCE(NULLIF(excluded.title, ''), title),
           -- NULLIF: a gather passes '' for "OpenAlex has none" (and for
           -- body text it never has), which COALESCE took as a value -- a
           -- re-fetched seed lost its PDF body text or its Prosopia abstract.
@@ -124,7 +126,7 @@ def _forget_umls_if_text_changed(conn: sqlite3.Connection, paper: dict[str, Any]
         return paper.get(key) if paper.get(key) else before[key]
 
     old = umls_input_text(before["title"], before["abstract"], before["body_text"])
-    new = umls_input_text(paper.get("title") or "", merged("abstract"), merged("body_text"))
+    new = umls_input_text(merged("title"), merged("abstract"), merged("body_text"))
     if new != old:
         conn.execute(
             "UPDATE papers SET umls_concepts_json = NULL, umls_mapped_topics_json = NULL "
