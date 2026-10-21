@@ -271,19 +271,29 @@ class Profile:
                 domains[t.domain.id] += 1
                 domain_names.setdefault(t.domain.id, t.domain.display_name)
 
+        # Papers per topic, each paper once: OpenAlex repeats the primary
+        # topic inside ``topics[]``, so ``count`` (assignments, which rank
+        # the list and weight the primary topic) reads "8 seeds" for 4.
+        papers_per_topic: Counter = Counter()
         for p in papers:
             _tally(p.primary_topic)
+            seen: set[str] = set()
+            for t in [p.primary_topic, *p.topics]:
+                if t is not None and t.id:
+                    seen.add(t.id)
             for t in p.topics:
                 _tally(t)
+            papers_per_topic.update(seen)
 
-        def _top(counter, names):
+        def _top(counter, names, papers_of=None):
             return [
-                {"id": tid, "display_name": names.get(tid, ""), "count": n}
+                {"id": tid, "display_name": names.get(tid, ""), "count": n,
+                 **({"papers": papers_of[tid]} if papers_of is not None else {})}
                 for tid, n in counter.most_common(top_k_each)
             ]
 
         return {
-            "topics": _top(topics, topic_names),
+            "topics": _top(topics, topic_names, papers_per_topic),
             "subfields": _top(subfields, subfield_names),
             "fields": _top(fields, field_names),
             "domains": _top(domains, domain_names),

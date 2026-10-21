@@ -82,8 +82,20 @@ def set_mark(
         ids.remove(researcher_id)
         marks[researcher_id] = mark
         rank = {"self": 0, "followed": 1, None: 2}
-        at = next((i for i, oid in enumerate(ids) if rank[marks[oid]] >= rank[mark]), len(ids))
-        ids.insert(at, researcher_id)
+
+        def place(rid: int) -> None:
+            at = next((i for i, oid in enumerate(ids) if rank[marks[oid]] >= rank[marks[rid]]), len(ids))
+            ids.insert(at, rid)
+
+        if mark == "self":
+            # One person is the user. The previous "You" is unmarked and
+            # heads the unmarked, where a mark change puts a row.
+            for rid in [oid for oid in ids if marks[oid] == "self"]:
+                ids.remove(rid)
+                marks[rid] = None
+                conn.execute("UPDATE researchers SET mark = NULL WHERE id = ?", (rid,))
+                place(rid)
+        place(researcher_id)
         conn.execute("UPDATE researchers SET mark = ? WHERE id = ?", (mark, researcher_id))
         _write_positions(conn, ids)
 

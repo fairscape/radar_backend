@@ -579,18 +579,21 @@ def drop_profile_topics(conn: sqlite3.Connection, profile_id: int, *, live: bool
     stored = _stored_topic_filters(conn, profile_id)
     if not researcher_topics.is_applied(stored):
         return False
-    topics = [dict(t) for t in stored.get("topics") or []]
-    for t in topics:
-        if researcher_topics.BEFORE in t:
-            t["on"] = bool(t[researcher_topics.BEFORE])
-    out = researcher_topics.strip({**stored, "topics": topics})
-    if live and not any(t.get("on") for t in out["topics"]) and any(t.get("on") for t in stored.get("topics") or []):
-        # Putting the seeds' topics back as they were would leave the saved
-        # interest searching by nothing: the user had switched them off and
-        # kept the profile's. Those stay, as ordinary topics of the
-        # interest, with the states they have.
+    if live:
+        # The list is what the user saved the interest with and what every
+        # scan searches by. Forgetting the person does not change it: the
+        # marks go, the profile's topics stay as the interest's own, every
+        # state as it is. Putting the seeds' topics back "as they were" put
+        # a topic the profile had said no to back on and dropped the two
+        # the user had committed with.
         out = researcher_topics.adopt(stored)
         log.info("wizard.researcher_topics_adopted", profile_id=profile_id)
+    else:
+        topics = [dict(t) for t in stored.get("topics") or []]
+        for t in topics:
+            if researcher_topics.BEFORE in t:
+                t["on"] = bool(t[researcher_topics.BEFORE])
+        out = researcher_topics.strip({**stored, "topics": topics})
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(out), profile_id),
@@ -746,7 +749,11 @@ def _keep_adopted_topics(stored: dict, topic_filters: dict) -> None:
     have = {researcher_topics.code(t.get("id")) for t in topics if t.get("id")}
     for t in stored.get("topics") or []:
         if t.get("id") and t.get("source") == researcher_topics.ADOPTED and researcher_topics.code(t["id"]) not in have:
-            topics.append(dict(t))
+            # Without the marks, as ``_keep_stored_umls``: ``apply`` re-marks
+            # the ones a live profile still has an opinion on. A stale
+            # ``on_before_profile`` on an unmarked copy made "Remove profile
+            # topics" override the user's later on/off choice.
+            topics.append({k: v for k, v in t.items() if k not in ("profile", researcher_topics.BEFORE)})
             have.add(researcher_topics.code(t["id"]))
 
 
@@ -766,7 +773,7 @@ def _keep_content_topics(topic_filters: dict, from_content: dict[str, dict]) -> 
             t["source"] = content_topics.SOURCE
     for tid, t in from_content.items():
         if tid not in have:
-            topics.append({"id": tid, "display_name": t.get("display_name") or "", "count": 1,
+            topics.append({"id": tid, "display_name": t.get("display_name") or "", "count": 1, "papers": 1,
                            "source": content_topics.SOURCE})
 
 
@@ -1082,6 +1089,7 @@ def commit_draft(
     selector = _new_selector_for_draft(row, profile, threshold=threshold)
     selector.fit(profile)
     sel_cfg = selector.config()
+    sel_cfg[FIT_SEEDS] = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
     diag = sel_cfg.get("diagnostics_snapshot") or {}
 
     centroid_blob: bytes | None = None
@@ -1209,8 +1217,35 @@ class ScanRunning(RuntimeError):
     of the pool against one centroid and part against another."""
 
 
-def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
+# The seed ids a live interest's fit was made from, stored inside
+# ``selector_config_json``. The scan compares the seeds it has against this
+# (not against the seeds at its own start): a seed attached under a scan
+# whose end-of-run refit did not happen -- the scan failed, another run
+# opened as it closed, the seed arrived between "Scan now" and the job --
+# stayed unfitted for good otherwise.
+FIT_SEEDS = "fit_seed_ids"
+
+
+def fit_seed_ids(row) -> list[str] | None:
+    """The seeds the stored fit was made from; None for a fit from before
+    this was recorded."""
+    sel_json = row["selector_config_json"] if row is not None else None
+    if not sel_json:
+        return None
+    try:
+        cfg = json.loads(sel_json)
+    except (ValueError, TypeError):
+        return None
+    ids = cfg.get(FIT_SEEDS) if isinstance(cfg, dict) else None
+    return sorted(str(i) for i in ids) if isinstance(ids, list) else None
+
+
+def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str,
+                  own_run_id: int | None = None) -> dict:
     """Re-fit a live profile's selector on the seeds it has now.
+
+    ``own_run_id``: the scan calling this holds the interest's scan lock and
+    its own run row is open; that row does not count as "a scan running".
 
     The fitted half of ``commit_draft``. Until this existed the scheduler
     kept scoring with the centroid fitted at commit -- it reuses the
@@ -1229,7 +1264,8 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
         raise ValueError(f"'{slug}' is a draft; it is fitted when it is committed")
     t0 = time.monotonic()
     profile_id = int(row["id"])
-    if gather_runs_repo.running_scan(conn, profile_id) is not None:
+    running = gather_runs_repo.running_scan(conn, profile_id)
+    if running is not None and (own_run_id is None or int(running["id"]) != int(own_run_id)):
         raise ScanRunning(f"a scan of '{slug}' is still running; refit when it has finished")
     embed_missing(conn, row["embedding_model"],
                   profiles_repo.list_seed_openalex_ids(conn, profile_id))
@@ -1241,6 +1277,7 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
     selector = _new_selector_for_draft(row, profile, threshold=row["threshold"])
     selector.fit(profile)
     sel_cfg = selector.config()
+    sel_cfg[FIT_SEEDS] = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
     diag = sel_cfg.get("diagnostics_snapshot") or {}
     centroid_list = sel_cfg.get("centroid")
     profiles_repo.update_fit(

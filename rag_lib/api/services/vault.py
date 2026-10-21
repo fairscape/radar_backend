@@ -159,7 +159,13 @@ def upload(
 
     if profile_slug:
         target = profiles_repo.get_by_slug(conn, user_id, profile_slug)
-        if target is not None and gather_runs_repo.has_unfinished_import(conn, int(target["id"])):
+        if target is None:
+            # The Seeds tab of an interest deleted in another tab, a wizard
+            # draft since discarded, or a slug that is not this user's: the
+            # upload used to land in the vault with a 200 and no seed, and
+            # nothing said so.
+            raise UploadRejected(f"no interest '{profile_slug}' to add the paper to", status_code=404)
+        if gather_runs_repo.has_unfinished_import(conn, int(target["id"])):
             # The Vault's "upload to <draft>" while that draft's import runs:
             # the wizard holds its own buttons, this path had no guard.
             raise UploadRejected(
@@ -463,7 +469,8 @@ def _chunk_count_for_paper(
 def _attach_to_profile(
     conn: sqlite3.Connection, user_id: int, profile_slug: str, openalex_id: str
 ) -> None:
-    """Idempotent profile_seeds upsert; silently no-ops if the slug is unknown.
+    """Idempotent profile_seeds upsert; no-ops if the slug is unknown
+    (``upload`` has already answered 404 for one).
 
     A live interest is re-fitted when this adds a seed, same as
     ``POST /{key}/seeds``: the Seeds tab's PDF drop zone lands here, and

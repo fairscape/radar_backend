@@ -192,7 +192,7 @@ def apply(topic_filters: dict, view: dict) -> dict:
         if have is not None:
             have["profile"] = INTEREST
         else:
-            new = {"id": item["id"], "display_name": item["display_name"], "count": 0,
+            new = {"id": item["id"], "display_name": item["display_name"], "count": 0, "papers": 0,
                    "source": SOURCE, "profile": INTEREST}
             topics.append(new)
             by_code[_code(item["id"])] = new

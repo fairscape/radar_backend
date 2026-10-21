@@ -565,19 +565,27 @@ def test_re_applying_keeps_the_original_pre_apply_state(env):
 
 def test_forgetting_the_researcher_takes_the_profile_off_a_saved_interest(env):
     """A saved interest's list is what every scan reads and nothing rebuilds
-    it on its own, so forgetting the researcher cleans it there and then."""
+    it on its own, so forgetting the researcher takes the marks off there
+    and then -- and leaves every topic as the user saved it: the profile's
+    topics become the interest's own (``adopted``), the one the profile had
+    said no to stays off. Round 12: it used to come back on, and the two
+    the user committed with were dropped."""
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
-    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    on_at_commit = [t["id"] for t in applied if t["on"]]
+    assert "T10001" not in on_at_commit and len(on_at_commit) == 2
+    _commit(app, slug, on_at_commit)
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
     stored = _stored(env, slug)
     assert stored["researcher_topics"] is False
-    assert [t["id"] for t in stored["topics"]] == ["T10001"]
-    assert stored["topics"][0]["on"] is True and "profile" not in stored["topics"][0]
+    assert [t["id"] for t in stored["topics"] if t["on"]] == on_at_commit
+    assert all("profile" not in t and "on_before_profile" not in t for t in stored["topics"])
+    assert {t["source"] for t in stored["topics"] if t["id"] in on_at_commit} == {"adopted"}
     detail = _request(app, "GET", f"/api/profiles/{slug}/detail").json()
-    assert [(t["id"], t["on"], t["profile"]) for t in detail["topics"]] == [("T10001", True, None)]
+    assert [t["id"] for t in detail["topics"] if t["on"]] == on_at_commit
+    assert all(t["profile"] is None for t in detail["topics"])
 
 
 def test_a_list_read_that_overlaps_an_apply_does_not_undo_it(env, monkeypatch):

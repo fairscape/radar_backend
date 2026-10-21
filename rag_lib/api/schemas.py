@@ -162,7 +162,12 @@ class SeedUmlsStatus(_Model):
 class Topic(_Model):
     id: str
     name: str
+    # Topic assignments across the seeds (ranks the list; a seed's primary
+    # topic is in it twice, as OpenAlex repeats it inside ``topics[]``).
     count: int
+    # Seeds carrying the topic, each once. None on lists saved before it
+    # was recorded.
+    papers: int | None = None
     on: bool
     source: str | None = None
     # Found by the seeds since the topics were last saved (topic preview only).

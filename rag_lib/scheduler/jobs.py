@@ -572,25 +572,51 @@ def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseEx
               error=f"{type(exc).__name__}: {exc}")
 
 
-def _refit_if_seeds_changed(conn, user_id: int, profile_id: int, seeds_at_start: set[str], run_id: int | None) -> None:
-    """Seeds attached or removed while the scan ran (an upload, "add as
-    seeds") were not fitted -- the refit refuses under a running scan -- and
-    no later scan fits them either: it hydrates the stored fit. The run is
-    closed, so the refit can go ahead now. Best effort: the scan succeeded."""
+def _refit_if_fit_stale(conn, user_id: int, profile_id: int, run_id: int | None, *, when: str) -> None:
+    """Fit the interest on the seeds it has if the stored fit was made from
+    other seeds. A seed attached or removed while a scan runs (an upload,
+    "add as seeds") is not fitted then -- the refit refuses under a running
+    scan -- and no scan fits it on its own: every scan hydrates the stored
+    fit. Called at the start of a scan (under the scan lock, with the own
+    run row open) and when it closes, clean or failed. Best effort."""
     try:
-        now = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
-        if now == seeds_at_start:
-            return
         row = profiles_repo.get(conn, profile_id)
         if row is None or row["is_draft"]:
             return
         from ..api.services import wizard as wizard_service
 
-        log.info("scheduler.gather_seeds_added_refit", profile_id=profile_id, run_id=run_id,
-                 n_added=len(now - seeds_at_start), n_removed=len(seeds_at_start - now))
-        wizard_service.refit_profile(conn, user_id=user_id, slug=row["slug"])
+        fitted = wizard_service.fit_seed_ids(row)
+        now = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+        if fitted is not None:
+            if now == fitted:
+                return
+        elif not _legacy_fit_is_stale(row, len(now)):
+            return
+        log.info("scheduler.gather_refit_stale_fit", profile_id=profile_id, run_id=run_id, when=when,
+                 legacy=fitted is None,
+                 n_added=len(set(now) - set(fitted or [])), n_removed=len(set(fitted or []) - set(now)))
+        try:
+            wizard_service.refit_profile(conn, user_id=user_id, slug=row["slug"], own_run_id=run_id)
+        except wizard_service.ScanRunning:
+            # Another run opened as this one closed; that scan refits at its start.
+            log.info("scheduler.gather_refit_deferred", profile_id=profile_id, run_id=run_id, when=when)
     except Exception:  # noqa: BLE001
-        log.exception("scheduler.gather_seeds_added_refit_failed", profile_id=profile_id, run_id=run_id)
+        log.exception("scheduler.gather_refit_stale_fit_failed", profile_id=profile_id, run_id=run_id, when=when)
+
+
+def _legacy_fit_is_stale(row, n_seeds_now: int) -> bool:
+    """A fit from before the seed ids were recorded: the one thing it tells
+    about its seeds is how many it embedded (``seed_matrix``). Different
+    count -> stale; no matrix -> nothing to compare, assume current."""
+    sel_json = row["selector_config_json"]
+    if not sel_json:
+        return False
+    try:
+        cfg = json.loads(sel_json)
+    except (ValueError, TypeError):
+        return False
+    matrix = cfg.get("seed_matrix") if isinstance(cfg, dict) else None
+    return isinstance(matrix, list) and len(matrix) != n_seeds_now
 
 
 def _gather_for_profile_locked(
@@ -613,11 +639,6 @@ def _gather_for_profile_locked(
         if profile_row is None:
             log.error("scheduler.profile_missing", profile_id=profile_id)
             return None
-        # The seeds the fit in use was made from. A seed added while this
-        # runs cannot be fitted then (the refit refuses under a scan) and
-        # nothing else would fit it: this scan does, once its row is closed.
-        seeds_at_start = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
-
         since = _days_ago_iso(days)
         span = None
         if years is not None:
@@ -635,6 +656,10 @@ def _gather_for_profile_locked(
 
         reporter = _ProgressReporter(conn, run_id)
         try:
+            # Seeds that arrived since the fit (under an earlier scan, or
+            # between "Scan now" and this job) are fitted before scoring.
+            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="start")
+            profile_row = profiles_repo.get(conn, profile_id) or profile_row
             reporter.step(
                 "loading_profile",
                 message="Loading profile and seed embeddings",
@@ -834,10 +859,11 @@ def _gather_for_profile_locked(
                 n_new=n_new,
                 n_redup=n_redup,
             )
-            _refit_if_seeds_changed(conn, user_id, profile_id, seeds_at_start, run_id)
+            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="end")
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
             _close_failed_scan(conn, profile_id, run_id, settings, exc)
+            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="failed")
             return run_id
     finally:
         conn.close()

@@ -106,6 +106,9 @@ class _AttachingGatherer(_StubGatherer):
 
 def test_a_scan_refits_seeds_added_while_it_ran(monkeypatch, db_path, settings, profile_id):
     conn = connect(db_path)
+    # The fit records the seeds it was made from (round 12); W1 alone here.
+    conn.execute("UPDATE profiles SET selector_config_json = json_set(selector_config_json, '$.fit_seed_ids', json('[\"W1\"]')) WHERE id = ?", (profile_id,))
+    conn.commit()
     before = conn.execute("SELECT selector_config_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()[0]
     conn.close()
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer",

@@ -539,6 +539,11 @@ def create_interest(
             raise ValueError("none of the selected papers belong to this researcher")
 
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    # As attach_seeds: the papers were embedded when imported, under the
+    # model of that day; a draft under another model needs its own vectors.
+    # Before the draft exists: an embedder failure then is a plain error,
+    # not a half-built draft that a retry would duplicate as "Name (2)".
+    wizard_service.embed_missing(conn, model, list(chosen))
     draft = wizard_service.create_draft(
         conn,
         user_id=user_id,
@@ -554,9 +559,6 @@ def create_interest(
     n = 0
     for openalex_id in chosen:
         n += profiles_repo.attach_seed(conn, profile_id, openalex_id)
-    # As attach_seeds: the papers were embedded when imported, under the
-    # model of that day; a draft under another model needs its own vectors.
-    wizard_service.embed_missing(conn, model, list(chosen))
     log.info(
         "researchers.create_interest",
         researcher_id=researcher_id, draft_slug=draft["slug"], n_seeds=n,
