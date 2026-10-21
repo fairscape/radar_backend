@@ -202,6 +202,29 @@ def apply(topic_filters: dict, view: dict) -> dict:
     return out
 
 
+def code(topic_id: Any) -> str:
+    """The bare OpenAlex code (``T10001``) of a topic id in either form."""
+    return _code(topic_id)
+
+
+def adopt(topic_filters: dict) -> dict:
+    """``topic_filters`` with the profile's topics kept as ordinary ones: the
+    marks and the flag gone, every state as it is. For a saved list that
+    ``strip`` would leave with nothing on; a new dict."""
+    out = dict(topic_filters or {})
+    kept = []
+    for t in out.get("topics") or []:
+        t = dict(t)
+        if t.get("source") == SOURCE:
+            t.pop("source", None)
+        t.pop("profile", None)
+        t.pop(BEFORE, None)
+        kept.append(t)
+    out["topics"] = kept
+    out[FLAG] = False
+    return out
+
+
 def strip(topic_filters: dict) -> dict:
     """``topic_filters`` without the profile's topics and marks; a new dict."""
     out = dict(topic_filters or {})

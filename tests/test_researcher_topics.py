@@ -732,3 +732,114 @@ def test_a_read_after_the_researcher_vanished_rebuilds_once(env, monkeypatch):
     _topics(app, slug)
     assert len(calls) == 1
     assert _stored(env, slug)["researcher_topics"] is False
+
+
+# --- after the fourth review ------------------------------------------------------
+
+
+def _switch(env, slug, states):
+    """Set stored on/off states by id, as a trial scan's saved ticks would."""
+    conn = connect(env)
+    try:
+        stored = json.loads(conn.execute("SELECT topic_filters_json FROM profiles WHERE slug = ?", (slug,)).fetchone()[0])
+        for t in stored["topics"]:
+            if t["id"] in states:
+                t["on"] = states[t["id"]]
+        conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE slug = ?", (json.dumps(stored), slug))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_forgetting_the_researcher_keeps_the_profiles_topics_where_nothing_else_is_on(env):
+    """The user kept only the profile's topics on. Putting the seeds' topics
+    back as they were (off) would leave the saved interest searching by
+    nothing, so the profile's stay -- as ordinary topics, no marks."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    # The seed's topic is switched off before the profile is applied (a trial
+    # scan saves the ticks), so it was off before and goes back to off.
+    _topics(app, slug)
+    _switch(env, slug, {"T10001": False})
+    assert _topics(app, slug)["T10001"]["on"] is False
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    only_profile = [t["id"] for t in applied if t["on"]]
+    assert only_profile and "T10001" not in only_profile
+    _commit(app, slug, only_profile)
+    assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    stored = _stored(env, slug)
+    assert stored["researcher_topics"] is False
+    assert {t["id"] for t in stored["topics"] if t["on"]} == set(only_profile)
+    assert all("profile" not in t and "on_before_profile" not in t and t.get("source") != "researcher"
+               for t in stored["topics"])
+    detail = _request(app, "GET", f"/api/profiles/{slug}/detail").json()
+    assert {t["id"] for t in detail["topics"] if t["on"]} == set(only_profile)
+    assert all(t["profile"] is None for t in detail["topics"])
+
+
+def test_a_topic_the_profile_stops_rejecting_goes_back_to_what_it_was(env):
+    """The owner's document is re-read without the rejection: the topic the
+    profile had switched off is on again, with no mark and nothing left
+    behind for "Remove" to restore; a switch the user made since stays."""
+    profile = _stub_profile()
+    profile.metadata = {"research_interests": [
+        _topic("T10001", "Test Topic", weight=-0.5, method="declared"),
+        _topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared"),
+    ]}
+    profile.rid = "0000-0001-5643-4068"
+    app = _app(StubProsopia(profile), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    applied = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    assert applied["T10001"]["on"] is False and applied["T10001"]["profile"] == "not_interest"
+
+    profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    topics = _topics(app, slug)
+    assert topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
+    assert "on_before_profile" not in {t["id"]: t for t in _stored(env, slug)["topics"]}["T10001"]
+    removed = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
+    assert removed["T10001"]["on"] is True
+
+
+def test_a_topic_the_profile_stops_rejecting_keeps_the_users_own_switch(env):
+    profile = _stub_profile()
+    profile.metadata = {"research_interests": [
+        _topic("T10001", "Test Topic", weight=-0.5, method="declared"),
+        _topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared"),
+    ]}
+    profile.rid = "0000-0001-5643-4068"
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    # The user switches the rejected topic back on themselves (a trial scan saves the ticks).
+    _switch(env, slug, {"T10001": True})
+    profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
+    _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"})
+    assert _topics(app, slug)["T10001"]["on"] is True
+
+
+def test_a_rebuild_overtaken_every_time_is_refused_rather_than_written(env, monkeypatch):
+    """Three rebuilds, each overtaken by an apply or remove: the last one is
+    not written anyway (it could undo one); the client gets a 409."""
+    from rag_lib.api.services import wizard as wizard_service
+
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    before = _stored(env, slug)
+    real = wizard_service._stored_topic_filters
+    state = {"flag": False}
+
+    def flipping(conn, profile_id):
+        out = dict(real(conn, profile_id))
+        if conn.in_transaction:                 # the read under the write lock
+            state["flag"] = not state["flag"]
+            out["researcher_topics"] = state["flag"]
+        return out
+
+    monkeypatch.setattr(wizard_service, "_stored_topic_filters", flipping)
+    resp = _request(app, "GET", f"/api/profiles/draft/{slug}/topics")
+    assert resp.status_code == 409 and "try again" in resp.json()["detail"]
+    monkeypatch.undo()
+    assert _stored(env, slug) == before

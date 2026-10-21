@@ -181,6 +181,15 @@ def create_app() -> FastAPI:
             errors.append(_json_safe(jsonable_encoder(err)))
         return JSONResponse(status_code=422, content={"detail": errors})
 
+    from .services.wizard import TopicsChanging
+
+    @app.exception_handler(TopicsChanging)
+    async def _topics_changing(request: Request, exc: TopicsChanging):
+        # The list was applied/removed under a rebuild three times over;
+        # the rebuilt list is not written (it could undo one). Try again.
+        return JSONResponse(status_code=409, content={
+            "detail": "the interest's topics changed while the list was being rebuilt; try again"})
+
     @app.exception_handler(OverflowError)
     async def _overflow(request: Request, exc: OverflowError):
         # An id past SQLite's 64-bit integers (2**63 and up) cannot name a

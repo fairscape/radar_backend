@@ -375,13 +375,18 @@ def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> d
         log.info("wizard.topics_rebuilt_after_profile_change", profile_id=profile_id)
         seen = now
         topic_filters = build()
-    conn.execute(
-        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(topic_filters), profile_id),
-    )
-    conn.commit()
-    return topic_filters
-    return topic_filters
+    # Three rebuilds, each overtaken by an apply or remove: writing the last
+    # one anyway could still undo one. The caller tries again.
+    raise TopicsChanging(profile_id)
+
+
+class TopicsChanging(RuntimeError):
+    """The profile's topics were applied or removed while the list was being
+    rebuilt, every time it was tried."""
+
+    def __init__(self, profile_id: int) -> None:
+        super().__init__(f"profile {profile_id}: topics changed while the list was being rebuilt")
+        self.profile_id = profile_id
 
 
 def _aggregate_topics(
@@ -422,6 +427,8 @@ def _aggregate_topics(
             # duration -- a scan in between would search without them and
             # the user's switches on them would be lost.
             topic_filters = _keep_stored_profile(stored, topic_filters)
+        else:
+            _settle_vanished_marks(stored, topic_filters, prior_on)
         _carry_before_states(stored, topic_filters)
     elif applied and _has_researcher(conn, profile_id):
         # The profile lists no topics Radar can read just now (re-imported
@@ -434,9 +441,7 @@ def _aggregate_topics(
         # The researcher was forgotten: the profile goes with them, and the
         # marked topics go back as they were before it was applied.
         topic_filters[researcher_topics.FLAG] = False
-        for t in stored.get("topics") or []:
-            if t.get("id") and researcher_topics.BEFORE in t:
-                prior_on[t["id"]] = bool(t[researcher_topics.BEFORE])
+        _restore_or_adopt(stored, topic_filters, prior_on)
 
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
@@ -480,7 +485,7 @@ def _keep_stored_profile(stored: dict, topic_filters: dict) -> dict:
 def _stored_topic_filters(conn: sqlite3.Connection, profile_id: int) -> dict:
     try:
         return profiles_repo.topic_filters(conn, profile_id) or {}
-    except Exception:  # noqa: BLE001 -- never aggregated, or unreadable
+    except (ValueError, TypeError):  # unreadable JSON; a database error is not "nothing stored"
         return {}
 
 
@@ -490,6 +495,40 @@ def _has_researcher(conn: sqlite3.Connection, profile_id: int) -> bool:
         (profile_id,),
     ).fetchone()
     return row is not None
+
+
+def _settle_vanished_marks(stored: dict, topic_filters: dict, prior_on: dict[str, bool]) -> None:
+    """A topic the profile had an opinion on last time and has none on now
+    (its document was re-read without it): the state the profile dictated
+    goes back to what it was before, unless the user changed it since. Its
+    remembered state is not carried on (``_carry_before_states`` keeps only
+    marked topics'), so nothing is left behind to restore later."""
+    marked_now = {researcher_topics.code(t.get("id")) for t in topic_filters.get("topics") or [] if t.get("profile")}
+    for old in stored.get("topics") or []:
+        if not old.get("id") or not old.get("profile") or researcher_topics.code(old["id"]) in marked_now:
+            continue
+        dictated = old["profile"] == researcher_topics.INTEREST
+        if researcher_topics.BEFORE in old and bool(old.get("on")) == dictated:
+            prior_on[old["id"]] = bool(old[researcher_topics.BEFORE])
+
+
+def _restore_or_adopt(stored: dict, topic_filters: dict, prior_on: dict[str, bool]) -> None:
+    """The researcher is gone. The marked topics go back as they were before
+    the profile was applied -- unless that would leave nothing on while the
+    list had something on: then every state stays and the profile's own
+    topics are kept as ordinary ones (as ``drop_profile_topics`` does)."""
+    stored_topics = [t for t in stored.get("topics") or [] if t.get("id")]
+    restored = {t["id"]: bool(t[researcher_topics.BEFORE]) for t in stored_topics if researcher_topics.BEFORE in t}
+    own = [t for t in stored_topics if t.get("source") != researcher_topics.SOURCE]
+    if (any(restored.get(t["id"], bool(t.get("on"))) for t in own)
+            or not any(t.get("on") for t in stored_topics)):
+        prior_on.update(restored)
+        return
+    have = {researcher_topics.code(t.get("id")) for t in topic_filters.get("topics") or [] if t.get("id")}
+    for t in stored_topics:
+        if t.get("source") == researcher_topics.SOURCE and researcher_topics.code(t["id"]) not in have:
+            topic_filters.setdefault("topics", []).append(
+                {k: v for k, v in t.items() if k not in ("source", "profile", researcher_topics.BEFORE)})
 
 
 def _carry_before_states(stored: dict, topic_filters: dict) -> None:
@@ -531,6 +570,13 @@ def drop_profile_topics(conn: sqlite3.Connection, profile_id: int, *, live: bool
         if researcher_topics.BEFORE in t:
             t["on"] = bool(t[researcher_topics.BEFORE])
     out = researcher_topics.strip({**stored, "topics": topics})
+    if live and not any(t.get("on") for t in out["topics"]) and any(t.get("on") for t in stored.get("topics") or []):
+        # Putting the seeds' topics back as they were would leave the saved
+        # interest searching by nothing: the user had switched them off and
+        # kept the profile's. Those stay, as ordinary topics of the
+        # interest, with the states they have.
+        out = researcher_topics.adopt(stored)
+        log.info("wizard.researcher_topics_adopted", profile_id=profile_id)
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(out), profile_id),
@@ -1387,7 +1433,7 @@ def _prior_topic_states(
     """Existing ``{topic_id: on}`` for a profile, empty if never aggregated."""
     try:
         existing = profiles_repo.topic_filters(conn, profile_id) or {}
-    except Exception:
+    except (ValueError, TypeError):
         return {}
     return {
         t["id"]: bool(t.get("on", True))
