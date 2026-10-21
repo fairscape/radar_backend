@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -82,24 +83,30 @@ def _log_feedback_for(
     fresh from the DB so the score / selector / doi reflect what the
     user actually saw.
     """
-    ctx = radar_service.card_feedback_context(db, user_id, card_id, profile_slug=profile)
-    if ctx is None:
-        return
-    log_event(
-        settings.RADAR_VAULT_DIR,
-        user_id,
-        db,
-        FeedbackEvent(
-            profile_id=ctx["profile_id"],
-            profile_slug=ctx["profile_slug"],
-            openalex_id=ctx["openalex_id"],
-            action=action,
-            score=ctx["score_pct"],
-            selector=ctx["selector"],
-            selector_config_hash=ctx["selector_config_hash"],
-            doi=ctx["doi"],
-        ),
-    )
+    try:
+        ctx = radar_service.card_feedback_context(db, user_id, card_id, profile_slug=profile)
+        if ctx is None:
+            return
+        log_event(
+            settings.RADAR_VAULT_DIR,
+            user_id,
+            db,
+            FeedbackEvent(
+                profile_id=ctx["profile_id"],
+                profile_slug=ctx["profile_slug"],
+                openalex_id=ctx["openalex_id"],
+                action=action,
+                score=ctx["score_pct"],
+                selector=ctx["selector"],
+                selector_config_hash=ctx["selector_config_hash"],
+                doi=ctx["doi"],
+            ),
+        )
+    except Exception:  # noqa: BLE001 -- the state change is committed; an unwritable vault dir was a 500
+        _log.exception("radar.feedback_log_failed", user_id=user_id, card_id=card_id, action=action)
+
+
+_log = structlog.get_logger(__name__)
 
 
 @router.post("/cards/save", response_model=CardActionResponse)
@@ -119,7 +126,7 @@ def save_card(
     # Only a real transition is feedback: re-saving a saved card is not a
     # second vote for it.
     if changed and res.state == "saved":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile)
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile or res.profile)
     return res
 
 
@@ -140,5 +147,5 @@ def dismiss_card(
     # Only a real transition is feedback: re-saving a saved card is not a
     # second vote for it.
     if changed and res.state == "dismissed":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile)
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile or res.profile)
     return res

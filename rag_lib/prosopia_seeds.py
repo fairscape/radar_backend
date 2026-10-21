@@ -376,6 +376,13 @@ def resolve_seed(
         )
 
     paper = _paper_from_record(record, slug=slug, fallback_text=fallback_text)
+    if oa_id and id_unreachable:
+        # The record names a work; only the lookup failed (rate limiting,
+        # a 5xx). Keyed by that id, the row is the paper a later scan or
+        # refresh brings in, not a synthetic twin of it that nothing can
+        # repair or dedup against. In the stored form (the full URL), as
+        # every gathered paper is keyed.
+        paper["openalex_id"] = f"https://openalex.org/{oa_id}"
     return Resolution(
         paper_id=paper_id,
         openalex_id=paper["openalex_id"],

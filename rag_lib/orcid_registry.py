@@ -118,6 +118,9 @@ def fetch_claimed(
         log.warning("orcid_registry.unavailable", orcid=orcid, error=str(exc))
         return None
 
+    if not isinstance(data, dict):
+        log.warning("orcid_registry.unexpected_body", orcid=orcid, kind=type(data).__name__)
+        return None
     out = ClaimedWorks()
     for group in data.get("group") or []:
         out.n_works += 1

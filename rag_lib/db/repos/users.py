@@ -36,12 +36,19 @@ def upsert(
     email_norm = email.strip().lower()
     existing = get_by_email(conn, email_norm)
     if existing is None:
+        # OR IGNORE: a first page load fires several requests at once, and
+        # every one of them found no row; all but the first then failed on
+        # the unique email. The row is read back whichever request made it.
         conn.execute(
-            "INSERT INTO users (email, mailto) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO users (email, mailto) VALUES (?, ?)",
             (email_norm, mailto if mailto is not None else email_norm),
         )
         conn.commit()
-        return get_by_email(conn, email_norm)  # type: ignore[return-value]
+        existing = get_by_email(conn, email_norm)
+        if existing is None:  # pragma: no cover -- the row was just inserted or already there
+            raise RuntimeError(f"user row for {email_norm!r} vanished after insert")
+        if mailto is None or mailto == existing["mailto"]:
+            return existing
     if mailto is not None and mailto != existing["mailto"]:
         conn.execute(
             "UPDATE users SET mailto = ? WHERE id = ?",

@@ -236,16 +236,26 @@ def launch_import(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
         )
-    scheduler.add_job(
-        import_prosopia_profile,
-        trigger="date",
-        run_date=datetime.now(tz=timezone.utc),
-        args=[plan],
-        kwargs={"run_id": run_id},
-        id=f"{tier}:{plan.profile_id or 0}:{plan.researcher_id or 0}:{run_id}",
-        replace_existing=False,
-        max_instances=1,
-    )
+    try:
+        scheduler.add_job(
+            import_prosopia_profile,
+            trigger="date",
+            run_date=datetime.now(tz=timezone.utc),
+            args=[plan],
+            kwargs={"run_id": run_id},
+            id=f"{tier}:{plan.profile_id or 0}:{plan.researcher_id or 0}:{run_id}",
+            replace_existing=False,
+            max_instances=1,
+        )
+    except Exception as exc:  # noqa: BLE001 -- open, the row showed "importing" for 30 minutes
+        gather_runs_repo.finish(
+            db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
+            error=f"could not schedule: {type(exc).__name__}: {exc}",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="the background scheduler refused the job; try again in a moment",
+        ) from exc
     return ProsopiaImportStart(draft_slug=plan.draft_slug, run_id=run_id)
 
 

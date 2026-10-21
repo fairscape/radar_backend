@@ -225,7 +225,7 @@ def prepare_researcher_import(
         _refuse_if_importing(
             conn, user_id,
             researcher_id=int(existing["id"]) if existing is not None else None,
-            orcid=rid if rid and not rid.lower().startswith("local:") else None,
+            orcid=rid.upper() if rid and not rid.lower().startswith("local:") else None,
         )
         records = select_records(profile, slug, paper_ids)
         researcher_id = record_prosopia_researcher(
@@ -387,6 +387,7 @@ def works_for_refresh(
         known = {
             w["openalex_id"] for w in works
             if orcid_service._strip_openalex(w["openalex_id"]) in saved_oa
+            or w["openalex_id"] in saved_pid
             or (normalize_doi(w.get("doi")) or "") in saved_doi
         }
         name = listing.get("name")
@@ -606,6 +607,12 @@ def attach_seeds(
 
         wizard_service.embed_missing(conn, row["embedding_model"], accepted)
         if not row["is_draft"]:
-            fit = wizard_service.refit_profile(conn, user_id=user_id, slug=slug)
+            try:
+                fit = wizard_service.refit_profile(conn, user_id=user_id, slug=slug)
+            except wizard_service.ScanRunning as exc:
+                # The seeds are attached; the running scan's rescore is on
+                # the old centroid, and the next refit picks them up.
+                log.warning("researchers.add_seeds.refit_skipped", slug=slug, reason=str(exc)[:160])
+                return attached, rejected, None
             return attached, rejected, fit.get("n_rescored")
     return attached, rejected, None

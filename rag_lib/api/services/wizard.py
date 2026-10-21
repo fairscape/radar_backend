@@ -124,15 +124,24 @@ def create_draft(
     get_selector(selector)         # validate; raises ValueError if unknown
 
     base_slug = profiles_repo.slugify(name)
-    slug, suffix = _unique_slug(conn, user_id, base_slug, name)
-    final_name = name if suffix == 0 else _suffixed(name, suffix)
-    profile_id = profiles_repo.create_draft(
-        conn,
-        user_id=user_id,
-        name=final_name,
-        slug=slug,
-        embedding_model=embedding_model,
-    )
+    for _attempt in range(5):
+        slug, suffix = _unique_slug(conn, user_id, base_slug, name)
+        final_name = name if suffix == 0 else _suffixed(name, suffix)
+        try:
+            profile_id = profiles_repo.create_draft(
+                conn,
+                user_id=user_id,
+                name=final_name,
+                slug=slug,
+                embedding_model=embedding_model,
+            )
+            break
+        except sqlite3.IntegrityError:
+            # Another request took the name between the check and the
+            # insert (a double-clicked Create): the next free one.
+            conn.rollback()
+    else:
+        raise ValueError(f"could not find a free name for {name!r}")
     # Stash the chosen selector type so dry-run + commit pick it up.
     # No fitted state yet — that lands on commit.
     conn.execute(
@@ -265,7 +274,7 @@ def compute_draft_coherence(
           seed_sim_min      = ?,
           seed_sim_median   = ?,
           seed_sim_max      = ?,
-          n_seed            = ?,
+          n_seed            = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?),
           updated_at        = datetime('now')
         WHERE id = ?
         """,
@@ -274,7 +283,7 @@ def compute_draft_coherence(
             band["min"] if band else None,
             band["median"] if band else None,
             band["max"] if band else None,
-            len(vecs), profile_id,
+            profile_id, profile_id,
         ),
     )
     conn.commit()
@@ -1178,6 +1187,11 @@ def embed_missing(
     return n
 
 
+class ScanRunning(RuntimeError):
+    """A scan of the interest is still running; a refit now would score part
+    of the pool against one centroid and part against another."""
+
+
 def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
     """Re-fit a live profile's selector on the seeds it has now.
 
@@ -1198,6 +1212,8 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
         raise ValueError(f"'{slug}' is a draft; it is fitted when it is committed")
     t0 = time.monotonic()
     profile_id = int(row["id"])
+    if gather_runs_repo.running_scan(conn, profile_id) is not None:
+        raise ScanRunning(f"a scan of '{slug}' is still running; refit when it has finished")
     embed_missing(conn, row["embedding_model"],
                   profiles_repo.list_seed_openalex_ids(conn, profile_id))
     profile = _load_profile(conn, row,

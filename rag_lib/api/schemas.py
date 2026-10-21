@@ -300,6 +300,9 @@ class CardActionResponse(_Model):
 
     id: str
     state: CardState | None = None
+    #: The interest the change landed on. A client that named none (older
+    #: ones) gets told which, so its feedback is logged against the same.
+    profile: str | None = None
 
 
 class FeedbackThresholdResponse(_Model):

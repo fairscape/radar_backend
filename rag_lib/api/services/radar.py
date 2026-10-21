@@ -291,7 +291,11 @@ def _set(
     if res is None:
         return None
     state, changed = res
-    return CardActionResponse(id=card_id, state=state), changed
+    slug = profile_slug
+    if slug is None:
+        row = conn.execute("SELECT slug FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        slug = row["slug"] if row is not None else None
+    return CardActionResponse(id=card_id, state=state, profile=slug), changed
 
 
 def save(

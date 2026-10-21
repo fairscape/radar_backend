@@ -13,7 +13,9 @@ slot in without refactoring the call site.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+import time
 from typing import Any
 
 import structlog
@@ -552,10 +554,20 @@ def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseEx
         rescore_pool(conn, profile_id, settings)
     except Exception:  # noqa: BLE001 -- the failure being reported comes first
         log.exception("scheduler.gather_failed.rescore_failed", profile_id=profile_id, run_id=run_id)
-    gather_runs_repo.finish(
-        conn, run_id, n_fetched=0, n_new=0, n_redup=0,
-        error=f"{type(exc).__name__}: {exc}",
-    )
+    for attempt in (1, 2):
+        try:
+            gather_runs_repo.finish(
+                conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            break
+        except sqlite3.OperationalError:
+            # Locked past the busy timeout: once more after a moment. Open,
+            # the row would count as a running scan for two hours.
+            if attempt == 2:
+                log.exception("scheduler.gather_failed.close_failed", profile_id=profile_id, run_id=run_id)
+            else:
+                time.sleep(2)
     log.exception("scheduler.gather_failed", profile_id=profile_id, run_id=run_id)
 
 

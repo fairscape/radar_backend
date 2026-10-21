@@ -189,7 +189,9 @@ def upload(
     pdf_path = pdf_dir / f"{file_hash}.pdf"
     # Read from a scratch name and move it in place only once it parsed: a
     # file pdfplumber cannot open is not kept.
-    part_path = pdf_dir / f".{file_hash}.part"
+    # One per request: the same file uploaded twice at once (a double-click)
+    # shared the name, and the first to finish moved it from under the other.
+    part_path = pdf_dir / f".{file_hash}.{os.getpid()}.{threading.get_ident()}.{int(_time.monotonic_ns())}.part"
     part_path.write_bytes(data)
 
     t1 = _time.monotonic()
@@ -205,7 +207,11 @@ def upload(
             "This file could not be read as a PDF. It may be damaged or password-protected.",
             status_code=422,
         ) from exc
-    os.replace(part_path, pdf_path)
+    try:
+        os.replace(part_path, pdf_path)
+    except FileNotFoundError:
+        if not pdf_path.exists():
+            raise
     if record.title == part_path.stem:
         # No title on the page: ingest_pdf fell back to the file's name,
         # which here is the scratch name (".<hash>"), not the user's.
@@ -476,7 +482,13 @@ def _attach_to_profile(
     # Even when the seed was already there: re-uploading the PDF is then how
     # a refit that failed after an earlier attach gets another go.
     if not profile["is_draft"]:
-        wizard_service.refit_profile(conn, user_id=user_id, slug=profile_slug)
+        try:
+            wizard_service.refit_profile(conn, user_id=user_id, slug=profile_slug)
+        except (wizard_service.ScanRunning, ValueError) as exc:
+            # The upload is stored and the seed attached; what did not
+            # happen is the refit (a scan is running, or nothing embeds).
+            # That was a 500 for an upload that had succeeded.
+            log.warning("vault.upload.refit_skipped", profile=profile_slug, reason=str(exc)[:160])
 
 
 def _embed_if_missing(conn: sqlite3.Connection, row: sqlite3.Row, settings: Any) -> None:

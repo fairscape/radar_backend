@@ -294,10 +294,16 @@ def start_seed_umls(
         extract_seed_umls_job(profile_id, settings)
     else:
         SEED_UMLS_RUNNING.add(profile_id)    # visible to the poll before the job starts
-        scheduler.add_job(
-            extract_seed_umls_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
-            args=[profile_id], id=f"seed-umls:{profile_id}", replace_existing=True, max_instances=1,
-        )
+        try:
+            scheduler.add_job(
+                extract_seed_umls_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
+                args=[profile_id], id=f"seed-umls:{profile_id}", replace_existing=True, max_instances=1,
+            )
+        except Exception:
+            # Not left set: every later request would have seen "running"
+            # for an extraction that never started.
+            SEED_UMLS_RUNNING.discard(profile_id)
+            raise
     return _seed_umls_status(db, settings, profile_id)
 
 
@@ -436,10 +442,9 @@ def draft_dry_run(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
         )
-    scheduler.add_job(
+    _schedule_run(
+        scheduler, db, run_id, "dry_run",
         dry_run_for_draft,
-        trigger="date",
-        run_date=datetime.now(tz=timezone.utc),
         args=[int(user["id"]), profile_id, slug],
         kwargs={
             "run_id": run_id,
@@ -450,10 +455,32 @@ def draft_dry_run(
             "selected_topic_ids": body.selected_topic_ids,
         },
         id=f"dry-run:{profile_id}:{run_id}",
-        replace_existing=False,
-        max_instances=1,
     )
     return DraftDryRunStart(ok=True, run_id=run_id)
+
+
+def _schedule_run(scheduler, db: sqlite3.Connection, run_id: int, tier: str, func, *, args, kwargs, id: str) -> None:
+    """Hand a run whose row is already open to the scheduler. If it refuses
+    (shutting down, executor gone) the row is closed with the error: open,
+    it counted as running for up to two hours, 409-ing every "Scan now"
+    and keeping the wizard's trial polling until the next restart."""
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    try:
+        scheduler.add_job(
+            func, trigger="date", run_date=datetime.now(tz=timezone.utc),
+            args=args, kwargs=kwargs, id=id, replace_existing=False, max_instances=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        gather_runs_repo.finish(
+            db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
+            error=f"could not schedule: {type(exc).__name__}: {exc}",
+        )
+        log.exception("api.schedule_failed", run_id=run_id, tier=tier)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="the background scheduler refused the job; try again in a moment",
+        ) from exc
 
 
 @router.get(
@@ -1119,6 +1146,8 @@ def refit_profile(
         fit = wizard_service.refit_profile(db, user_id=int(user["id"]), slug=key)
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except wizard_service.ScanRunning as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     cost = f"{fit['elapsed_s']:.2f} s · {fit['n_embedded']} vecs"
@@ -1255,20 +1284,12 @@ def gather_now(
         user_id=int(user["id"]),
         tier_used="manual",
     )
-    scheduler.add_job(
+    _schedule_run(
+        scheduler, db, run_id, "manual",
         gather_for_profile,
-        trigger="date",
-        run_date=datetime.now(tz=timezone.utc),
         args=[int(user["id"]), profile_id],
-        kwargs={
-            "run_id": run_id,
-            "tier": "manual",
-            "days": days,
-            "limit": limit,
-        },
+        kwargs={"run_id": run_id, "tier": "manual", "days": days, "limit": limit},
         id=f"gather-now:{profile_id}:{run_id}",
-        replace_existing=False,
-        max_instances=1,
     )
     return GatherNowResponse(ok=True, run_id=run_id)
 
@@ -1311,15 +1332,12 @@ def backfill(
         db, profile_id=profile_id, user_id=int(user["id"]),
         since_date=f"{start}-01-01", tier_used="backfill",
     )
-    scheduler.add_job(
+    _schedule_run(
+        scheduler, db, run_id, "backfill",
         gather_for_profile,
-        trigger="date",
-        run_date=datetime.now(tz=timezone.utc),
         args=[int(user["id"]), profile_id],
         kwargs={"run_id": run_id, "tier": "backfill", "years": (body.year_from, body.year_to)},
         id=f"backfill:{profile_id}:{run_id}",
-        replace_existing=False,
-        max_instances=1,
     )
     return GatherNowResponse(ok=True, run_id=run_id)
 
