@@ -50,6 +50,7 @@ EXPECTED_VERSIONS = [
     "0021_profile_names_per_user",
     "0022_score_raw_backfill",
     "0023_researcher_marks",
+    "0024_reserve_all_slug",
 ]
 
 

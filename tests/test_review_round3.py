@@ -272,7 +272,7 @@ def test_rebuilding_profiles_keeps_every_child_row(tmp_path):
     gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")
     conn.execute("DELETE FROM profiles WHERE id = ?", (_interest(conn, uid, "Gone"),))
     conn.commit()
-    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks"]
+    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug"]
     for table in ("profile_seeds", "profile_candidates", "gather_runs"):
         assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1, table
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

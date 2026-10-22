@@ -22,7 +22,11 @@ from .gather_runs import IMPORT_TIERS
 #: ``/{key}``. Keep in step with routers/profiles.py.
 # "new": the frontend's /interests/new is the wizard, so an interest named
 # "New" was saved and then opened as a blank wizard, its page unreachable.
-RESERVED_SLUGS = frozenset({"drafts", "draft", "wizard", "new"})
+# "all": the feed's interest filter, the Vault's tag filter and its per-tag
+# counts read the literal "all" as "every interest", so an interest named
+# "ALL" (acute lymphoblastic leukemia) showed every interest's papers and
+# listed the whole Vault as its seeds. 0024 renames existing ones.
+RESERVED_SLUGS = frozenset({"drafts", "draft", "wizard", "new", "all"})
 
 
 def slugify(name: str) -> str:

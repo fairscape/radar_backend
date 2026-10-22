@@ -220,6 +220,8 @@ def researcher_works(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except prosopia_service.ProfileNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except OverflowError as exc:   # an id SQLite cannot hold: no such researcher, not a source failure
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"researcher {researcher_id} not found") from exc
     except Exception as exc:  # noqa: BLE001 — the source could not be read
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

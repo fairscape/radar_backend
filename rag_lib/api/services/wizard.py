@@ -456,17 +456,22 @@ def _aggregate_topics(
         topic_filters[researcher_topics.FLAG] = False
         _restore_or_adopt(stored, topic_filters, prior_on)
 
+    stored_marks = {researcher_topics.code(t["id"]): t.get("profile")
+                    for t in stored.get("topics") or [] if t.get("id")}
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
             t["on"] = prior_on.get(t["id"], new_on)
-            # A topic the profile has an opinion on and the user has not
-            # seen before starts as the profile says, whatever other new
-            # topics start as; a choice the user made since is kept. Either
-            # way the state it would have had is remembered, so removing
-            # the profile can put it back (``set_researcher_topics``).
+            # A topic the profile has an opinion on starts as the profile
+            # says when the user has not seen it, or has not seen the
+            # profile's opinion on it: a mark new since the stored list (a
+            # re-import that now rejects a seed topic) is the profile's say,
+            # as on the first apply, not "a choice the user made since". A
+            # state set under the same mark is the user's and is kept.
+            # Either way the state it would have had is remembered, so
+            # removing the profile can put it back (``set_researcher_topics``).
             if from_profile is not None and t.get("profile"):
                 t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], new_on))
-                if t["id"] not in prior_on:
+                if t["id"] not in prior_on or stored_marks.get(researcher_topics.code(t["id"])) != t["profile"]:
                     t["on"] = t["profile"] == researcher_topics.INTEREST
     return topic_filters
 
@@ -545,6 +550,20 @@ def _restore_or_adopt(stored: dict, topic_filters: dict, prior_on: dict[str, boo
             topic_filters.setdefault("topics", []).append(kept)
 
 
+def _restore_before(t: dict) -> None:
+    """Take the profile's say off one marked topic: back to its remembered
+    pre-apply state -- only while it is still as the profile dictated. A
+    switch the user made since (a wanted topic turned off on the edit page)
+    is theirs and stays; restoring it regardless turned that topic back on
+    for every later scan. As ``_settle_vanished_marks``."""
+    if researcher_topics.BEFORE not in t:
+        return
+    mark = t.get("profile")
+    if mark and bool(t.get("on", True)) != (mark == researcher_topics.INTEREST):
+        return
+    t["on"] = bool(t[researcher_topics.BEFORE])
+
+
 def _carry_before_states(stored: dict, topic_filters: dict) -> None:
     """Keep each marked topic's recorded pre-apply state across a rebuild."""
     before = {t.get("id"): t[researcher_topics.BEFORE] for t in stored.get("topics") or []
@@ -591,8 +610,7 @@ def drop_profile_topics(conn: sqlite3.Connection, profile_id: int, *, live: bool
     else:
         topics = [dict(t) for t in stored.get("topics") or []]
         for t in topics:
-            if researcher_topics.BEFORE in t:
-                t["on"] = bool(t[researcher_topics.BEFORE])
+            _restore_before(t)
         out = researcher_topics.strip({**stored, "topics": topics})
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
@@ -661,6 +679,21 @@ def set_researcher_topics(
             raise ValueError(
                 "this interest was not built from a researcher whose profile lists topics"
             )
+    for _attempt in range(3):
+        raw = conn.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()[0]
+        out = _set_researcher_topics_once(conn, row, profile_id, enabled=enabled, raw=raw)
+        if out is not None:
+            return out
+    raise RuntimeError("the topic list kept changing while the profile's topics were applied; try again")
+
+
+def _set_researcher_topics_once(
+    conn: sqlite3.Connection, row: sqlite3.Row, profile_id: int, *, enabled: bool, raw: str | None,
+) -> dict | None:
+    """One go of ``set_researcher_topics`` against the stored list as read
+    (``raw``). None when the list changed before the write (a topics save
+    from another tab while the profile's labels were mapped): the write
+    would have undone it, so the caller reads again and retries."""
     stored = _stored_topic_filters(conn, profile_id)
     if not enabled and not researcher_topics.is_applied(stored):
         # Nothing applied, nothing to take off: the stored list stays as it
@@ -680,11 +713,14 @@ def set_researcher_topics(
         # draft's is settled on step 3, which says so when nothing is ticked.
         if not row["is_draft"] and kept and not any(t.get("on", True) for t in kept):
             raise NoTopicOn("removing the profile's topics would leave none on: switch one on first")
-    conn.execute(
-        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(full), profile_id),
+    cur = conn.execute(
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ? AND topic_filters_json IS ?",
+        (json.dumps(full), profile_id, raw),
     )
     conn.commit()
+    if cur.rowcount == 0:
+        log.info("wizard.researcher_topics_retry", profile_id=profile_id)
+        return None
     if not row["is_draft"]:
         from rag_lib.scheduler.jobs import request_rerank_refresh
         request_rerank_refresh(profile_id)
@@ -707,8 +743,7 @@ def _researcher_topics_rebuilt(conn: sqlite3.Connection, profile_id: int, *, ena
                 t["on"] = t["profile"] == researcher_topics.INTEREST
         return full
     for t in topics:
-        if researcher_topics.BEFORE in t:
-            t["on"] = bool(t[researcher_topics.BEFORE])
+        _restore_before(t)
     return researcher_topics.strip(full)
 
 
@@ -734,8 +769,7 @@ def _researcher_topics_on_stored(
     """
     topics = [dict(t) for t in stored.get("topics") or []]
     for t in topics:
-        if researcher_topics.BEFORE in t:
-            t["on"] = bool(t[researcher_topics.BEFORE])
+        _restore_before(t)
     plain = researcher_topics.strip({**stored, "topics": topics})
     if not enabled:
         return plain
@@ -750,7 +784,11 @@ def _researcher_topics_on_stored(
     full = researcher_topics.apply(plain, view)
     for t in full.get("topics") or []:
         if t.get("profile"):
-            t[researcher_topics.BEFORE] = before.get(t["id"], True)
+            # A topic only the profile brings was not in the list: off is
+            # the state it had, and the one a topic new to a saved interest
+            # starts in -- should a seed bring it later, removing the
+            # profile then leaves it off rather than widening the scan.
+            t[researcher_topics.BEFORE] = before.get(t["id"], False)
             t["on"] = t["profile"] == researcher_topics.INTEREST
     return full
 
