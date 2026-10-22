@@ -200,3 +200,43 @@ def _seed_loo_cosines(
     if band is None:
         return {}
     return {r["oa"]: round(v, 4) for r, v in zip(rows, band["values"])}
+
+
+class ProfileBusy(RuntimeError):
+    """A scan or an import of the interest is still running."""
+
+
+def delete_profile(conn: sqlite3.Connection, user_id: int, slug: str) -> int | None:
+    """Delete one of the user's saved interests. Returns its id, or None
+    when the user has no interest by that slug.
+
+    Its seeds, stored papers, feedback, schedule and scan history go with
+    it (ON DELETE CASCADE); the papers themselves and the user's vault
+    stay. Refused while one of its scans or imports runs: the job would
+    keep writing rows for an interest that is gone. Holding the scan lock
+    across the delete closes the gap between that check and a scan that
+    starts in this process meanwhile.
+    """
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.scheduler import jobs
+
+    row = profiles_repo.get_by_slug(conn, user_id, slug)
+    if row is None or row["is_draft"]:
+        return None
+    profile_id = int(row["id"])
+    lock = jobs._scan_locks.setdefault(profile_id, jobs.threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise ProfileBusy(slug)
+    try:
+        if (gather_runs_repo.running_scan(conn, profile_id) is not None
+                or gather_runs_repo.has_unfinished_import(conn, profile_id)
+                or profile_id in jobs.SEED_UMLS_RUNNING):
+            raise ProfileBusy(slug)
+        profiles_repo.delete(conn, profile_id)
+    finally:
+        lock.release()
+    jobs._scan_locks.pop(profile_id, None)
+    jobs._refresh_again.discard(profile_id)
+    for key in [k for k in _sweep_cache if k[0] == profile_id]:
+        _sweep_cache.pop(key, None)
+    return profile_id

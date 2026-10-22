@@ -858,6 +858,35 @@ def update_profile(
     return updated
 
 
+@router.delete("/{key}")
+def delete_profile(
+    key: str,
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    """Delete a saved interest. Drafts go through ``DELETE /draft/{slug}``."""
+    try:
+        profile_id = profiles_service.delete_profile(db, int(user["id"]), key)
+    except profiles_service.ProfileBusy as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A scan or an import of this interest is still running. Delete it once that has finished.",
+        ) from exc
+    if profile_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"profile '{key}' not found for current user",
+        )
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        try:
+            scheduler.remove_job(f"gather:{profile_id}")
+        except Exception:  # noqa: BLE001 — no nightly job was registered
+            pass
+    return {"ok": True}
+
+
 # Recompute aliases — let the profile detail page re-run coherence and
 # topic aggregation after the user uploads more seeds. Both work for
 # drafts AND committed profiles (the wizard service uses
