@@ -666,24 +666,15 @@ def set_researcher_topics(
         # Nothing applied, nothing to take off: the stored list stays as it
         # is (a rebuild here would bring in topics the user has not seen).
         return stored
-    prior_on = _prior_topic_states(conn, profile_id)
-    # Folded in and marked either way: dropping needs the marks to know
-    # which topics to put back.
-    full = _aggregate_topics(conn, profile_id, new_on=bool(row["is_draft"]), profile_topics=True)
-    topics = full.get("topics") or []
+    if row["is_draft"]:
+        full = _researcher_topics_rebuilt(conn, profile_id, enabled=enabled)
+    else:
+        full = _researcher_topics_on_stored(conn, profile_id, stored, enabled=enabled)
     if enabled:
-        for t in topics:
-            if t.get("profile"):
-                # The state before the profile had its say, kept across re-applies.
-                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], bool(t.get("on", True))))
-                t["on"] = t["profile"] == researcher_topics.INTEREST
+        topics = full.get("topics") or []
         if topics and not any(t.get("on", True) for t in topics):
             raise NoTopicOn("the profile would switch every topic off: a scan searches by them")
     else:
-        for t in topics:
-            if researcher_topics.BEFORE in t:
-                t["on"] = bool(t[researcher_topics.BEFORE])
-        full = researcher_topics.strip(full)
         kept = full.get("topics") or []
         # On a saved interest the list is what the next scan searches by; a
         # draft's is settled on step 3, which says so when nothing is ticked.
@@ -699,6 +690,68 @@ def set_researcher_topics(
         request_rerank_refresh(profile_id)
     log.info("wizard.researcher_topics", profile_id=profile_id, enabled=enabled,
              n_on=sum(1 for t in full.get("topics") or [] if t.get("on", True)))
+    return full
+
+
+def _researcher_topics_rebuilt(conn: sqlite3.Connection, profile_id: int, *, enabled: bool) -> dict:
+    """A draft's list with the profile applied or taken off: rebuilt from
+    the seeds, as step 3 shows it anyway (a new topic starts on there)."""
+    prior_on = _prior_topic_states(conn, profile_id)
+    full = _aggregate_topics(conn, profile_id, new_on=True, profile_topics=True)
+    topics = full.get("topics") or []
+    if enabled:
+        for t in topics:
+            if t.get("profile"):
+                # The state before the profile had its say, kept across re-applies.
+                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], bool(t.get("on", True))))
+                t["on"] = t["profile"] == researcher_topics.INTEREST
+        return full
+    for t in topics:
+        if researcher_topics.BEFORE in t:
+            t["on"] = bool(t[researcher_topics.BEFORE])
+    return researcher_topics.strip(full)
+
+
+def _researcher_topics_on_stored(
+    conn: sqlite3.Connection, profile_id: int, stored: dict, *, enabled: bool,
+) -> dict:
+    """A saved interest's list with the profile applied or taken off,
+    worked on the stored list itself.
+
+    The stored list is what the user saved and what every scan searches
+    by; rebuilding it from the seeds here (as a draft's is) replaced it
+    with the recomputed one -- topics the seeds no longer give were
+    dropped and topics they gained started off -- so applying the profile
+    and taking it off again left a different interest (17 topics on, then
+    8) with no warning. The edit page keeps showing the recomputed list;
+    it replaces the stored one only when the user saves it there.
+
+    Taking the profile off restores every marked topic to its remembered
+    state and removes the topics only the profile brought. Applying starts
+    from that restored list (so re-applying after the profile changed does
+    not keep stale marks) and folds the profile in as the aggregation
+    does: wanted topics on, not-wanted ones off, the prior state remembered.
+    """
+    topics = [dict(t) for t in stored.get("topics") or []]
+    for t in topics:
+        if researcher_topics.BEFORE in t:
+            t["on"] = bool(t[researcher_topics.BEFORE])
+    plain = researcher_topics.strip({**stored, "topics": topics})
+    if not enabled:
+        return plain
+    view = _researcher_topics_for(conn, profile_id)
+    if view is None:  # pragma: no cover -- set_researcher_topics checked
+        raise ValueError("this interest was not built from a researcher whose profile lists topics")
+    if view.get("labels_unmapped") and researcher_topics.is_applied(stored):
+        # Part of the profile (its text labels) cannot be read just now:
+        # the list as last applied in full is better than one missing them.
+        return stored
+    before = {t["id"]: bool(t.get("on", True)) for t in plain.get("topics") or [] if t.get("id")}
+    full = researcher_topics.apply(plain, view)
+    for t in full.get("topics") or []:
+        if t.get("profile"):
+            t[researcher_topics.BEFORE] = before.get(t["id"], True)
+            t["on"] = t["profile"] == researcher_topics.INTEREST
     return full
 
 

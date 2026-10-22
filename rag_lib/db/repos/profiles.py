@@ -325,6 +325,7 @@ def upsert(
     Slug defaults to ``slugify(name)`` when not given. JSON-typed columns
     are encoded here; callers pass plain dicts.
     """
+    given_slug = slug
     slug = slug or slugify(name)
     tf_json = json.dumps(topic_filters or {})
     sel_json = json.dumps(selector_config) if selector_config is not None else None
@@ -364,14 +365,19 @@ def upsert(
           embedding_model = ?, centroid = ?, threshold = ?,
           topic_filters_json = ?, selector_config_json = ?,
           gatherer_config_json = ?, coherence_median = ?, coherence_iqr = ?,
-          coherence_bimodal = ?, n_seed = ?, slug = ?,
+          coherence_bimodal = ?, n_seed = ?, slug = COALESCE(?, slug),
           updated_at = datetime('now')
         WHERE id = ?
         """,
         (
             embedding_model, centroid, threshold,
             tf_json, sel_json, gat_json,
-            coherence_median, coherence_iqr, bimodal_int, n_seed, slug,
+            coherence_median, coherence_iqr, bimodal_int, n_seed,
+            # The slug is the interest's URL key: an existing row keeps it
+            # unless the caller names one. Recomputing it from the name
+            # renamed (or, after the wizard's "-2" suffix, collided with)
+            # the key of an interest re-stored from the CLI.
+            given_slug,
             existing["id"],
         ),
     )

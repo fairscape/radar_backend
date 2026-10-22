@@ -327,6 +327,7 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
             id=tid,
             name=name,
             count=int(it.get("count") or 0),
+            papers=int(it["papers"]) if it.get("papers") is not None else None,
             on=bool(it.get("on", True)),
             source=it.get("source"),
             profile=it.get("profile"),

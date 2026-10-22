@@ -207,20 +207,24 @@ def test_dismiss_writes_feedback_event(app):
     assert row["action"] == "dismissed"
 
 
-def test_save_toggle_off_does_not_log_extra_event(app):
+def test_save_toggle_off_logs_unsaved(app):
     daily = _request(app, "GET", "/api/radar/daily").json()
     card_id = daily["cards"][2]["id"]
 
-    _request(app, "POST", "/api/radar/cards/save", json={"card_id": card_id})  # saved → 1 row
-    _request(app, "POST", "/api/radar/cards/save", json={"card_id": card_id})  # toggled off → 0 added
+    _request(app, "POST", "/api/radar/cards/save", json={"card_id": card_id})  # saved
+    _request(app, "POST", "/api/radar/cards/save", json={"card_id": card_id})  # toggled off -> unsaved
 
     conn = _read_db(app.state.test_db)
-    n = conn.execute(
-        "SELECT count(*) AS n FROM feedback_events WHERE openalex_id = ?",
-        (card_id,),
-    ).fetchone()["n"]
+    actions = [
+        r["action"] for r in conn.execute(
+            "SELECT action FROM feedback_events WHERE openalex_id = ? ORDER BY id",
+            (card_id,),
+        ).fetchall()
+    ]
     conn.close()
-    assert n == 1
+    # The undo is logged too: the log is what the threshold suggestion
+    # reads, and a save that was taken back must not count as a save.
+    assert actions == ["saved", "unsaved"]
 
 
 def test_profile_detail_includes_recent_feedback(app):

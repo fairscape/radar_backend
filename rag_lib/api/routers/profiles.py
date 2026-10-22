@@ -1587,9 +1587,10 @@ def reranker_comparison(
         WHERE pc.profile_id = ?
           AND {candidates_repo.PASSES} AND {candidates_repo.IN_YEARS}
           AND {candidates_repo.NOT_SEED}
-          -- "Was reranked" is the reranker's own score, not the blend: the
-          -- pool rescore gives every row a blend once any row is reranked.
-          AND pc.score_reranker_raw IS NOT NULL
+          -- Every row the feed ranks: the pool rescore blends a row with
+          -- no reranker logit at the pool median (scoring/pool.py), and
+          -- the feed orders by that. Ranking only the reranked rows made
+          -- "rank after 1" a paper that is not the feed's first card.
           AND pc.score_blended IS NOT NULL
           AND pc.score_raw IS NOT NULL
         """,
@@ -1637,8 +1638,8 @@ def reranker_comparison(
     return RerankerComparisonResponse(
         ok=True,
         key=key,
-        # Every reranked paper, not the ``limit`` listed: the ranks shown run
-        # over all of them (a row can read 312), and the page says so.
+        # Every paper in the feed's pool, not the ``limit`` listed: the
+        # ranks shown run over all of them (a row can read 312).
         n=len(all_rows),
         candidates=candidates,
         avg_rank_change=round(avg_change, 2),

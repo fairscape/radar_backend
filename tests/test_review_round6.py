@@ -134,7 +134,9 @@ def test_scores_and_suggestion_stay_within_the_years(tmp_path):
                      " VALUES (?, ?, ?, ?, datetime('now'))", (pid, oa, s, s))
     conn.commit()
     assert candidates_repo.scores_for_profile(conn, pid) == [0.80, 0.70]        # no year passes, as the feed
-    assert [r["openalex_id"] for r in candidates_repo.scored_papers_for_profile(conn, pid)] == ["W-new", "W-none"]
+    # The list beside the slider keeps every stored year (round 13): the
+    # Threshold tab filters it by the range being tried, which may be wider.
+    assert [r["openalex_id"] for r in candidates_repo.scored_papers_for_profile(conn, pid)] == ["W-old", "W-new", "W-none"]
 
 
 # --- 9. the wizard's year-range trial, through the app -------------------------

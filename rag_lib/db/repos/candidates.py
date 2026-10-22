@@ -276,7 +276,10 @@ def scored_papers_for_profile(
     """Every stored candidate, in the feed or not, best first, with its title.
 
     The list beside the threshold slider: the score is the one the
-    threshold compares (``score_raw``, as ``scores_for_profile``).
+    threshold compares (``score_raw``, as ``scores_for_profile``). Every
+    year is included -- the Threshold tab filters by the range the user
+    is trying out, which may be wider than the saved one; filtered here by
+    the saved range, widening the range showed nothing older.
     """
     return conn.execute(
         f"""
@@ -284,8 +287,7 @@ def scored_papers_for_profile(
                p.title, p.venue, p.year
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
-        JOIN profiles pr ON pr.id = pc.profile_id
-        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
+        WHERE pc.profile_id = ? AND {NOT_SEED}
         ORDER BY s DESC
         """,
         (profile_id,),

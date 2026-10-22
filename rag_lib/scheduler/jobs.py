@@ -534,8 +534,36 @@ def gather_for_profile(
             user_id, profile_id, settings=settings, days=days, limit=limit,
             run_id=run_id, tier=tier, years=years,
         )
+    except Exception as exc:
+        # Died before its own try (the database could not be opened, the
+        # profile row read failed): the pre-created row stayed open and
+        # the interest read "scan running" for two hours.
+        _close_run_after_failure(settings, run_id, exc)
+        raise
     finally:
         lock.release()
+
+
+def _close_run_after_failure(settings, run_id: int | None, exc: BaseException) -> None:
+    """Close a job's pre-created run row with the error, on a fresh
+    connection, when the job failed outside the code that closes it
+    itself. Best effort: the failure being reported comes first."""
+    if run_id is None:
+        return
+    try:
+        conn = connect(settings.RADAR_DB_PATH)
+    except Exception:  # noqa: BLE001
+        log.exception("scheduler.run_close_failed", run_id=run_id)
+        return
+    try:
+        row = gather_runs_repo.get(conn, run_id)
+        if row is not None and row["finished_at"] is None:
+            gather_runs_repo.finish(conn, run_id, n_fetched=0, n_new=0, n_redup=0,
+                                    error=f"{type(exc).__name__}: {exc}")
+    except Exception:  # noqa: BLE001
+        log.exception("scheduler.run_close_failed", run_id=run_id)
+    finally:
+        conn.close()
 
 
 SCAN_BUSY = "Skipped: another scan of this interest was running."
@@ -600,6 +628,10 @@ def _refit_if_fit_stale(conn, user_id: int, profile_id: int, run_id: int | None,
         except wizard_service.ScanRunning:
             # Another run opened as this one closed; that scan refits at its start.
             log.info("scheduler.gather_refit_deferred", profile_id=profile_id, run_id=run_id, when=when)
+        except ValueError as exc:
+            # No embeddable seed: the scan goes on with the stored fit. A
+            # line, not a traceback -- a legacy fit says this every scan.
+            log.warning("scheduler.gather_refit_skipped", profile_id=profile_id, run_id=run_id, when=when, error=str(exc))
     except Exception:  # noqa: BLE001
         log.exception("scheduler.gather_refit_stale_fit_failed", profile_id=profile_id, run_id=run_id, when=when)
 
@@ -607,7 +639,9 @@ def _refit_if_fit_stale(conn, user_id: int, profile_id: int, run_id: int | None,
 def _legacy_fit_is_stale(row, n_seeds_now: int) -> bool:
     """A fit from before the seed ids were recorded: the one thing it tells
     about its seeds is how many it embedded (``seed_matrix``). Different
-    count -> stale; no matrix -> nothing to compare, assume current."""
+    count -> stale; no matrix (a CLI-written centroid, the full-text
+    selector, a plugin) -> nothing to compare, so refit once: that records
+    the seed ids and the exact comparison applies from then on."""
     sel_json = row["selector_config_json"]
     if not sel_json:
         return False
@@ -616,7 +650,7 @@ def _legacy_fit_is_stale(row, n_seeds_now: int) -> bool:
     except (ValueError, TypeError):
         return False
     matrix = cfg.get("seed_matrix") if isinstance(cfg, dict) else None
-    return isinstance(matrix, list) and len(matrix) != n_seeds_now
+    return not isinstance(matrix, list) or len(matrix) != n_seeds_now
 
 
 def _gather_for_profile_locked(
@@ -903,7 +937,11 @@ def dry_run_for_draft(
     from ..api.services.wizard import compute_dry_run_for_profile
     from ..db.repos import profiles as profiles_repo
 
-    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        conn = connect(settings.RADAR_DB_PATH)
+    except Exception as exc:
+        _close_run_after_failure(settings, run_id, exc)
+        raise
     try:
         profile_row = profiles_repo.get(conn, profile_id)
         if profile_row is None:
@@ -991,7 +1029,11 @@ def import_prosopia_profile(
 
     from ..api.services.prosopia import run_import
 
-    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        conn = connect(settings.RADAR_DB_PATH)
+    except Exception as exc:
+        _close_run_after_failure(settings, run_id, exc)
+        raise
     try:
         # The kick-off route opened the row under the tier that says where
         # the seeds come from (prosopia_import / orcid_import); keep it.
@@ -1064,7 +1106,38 @@ def _backfill_import_umls(conn, settings, plan) -> None:
 
 
 # Interests whose seeds ``extract_seed_umls_job`` is working through.
-SEED_UMLS_RUNNING: set[int] = set()
+class _RunningFlags:
+    """Interests whose seed-UMLS extraction is running, in memory (the
+    extraction has no run row). An entry outlives its job only when the
+    job never ran (APScheduler dropped it) or died outside its own
+    ``finally``; such an entry expires, so step 3 is not stuck on "running"
+    until the next restart."""
+
+    MAX_MINUTES = 30
+
+    def __init__(self) -> None:
+        self._since: dict[int, float] = {}
+
+    def add(self, profile_id: int) -> None:
+        self._since[int(profile_id)] = time.monotonic()
+
+    def discard(self, profile_id: int) -> None:
+        self._since.pop(int(profile_id), None)
+
+    def clear(self) -> None:
+        self._since.clear()
+
+    def __contains__(self, profile_id: object) -> bool:
+        since = self._since.get(int(profile_id)) if isinstance(profile_id, int) else None
+        if since is None:
+            return False
+        if time.monotonic() - since > self.MAX_MINUTES * 60:
+            self._since.pop(int(profile_id), None)
+            return False
+        return True
+
+
+SEED_UMLS_RUNNING = _RunningFlags()
 
 
 def extract_seed_umls_job(profile_id: int, settings: Any | None = None) -> int:
@@ -1081,16 +1154,20 @@ def extract_seed_umls_job(profile_id: int, settings: Any | None = None) -> int:
         settings = get_settings()
     from ..api.services.vault import backfill_seed_umls
 
-    SEED_UMLS_RUNNING.add(profile_id)
-    conn = connect(settings.RADAR_DB_PATH)
+    conn = None
     try:
+        # Inside the try: a failure to open the database used to leave the
+        # flag set, and step 3 waited on it until the next restart.
+        SEED_UMLS_RUNNING.add(profile_id)
+        conn = connect(settings.RADAR_DB_PATH)
         ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
         return backfill_seed_umls(conn, settings, openalex_ids=ids, limit=max(1, len(ids)))
     except Exception:  # noqa: BLE001 -- the seeds stay pending; the sweep retries
         log.exception("scheduler.seed_umls_failed", profile_id=profile_id)
         return 0
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
         SEED_UMLS_RUNNING.discard(profile_id)
 
 

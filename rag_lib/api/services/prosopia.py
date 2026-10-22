@@ -250,10 +250,14 @@ def open_draft(
     A new draft is linked to the researcher. An existing one keeps its
     name and, if it was built from someone already, stays theirs -- so a
     second researcher's papers can join the first's (the wizard's "add
-    papers from an ORCID / Prosopia profile" once a draft exists).
+    papers from an ORCID / Prosopia profile" once a draft exists). A draft
+    that already has seeds of its own (uploaded PDFs) is not linked
+    either: it was not built from this person, and the link made the
+    wizard, the drafts list and the interest page say it was ("4 papers
+    from the profile of X" over two PDFs and two of X's papers).
     """
     if target is not None:
-        if target["researcher_id"] is None and researcher_id is not None:
+        if target["researcher_id"] is None and researcher_id is not None and not _has_seeds(conn, int(target["id"])):
             researchers_repo.set_profile_researcher(conn, int(target["id"]), researcher_id)
         return target
     draft = wizard_service.create_draft(
@@ -268,6 +272,12 @@ def open_draft(
         raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
     researchers_repo.set_profile_researcher(conn, int(draft_row["id"]), researcher_id)
     return draft_row
+
+
+def _has_seeds(conn: sqlite3.Connection, profile_id: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM profile_seeds WHERE profile_id = ? LIMIT 1", (profile_id,)
+    ).fetchone() is not None
 
 
 def prepare_import(

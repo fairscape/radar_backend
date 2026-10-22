@@ -32,10 +32,16 @@ def build_scheduler(settings):
     """
     # Imported here so a missing apscheduler install doesn't break module
     # import for callers that only need ``gather_for_profile``.
+    from apscheduler.executors.pool import ThreadPoolExecutor
     from apscheduler.schedulers.background import BackgroundScheduler
 
     scheduler = BackgroundScheduler(
         timezone="UTC",
+        # The default pool is 10 threads. Scans, backfills, trial scans,
+        # imports, seed-UMLS extractions and rerank refreshes share it; a
+        # job queued behind ten long ones sat with its row open and no
+        # heartbeat until it counted as stale.
+        executors={"default": ThreadPoolExecutor(max_workers=24)},
         job_defaults={
             "coalesce": True,           # collapse missed firings into one
             "max_instances": 1,         # one run per job at a time

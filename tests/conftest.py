@@ -73,3 +73,29 @@ def _no_orcid_registry(request, monkeypatch):
 def live_orcid_registry():
     """Opt back in to the real pub.orcid.org. Marks the test as networked."""
     return True
+
+
+@pytest.fixture(autouse=True)
+def _no_chroma(request, monkeypatch):
+    """Keep Chroma out of the API tests unless a test asks for it.
+
+    An upload (``vault.upload``) and a chat open the user's Chroma
+    collection to count or store chunks. Late in a full run -- after a few
+    hundred tests have each opened their own ``PersistentClient`` -- the
+    rust binding's ``start`` stopped returning: the process sat idle for
+    hours instead of failing (twice, in different tests, 2026-10-21). No
+    test here checks the chunks a real collection holds: ``test_api_vault``
+    asserts 0 and ``test_api_chat`` stubs the collection itself. A test
+    that wants the real thing names ``live_chroma`` in its fixtures.
+    """
+    if "live_chroma" in request.fixturenames:
+        return
+    import rag_lib.rag.indexer as rag_indexer
+    monkeypatch.setattr(rag_indexer, "index_user_collection", lambda *a, **k: None)
+    monkeypatch.setattr(rag_indexer, "index_user_chat_collection", lambda *a, **k: None)
+
+
+@pytest.fixture
+def live_chroma():
+    """Opt out of ``_no_chroma``: the test opens a real collection."""
+    return True

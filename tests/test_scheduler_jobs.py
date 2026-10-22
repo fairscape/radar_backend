@@ -935,6 +935,9 @@ def test_a_scan_that_overlapped_a_seed_change_rescores_against_the_new_seeds(
                 c.close()
             return super().fetch(profile, since=since, limit=limit)
 
+    conn = connect(db_path)   # the fit records its seeds (round 12); W1 alone here
+    conn.execute("UPDATE profiles SET selector_config_json = json_set(selector_config_json, '$.fit_seed_ids', json('[\"W1\"]')) WHERE id = ?", (profile_id,))
+    conn.commit(); conn.close()
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: RefitMidway([_candidate_paper("W800")]))
     monkeypatch.setattr(rescore, "rescore_candidates", lambda conn, pid: calls.append(pid) or {})
     scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)

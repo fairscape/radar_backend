@@ -24,7 +24,9 @@ from rag_lib.db.repos import feedback as feedback_repo
 
 # Actions logged to JSONL + DB. ``shown`` is intentionally absent —
 # captured by ``profile_candidates.shown_at``.
-ALLOWED_ACTIONS = frozenset({"saved", "dismissed", "snoozed"})
+# ``unsaved`` / ``undismissed``: the undo of the two; without them the
+# activity log kept a SAVED line for a paper the user had un-saved.
+ALLOWED_ACTIONS = frozenset({"saved", "dismissed", "snoozed", "unsaved", "undismissed"})
 
 
 @dataclass(frozen=True)
@@ -156,23 +158,27 @@ def tail_jsonl(path: Path | str, n: int = 20) -> list[str]:
 
 
 def format_event_line(row: sqlite3.Row | dict) -> str:
-    """Render a feedback_events row as the UI's plain-string log line.
+    """Render a feedback_events row as the UI's plain-string log line:
 
-    Mirrors the mock-api shape:
-        ``2026-04-16T07:00:12Z  SAVE     centroid  10.x/...  score=0.912``
+        ``2026-04-16T07:00  SAVED  <title>  score=0.912``
 
-    Falls back to the openalex id when DOI is missing.
+    The time to the minute, the action, the paper's title (its DOI, or
+    its OpenAlex id, when no title is stored) and the score the selector
+    gave it. The selector's name and the full timestamp were debug output
+    on the interest's Overview.
     """
     get = row.__getitem__ if isinstance(row, sqlite3.Row) else row.get
-    ts = get("ts") or ""
+
+    def _opt(key: str):
+        try:
+            return get(key)
+        except (KeyError, IndexError):
+            return None
+
+    ts = str(get("ts") or "")[:16]
     action = (get("action") or "").upper()
-    selector = get("selector") or "?"
-    doi = None
-    try:
-        doi = get("doi")
-    except (KeyError, IndexError):
-        doi = None
-    ident = doi or get("openalex_id") or "?"
+    title = " ".join(str(_opt("title") or "").split())
+    ident = title or _opt("doi") or get("openalex_id") or "?"
     score = get("score")
     score_str = f"score={score:.3f}" if isinstance(score, (int, float)) else "score=NA"
-    return f"{ts}  {action:<8} {selector}  {ident}  {score_str}"
+    return f"{ts}  {action}  {ident}  {score_str}"

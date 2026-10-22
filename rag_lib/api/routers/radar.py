@@ -124,9 +124,12 @@ def save_card(
         )
     res, changed = out
     # Only a real transition is feedback: re-saving a saved card is not a
-    # second vote for it.
+    # second vote for it. The undo is logged too, so the activity log
+    # agrees with the counts.
     if changed and res.state == "saved":
         _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile or res.profile)
+    elif changed and res.state is None:
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "unsaved", body.profile or res.profile)
     return res
 
 
@@ -144,8 +147,10 @@ def dismiss_card(
             detail="card not found for current user",
         )
     res, changed = out
-    # Only a real transition is feedback: re-saving a saved card is not a
-    # second vote for it.
+    # Only a real transition is feedback: re-dismissing a dismissed card is
+    # not a second vote against it. The undo is logged too.
     if changed and res.state == "dismissed":
         _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile or res.profile)
+    elif changed and res.state is None:
+        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "undismissed", body.profile or res.profile)
     return res
