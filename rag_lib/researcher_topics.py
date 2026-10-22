@@ -35,13 +35,17 @@ ADOPTED = "adopted"          # topic_filters key: the profile's topics are appli
 # the profile is removed again.
 BEFORE = "on_before_profile"
 
-_TOPIC_ID = re.compile(r"^(?:https://openalex\.org/)?(T\d+)$", re.IGNORECASE)
+_TOPIC_ID = re.compile(r"^(?:https?://(?:api\.)?openalex\.org/(?:topics/)?)?(T\d+)$", re.IGNORECASE)
 
 
 def _topic_id(concept: dict) -> str | None:
-    raw = concept.get("@id") or concept.get("id") or concept.get("code") or ""
-    m = _TOPIC_ID.match(str(raw).strip())
-    return f"https://openalex.org/{m.group(1).upper()}" if m else None
+    # Each identifier in turn: an "@id" in another spelling of the URL
+    # hid a valid "code" and dropped the topic.
+    for key in ("@id", "id", "code"):
+        m = _TOPIC_ID.match(str(concept.get(key) or "").strip())
+        if m:
+            return f"https://openalex.org/{m.group(1).upper()}"
+    return None
 
 
 def _code(topic_id: Any) -> str:
@@ -66,11 +70,15 @@ def _weight(entry: dict) -> float | None:
 
 
 def _strings(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        value = value.get("top")
     if not isinstance(value, list):
         return []
     out: list[str] = []
     seen: set[str] = set()
     for v in value:
+        if isinstance(v, dict):
+            v = v.get("label")
         if isinstance(v, str) and v.strip() and v.strip().lower() not in seen:
             seen.add(v.strip().lower())
             out.append(v.strip())

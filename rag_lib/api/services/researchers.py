@@ -602,12 +602,20 @@ def attach_seeds(
     attached = 0
     rejected: list[str] = []
     accepted: list[str] = []
-    for openalex_id in wanted:
-        if openalex_id in owned:
-            attached += profiles_repo.attach_seed(conn, int(row["id"]), openalex_id)
-            accepted.append(openalex_id)
-        else:
-            rejected.append(openalex_id)
+    try:
+        for openalex_id in wanted:
+            if openalex_id in owned:
+                attached += profiles_repo.attach_seed(conn, int(row["id"]), openalex_id)
+                accepted.append(openalex_id)
+            else:
+                rejected.append(openalex_id)
+    except sqlite3.IntegrityError as exc:
+        # Deleted in another tab since it was read: the seed row's foreign
+        # key fails (OR IGNORE does not cover that). A 404, not a 500.
+        conn.rollback()
+        if profiles_repo.get_by_slug(conn, user_id, slug) is not None:
+            raise
+        raise LookupError(f"interest '{slug}' not found for current user") from exc
     if accepted:
         # Over every accepted id, not just the newly attached ones: the
         # seed row commits before this runs, so if embedding or the refit

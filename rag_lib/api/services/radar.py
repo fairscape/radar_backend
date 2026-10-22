@@ -173,9 +173,9 @@ def daily(
             seed_sim_min = None
         band = float(seed_sim_min) if seed_sim_min is not None and threshold is not None else None
 
-        def cards_for(triaged: bool) -> list[Card]:
+        def cards_for(triaged: bool, limit: int) -> list[Card]:
             rows = candidates_repo.top_for_profile(
-                conn, pid, limit=_DAILY_LIMIT, year_from=year_from, below=bucket == "low",
+                conn, pid, limit=limit, year_from=year_from, below=bucket == "low",
                 sim_at_least=band if bucket == "high" else None,
                 sim_below=band if bucket == "medium" else None,
                 triaged=triaged,
@@ -201,7 +201,9 @@ def daily(
         # Papers still to look at and papers already saved or dismissed are
         # shared out separately: the feed hides the second kind by default,
         # and when they shared one budget they crowded the first out.
-        per_profile.append((pid, cards_for(False), cards_for(True)))
+        # One row over the limit for the papers still to look at, so an
+        # interest past the cap alone still reports papers not shown.
+        per_profile.append((pid, cards_for(False, _DAILY_LIMIT + 1), cards_for(True, _DAILY_LIMIT)))
 
     cards: list[Card] = []
     n_unshown = 0

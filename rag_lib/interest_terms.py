@@ -115,6 +115,10 @@ def prosopia_terms(base_url: str, slug: str, *, timeout: float = 30.0) -> dict |
     def labels(v: Any) -> list[str]:
         if isinstance(v, dict):
             v = v.get("top") or []
+        if isinstance(v, str):
+            # Text, not a list: one label per line or comma, markdown bullets
+            # dropped. Walked as a list it gave one term per character.
+            v = [part.strip().lstrip("-*• ").strip() for part in re.split(r"[\n,;]+", v)]
         out = []
         for item in v or []:
             text = item.get("label") if isinstance(item, dict) else item
@@ -134,7 +138,8 @@ def prosopia_terms(base_url: str, slug: str, *, timeout: float = 30.0) -> dict |
     if isinstance(ri, list) and any(isinstance(e, dict) and isinstance(e.get("concept"), dict) for e in ri):
         view = researcher_topics.read(fields)
         interests = [t["display_name"] for t in view["wanted"]] + view["wanted_labels"]
-        not_interests = [t["display_name"] for t in view["unwanted"]] + view["unwanted_labels"]
+        not_interests = ([t["display_name"] for t in view["unwanted"]] + view["unwanted_labels"]
+                         + labels(fields.get("not_interests")))
     else:
         interests = labels(ri)
     terms = [{"label": t, "weight": None, "paper_ids": [], "kind": "research_interest"}
@@ -144,8 +149,13 @@ def prosopia_terms(base_url: str, slug: str, *, timeout: float = 30.0) -> dict |
     terms += [{"label": t, "weight": None, "paper_ids": [], "kind": "subfield"}
               for t in labels(fields.get("subfields"))]
     # Never query what the owner said they do not want.
-    unwanted = {n.lower() for n in not_interests}
-    terms = [t for t in terms if t["label"].lower() not in unwanted]
+    # Compared as labels() spells them: "wet-lab-x" in not_interests is the
+    # expertise "wet lab x".
+    def norm(text: str) -> str:
+        return " ".join(str(text).replace("-", " ").lower().split())
+
+    unwanted = {norm(n) for n in not_interests}
+    terms = [t for t in terms if norm(t["label"]) not in unwanted]
     if not terms:
         return None
     return {"terms": terms, "not_interests": not_interests}

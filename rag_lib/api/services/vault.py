@@ -512,6 +512,11 @@ def _attach_to_profile(
             # happen is the refit (a scan is running, or nothing embeds).
             # That was a 500 for an upload that had succeeded.
             log.warning("vault.upload.refit_skipped", profile=profile_slug, reason=str(exc)[:160])
+        except LookupError as exc:
+            # Deleted between the attach and the refit.
+            if profiles_repo.get_by_slug(conn, user_id, profile_slug) is not None:
+                raise
+            raise gone from exc
 
 
 def _embed_if_missing(conn: sqlite3.Connection, row: sqlite3.Row, settings: Any) -> None:
