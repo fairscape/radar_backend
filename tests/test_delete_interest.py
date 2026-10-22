@@ -78,10 +78,10 @@ def test_delete_waits_for_a_running_scan(app, env):
         assert _request(app, "DELETE", f"/api/profiles/{slug}").status_code == 409
     finally:
         lock.release()
+    # Seed UMLS extraction (paper-level data only) does not block it.
     jobs.SEED_UMLS_RUNNING.add(pid)
     try:
-        assert _request(app, "DELETE", f"/api/profiles/{slug}").status_code == 409
+        _ok(_request(app, "DELETE", f"/api/profiles/{slug}"))
     finally:
         jobs.SEED_UMLS_RUNNING.discard(pid)
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}"))
     assert pid not in jobs._scan_locks

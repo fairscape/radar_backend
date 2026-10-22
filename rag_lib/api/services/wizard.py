@@ -684,7 +684,7 @@ def set_researcher_topics(
         out = _set_researcher_topics_once(conn, row, profile_id, enabled=enabled, raw=raw)
         if out is not None:
             return out
-    raise RuntimeError("the topic list kept changing while the profile's topics were applied; try again")
+    raise TopicsChanging(profile_id)
 
 
 def _set_researcher_topics_once(

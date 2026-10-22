@@ -1282,6 +1282,18 @@ def _refuse_if_scanning(db: sqlite3.Connection, profile_id: int) -> None:
         )
 
 
+def _open_scan_run(db: sqlite3.Connection, key: str, **kwargs) -> int:
+    """``gather_runs.start`` for a scan; 404 when the interest was deleted
+    since it was looked up (the insert's foreign key fails: it was a 500)."""
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    try:
+        return gather_runs_repo.start(db, **kwargs)
+    except sqlite3.IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'") from exc
+
+
 @router.post("/{key}/gather-now", response_model=GatherNowResponse)
 def gather_now(
     key: str,
@@ -1312,8 +1324,8 @@ def gather_now(
     _refuse_if_scanning(db, profile_id)
     # Open the audit row eagerly so we can echo a real run_id; the
     # background job reuses it via the ``run_id`` kwarg.
-    run_id = gather_runs_repo.start(
-        db,
+    run_id = _open_scan_run(
+        db, key,
         profile_id=profile_id,
         user_id=int(user["id"]),
         tier_used="manual",
@@ -1362,8 +1374,8 @@ def backfill(
     profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
     start, _end = years_rules.fetch_span(body.year_from, body.year_to)
-    run_id = gather_runs_repo.start(
-        db, profile_id=profile_id, user_id=int(user["id"]),
+    run_id = _open_scan_run(
+        db, key, profile_id=profile_id, user_id=int(user["id"]),
         since_date=f"{start}-01-01", tier_used="backfill",
     )
     _schedule_run(

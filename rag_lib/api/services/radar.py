@@ -204,10 +204,12 @@ def daily(
         per_profile.append((pid, cards_for(False), cards_for(True)))
 
     cards: list[Card] = []
+    n_unshown = 0
     fresh_shares = fair_shares([len(f) for _, f, _ in per_profile], _DAILY_LIMIT)
     done_shares = fair_shares([len(d) for _, _, d in per_profile], _DAILY_LIMIT)
     for (pid, fresh, done), n_fresh, n_done in zip(per_profile, fresh_shares, done_shares):
         kept = fresh[:n_fresh]
+        n_unshown += len(fresh) - len(kept)
         cards.extend(kept)
         for card in done[:n_done]:
             cards.append(card)
@@ -236,6 +238,10 @@ def daily(
         candidatesScored=scored,
         cards=cards,
         states=states,
+        # Papers to review left out by the shared cap (at least: each
+        # interest is read up to the cap). Without it "All interests" showed
+        # ~13 papers of each interest and nothing said there were more.
+        untriagedNotShown=n_unshown,
     )
 
 

@@ -228,9 +228,10 @@ def delete_profile(conn: sqlite3.Connection, user_id: int, slug: str) -> int | N
     if not lock.acquire(blocking=False):
         raise ProfileBusy(slug)
     try:
+        # Seed UMLS extraction is no reason to wait: it writes only
+        # paper-level concepts, and finishes harmlessly after the delete.
         if (gather_runs_repo.running_scan(conn, profile_id) is not None
-                or gather_runs_repo.has_unfinished_import(conn, profile_id)
-                or profile_id in jobs.SEED_UMLS_RUNNING):
+                or gather_runs_repo.has_unfinished_import(conn, profile_id)):
             raise ProfileBusy(slug)
         profiles_repo.delete(conn, profile_id)
     finally:

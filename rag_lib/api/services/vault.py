@@ -157,6 +157,7 @@ def upload(
 
     file_hash = compute_file_hash(data)
 
+    target_id: int | None = None
     if profile_slug:
         target = profiles_repo.get_by_slug(conn, user_id, profile_slug)
         if target is None:
@@ -165,6 +166,7 @@ def upload(
             # upload used to land in the vault with a 200 and no seed, and
             # nothing said so.
             raise UploadRejected(f"no interest '{profile_slug}' to add the paper to", status_code=404)
+        target_id = int(target["id"])
         if gather_runs_repo.has_unfinished_import(conn, int(target["id"])):
             # The Vault's "upload to <draft>" while that draft's import runs:
             # the wizard holds its own buttons, this path had no guard.
@@ -181,7 +183,7 @@ def upload(
         # -- a seed silently missing from the fit. A retry finishes the job.
         _embed_if_missing(conn, existing, settings)
         if profile_slug:
-            _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"])
+            _attach_to_profile(conn, user_id, profile_slug, existing["openalex_id"], target_id)
         log.info(
             "vault.upload.dedup_hit",
             openalex_id=existing["openalex_id"],
@@ -274,7 +276,7 @@ def upload(
     log.info("vault.upload.embed", model=embedding_model, elapsed_ms=round((_time.monotonic() - t3) * 1000, 1))
 
     if profile_slug:
-        _attach_to_profile(conn, user_id, profile_slug, openalex_id)
+        _attach_to_profile(conn, user_id, profile_slug, openalex_id, target_id)
 
     # UMLS extraction is not started here. It used to run on a daemon
     # thread so the upload could return early, and the cost of that was
@@ -467,19 +469,33 @@ def _chunk_count_for_paper(
 
 
 def _attach_to_profile(
-    conn: sqlite3.Connection, user_id: int, profile_slug: str, openalex_id: str
+    conn: sqlite3.Connection, user_id: int, profile_slug: str, openalex_id: str,
+    profile_id: int | None = None,
 ) -> None:
-    """Idempotent profile_seeds upsert; no-ops if the slug is unknown
-    (``upload`` has already answered 404 for one).
+    """Idempotent profile_seeds upsert onto the interest ``upload`` checked
+    at its start (``profile_id``).
+
+    Raises ``UploadRejected`` (404) when that interest was deleted while the
+    paper was read and embedded: the upload answered 200 and no seed existed
+    anywhere -- or, the name re-used meanwhile, the seed went to the new one.
+    The paper itself is stored by then and stays in the vault.
 
     A live interest is re-fitted when this adds a seed, same as
     ``POST /{key}/seeds``: the Seeds tab's PDF drop zone lands here, and
     without it an uploaded seed was listed but never scored against.
     """
+    gone = UploadRejected(
+        f"'{profile_slug}' was deleted while the paper uploaded. The paper is in your vault, not a seed.",
+        status_code=404,
+    )
     profile = profiles_repo.get_by_slug(conn, user_id, profile_slug)
-    if profile is None:
-        return
-    profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id)
+    if profile is None or (profile_id is not None and int(profile["id"]) != profile_id):
+        raise gone
+    try:
+        profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id)
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise gone from exc
     from . import wizard as wizard_service
 
     # The upload embedded under the default model; a draft under another

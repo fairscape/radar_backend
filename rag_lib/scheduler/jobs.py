@@ -33,7 +33,7 @@ from ..gatherers.openalex import OpenAlexGatherer
 from ..openalex_tiers import enabled_topic_ids
 from ..paper import Paper
 from ..persistence.db_store import dedup_and_insert_candidates
-from ..scoring.pool import KEEP_ALL, passes, rescore_profile_pool
+from ..scoring.pool import KEEP_ALL, in_years, passes, rescore_profile_pool
 from ..profile import Profile
 from ..radar import _days_ago_iso
 from ..selector import Selector
@@ -757,8 +757,16 @@ def _gather_for_profile_locked(
             # stored but kept out of the feed (candidates.PASSES), and are
             # not reranked -- the cross-encoder costs per paper, and a scan
             # fetches ~5x more than passes.
-            ranked = [e for e in scored if passes(e[2].get("score_raw", e[0]), profile.threshold)]
-            below = [e for e in scored if not passes(e[2].get("score_raw", e[0]), profile.threshold)]
+            # Outside the interest's years counts as below too: the feed
+            # (candidates.IN_YEARS) never shows those, yet they were reranked
+            # and counted as the run's "new" ("5 new papers", feed unchanged).
+            yf, yt = profile_row["year_from"], profile_row["year_to"]
+
+            def _reaches_feed(e) -> bool:
+                return passes(e[2].get("score_raw", e[0]), profile.threshold) and in_years(e[1].year, yf, yt)
+
+            ranked = [e for e in scored if _reaches_feed(e)]
+            below = [e for e in scored if not _reaches_feed(e)]
             # --- Reranker stage ---
             reranker = _build_reranker(profile_row, settings)
             if reranker.name != "noop" and ranked:

@@ -122,15 +122,33 @@ def prosopia_terms(base_url: str, slug: str, *, timeout: float = 30.0) -> dict |
                 out.append(str(text).replace("-", " ").strip())
         return out
 
+    # The current API ("2026-09") lists research_interests as weighted
+    # concepts, a negative weight meaning "not this" -- the shape
+    # researcher_topics reads for the topic list. Read that way here too:
+    # labels() found no interests in it, and would have queried the
+    # unwanted ones had it found them.
+    from . import researcher_topics
+
+    ri = fields.get("research_interests")
+    not_interests = labels(fields.get("not_interests"))
+    if isinstance(ri, list) and any(isinstance(e, dict) and isinstance(e.get("concept"), dict) for e in ri):
+        view = researcher_topics.read(fields)
+        interests = [t["display_name"] for t in view["wanted"]] + view["wanted_labels"]
+        not_interests = [t["display_name"] for t in view["unwanted"]] + view["unwanted_labels"]
+    else:
+        interests = labels(ri)
     terms = [{"label": t, "weight": None, "paper_ids": [], "kind": "research_interest"}
-             for t in labels(fields.get("research_interests"))]
+             for t in interests]
     terms += [{"label": t, "weight": None, "paper_ids": [], "kind": "expertise"}
               for t in labels(fields.get("expertise"))]
     terms += [{"label": t, "weight": None, "paper_ids": [], "kind": "subfield"}
               for t in labels(fields.get("subfields"))]
+    # Never query what the owner said they do not want.
+    unwanted = {n.lower() for n in not_interests}
+    terms = [t for t in terms if t["label"].lower() not in unwanted]
     if not terms:
         return None
-    return {"terms": terms, "not_interests": labels(fields.get("not_interests"))}
+    return {"terms": terms, "not_interests": not_interests}
 
 
 # ---------------------------------------------------------------------------

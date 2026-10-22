@@ -427,8 +427,9 @@ def topic_yield_for_profile(
     recent window. Rows predating migration 0014 carry no attribution
     and are excluded.
     """
-    # What reached the feed: a topic is judged by papers above the threshold.
-    where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES, NOT_SEED]
+    # What reached the feed: a topic is judged by papers above the threshold
+    # and in the interest's years.
+    where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES, IN_YEARS, NOT_SEED]
     params: list = [profile_id]
     if since:
         where.append("pc.fetched_at >= ?")
@@ -445,6 +446,7 @@ def topic_yield_for_profile(
           MAX(pc.fetched_at)               AS last_fetched_at
         FROM profile_candidates pc
         JOIN profiles pr ON pr.id = pc.profile_id
+        JOIN papers p ON p.openalex_id = pc.openalex_id
         WHERE {' AND '.join(where)}
         GROUP BY pc.sourced_by_topic_id
         ORDER BY n_candidates DESC

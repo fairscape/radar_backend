@@ -249,6 +249,7 @@ class DailyRadarResponse(_Model):
     candidatesScored: int
     cards: list[Card]
     states: dict[str, CardState | None] = Field(default_factory=dict)
+    untriagedNotShown: int = 0
 
 
 class VaultStats(_Model):
