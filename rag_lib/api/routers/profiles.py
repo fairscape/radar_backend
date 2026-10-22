@@ -1226,12 +1226,13 @@ def dry_run_profile(
     if row is None:
         return DryRunResponse(ok=True, key=key, n=0, scores=[])
     profile_id = int(row["id"])
+    from rag_lib.api.mappers import floor4
     from rag_lib.api.schemas import DryRunPaper
 
     scores = candidates_repo.scores_for_profile(db, profile_id)
     papers = [
         DryRunPaper(id=r["openalex_id"], title=r["title"] or "", venue=r["venue"] or "",
-                    year=r["year"], score=round(float(r["s"]), 4))
+                    year=r["year"], score=floor4(r["s"]))
         for r in candidates_repo.scored_papers_for_profile(db, profile_id)
     ]
     from rag_lib import calibration

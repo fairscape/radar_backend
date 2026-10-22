@@ -255,6 +255,7 @@ class OpenAlexGatherer:
             )
             parts = tiers[0][1] if tiers else []
 
+        by_bare = {bare_id(t): t for t in topic_ids}
         chosen: list[Paper] = []
         seen = _Deduper()
         # OpenAlex allows a query that ORs more than WIDE_OR_TERMS topics
@@ -284,6 +285,15 @@ class OpenAlexGatherer:
                         if p.openalex_id and seen.take(p):
                             chosen.append(p)
                             n_new += 1
+                            # Credit the first enabled topic the work carries
+                            # (OpenAlex lists its topics best match first):
+                            # left unattributed, a backfilled interest's
+                            # topics all read "found 0".
+                            for t in w.get("topics") or []:
+                                tid = by_bare.get(bare_id(str((t or {}).get("id") or "")))
+                                if tid:
+                                    self.last_source_topics[p.openalex_id] = tid
+                                    break
                     log.info("openalex_gatherer.year_fetch", profile=profile.name,
                              year=year, n=len(works), new=n_new)
         finally:

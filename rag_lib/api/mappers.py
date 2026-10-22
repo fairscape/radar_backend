@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from typing import Any, Iterable
 
@@ -34,6 +35,17 @@ from .schemas import (
     SweepRow,
     Topic,
 )
+
+
+def floor4(x: float) -> float:
+    """``x`` to 4 places, rounded down.
+
+    Thresholds are compared with the unrounded score; rounded to nearest,
+    0.49997 under a 0.5 bar read 0.5 -- "at the bar" on a paper the feed
+    left out, and one more passing on the Threshold tab than in the feed.
+    Down never lifts a paper over a bar of 4 places or fewer.
+    """
+    return math.floor(float(x) * 10_000 + 1e-9) / 10_000
 
 
 def _col(row: sqlite3.Row | dict, name: str, default=None):
@@ -258,8 +270,8 @@ def candidate_row_to_card(
         doi=row["doi"],
         openalex=row["openalex_id"],
         profile=profile_slug,
-        score=round(score, 4),
-        similarity=round(similarity, 4) if similarity is not None else None,
+        score=floor4(score),
+        similarity=floor4(similarity) if similarity is not None else None,
         bucket=bucket_for_similarity(
             similarity,
             threshold=threshold,
@@ -273,7 +285,7 @@ def candidate_row_to_card(
         terms=terms,
         matched=matched,
         topicMatch=_topic_match_for(topics_payload, active_topic_ids),
-        centroidCos=round(similarity if similarity is not None else score, 4),
+        centroidCos=floor4(similarity if similarity is not None else score),
         noveltyDelta=0.0,
         mins=_read_minutes(abstract),
     )

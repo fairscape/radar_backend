@@ -153,6 +153,8 @@ def daily(
         profile_rows = profiles_repo.list_for_user(conn, user_id)
 
     states: dict[str, CardState | None] = {}
+    # Each card's own interest's threshold, for "closest to the bar" across interests.
+    bar_of: dict[int, float] = {}
     profile_ids: list[int] = []
     per_profile: list[tuple[int, list[Card], list[Card]]] = []
 
@@ -195,6 +197,8 @@ def daily(
                     "saved" if crow["saved_at"] else
                     "dismissed" if crow["dismissed_at"] else None
                 )
+                if threshold is not None:
+                    bar_of[id(card)] = float(threshold)
                 out.append(card)
             return out
 
@@ -207,11 +211,17 @@ def daily(
 
     cards: list[Card] = []
     n_unshown = 0
+    # By bucket, as far as the rows read show: the feed marks only those
+    # counts as "at least".
+    unshown_by_bucket: dict[str, int] = {}
     fresh_shares = fair_shares([len(f) for _, f, _ in per_profile], _DAILY_LIMIT)
     done_shares = fair_shares([len(d) for _, _, d in per_profile], _DAILY_LIMIT)
     for (pid, fresh, done), n_fresh, n_done in zip(per_profile, fresh_shares, done_shares):
         kept = fresh[:n_fresh]
         n_unshown += len(fresh) - len(kept)
+        for card in fresh[len(kept):]:
+            if card.bucket:
+                unshown_by_bucket[card.bucket] = unshown_by_bucket.get(card.bucket, 0) + 1
         cards.extend(kept)
         for card in done[:n_done]:
             cards.append(card)
@@ -226,7 +236,11 @@ def daily(
     # Below the bar, closest to it first: ``score`` there is a rank from the
     # paper's own scan, not its similarity to the seeds now.
     if bucket == "low":
-        cards.sort(key=lambda c: c.similarity if c.similarity is not None else -1.0, reverse=True)
+        # By the distance under the card's own interest's bar: across
+        # interests the raw similarity put a paper 0.10 under a 0.9 bar
+        # ahead of one 0.01 under a 0.5 bar.
+        cards.sort(key=lambda c: (c.similarity - bar_of.get(id(c), 0.0)) if c.similarity is not None else -9.0,
+                   reverse=True)
     else:
         cards.sort(key=lambda c: c.score, reverse=True)
 
@@ -244,6 +258,7 @@ def daily(
         # interest is read up to the cap). Without it "All interests" showed
         # ~13 papers of each interest and nothing said there were more.
         untriagedNotShown=n_unshown,
+        untriagedNotShownByBucket=unshown_by_bucket,
     )
 
 

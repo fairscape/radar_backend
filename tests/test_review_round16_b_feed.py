@@ -20,3 +20,20 @@ def test_one_interest_over_the_cap_says_nothing_is_hidden(app, env, monkeypatch)
         assert len(fresh) == 4
         # total - 4 untriaged papers are not in the list; the count says 0.
         assert view["untriagedNotShown"] >= total - 4, (view["untriagedNotShown"], total)
+
+
+def test_hidden_papers_are_counted_by_bucket(app, env, monkeypatch):
+    # The feed marks only the buckets with papers left out as "N+".
+    a, _ = _go_live(app, env, name="Buckets", threshold=0.0)
+    _scan(app, a)
+    full = [c for c in _feed(app, a)["cards"] if c.get("state") is None]
+    assert len(full) > 2
+    monkeypatch.setattr(radar_service, "_DAILY_LIMIT", 2)
+    view = _feed(app, a)
+    by = view["untriagedNotShownByBucket"]
+    assert view["untriagedNotShown"] > 0
+    assert sum(by.values()) == view["untriagedNotShown"], by
+    shown = {c["id"] for c in view["cards"]}
+    hidden = [c for c in full if c["id"] not in shown]
+    for b, n in by.items():
+        assert sum(1 for c in hidden if c["bucket"] == b) >= n, (b, by)

@@ -1180,7 +1180,9 @@ def commit_draft(
     selector = _new_selector_for_draft(row, profile, threshold=threshold)
     selector.fit(profile)
     sel_cfg = selector.config()
-    sel_cfg[FIT_SEEDS] = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    # The seeds the fit was built from, not a second read: a seed attached
+    # in between was listed as fitted, so no later scan refitted for it.
+    sel_cfg[FIT_SEEDS] = sorted(p.openalex_id for p in profile.papers if p.openalex_id)
     diag = sel_cfg.get("diagnostics_snapshot") or {}
 
     centroid_blob: bytes | None = None
@@ -1368,7 +1370,9 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str,
     selector = _new_selector_for_draft(row, profile, threshold=row["threshold"])
     selector.fit(profile)
     sel_cfg = selector.config()
-    sel_cfg[FIT_SEEDS] = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    # The seeds the fit was built from, not a second read: a seed attached
+    # in between was listed as fitted, so no later scan refitted for it.
+    sel_cfg[FIT_SEEDS] = sorted(p.openalex_id for p in profile.papers if p.openalex_id)
     diag = sel_cfg.get("diagnostics_snapshot") or {}
     centroid_list = sel_cfg.get("centroid")
     profiles_repo.update_fit(

@@ -330,14 +330,20 @@ def mark_shown_bulk(
 def count_saves_dismisses_30d(
     conn: sqlite3.Connection, profile_id: int
 ) -> tuple[int, int]:
-    """``(saves, dismisses)`` recorded in the trailing 30 days for a profile."""
+    """``(saves, dismisses)`` recorded in the trailing 30 days for a profile.
+
+    Over the papers the feed lists as saved or dismissed: a paper since
+    made a seed, or outside the year range, counted here and nowhere else.
+    """
     row = conn.execute(
-        """
+        f"""
         SELECT
-          SUM(CASE WHEN saved_at     >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS saves,
-          SUM(CASE WHEN dismissed_at >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS dismisses
-        FROM profile_candidates
-        WHERE profile_id = ?
+          SUM(CASE WHEN pc.saved_at     >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS saves,
+          SUM(CASE WHEN pc.dismissed_at >= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS dismisses
+        FROM profile_candidates pc
+        JOIN profiles pr ON pr.id = pc.profile_id
+        JOIN papers p ON p.openalex_id = pc.openalex_id
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
         """,
         (profile_id,),
     ).fetchone()

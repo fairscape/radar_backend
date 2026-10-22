@@ -250,6 +250,7 @@ class DailyRadarResponse(_Model):
     cards: list[Card]
     states: dict[str, CardState | None] = Field(default_factory=dict)
     untriagedNotShown: int = 0
+    untriagedNotShownByBucket: dict[str, int] = Field(default_factory=dict)
 
 
 class VaultStats(_Model):
