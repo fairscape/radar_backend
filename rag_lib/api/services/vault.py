@@ -740,7 +740,7 @@ def _verified_doi_match(record: Any, work: dict) -> bool:
 def _authors_from_work(work: dict) -> list[str]:
     out: list[str] = []
     for entry in (work.get("authorships") or []):
-        author = entry.get("author") or {}
+        author = (entry or {}).get("author") or {}
         name = author.get("display_name")
         if name:
             out.append(name)

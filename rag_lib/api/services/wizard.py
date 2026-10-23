@@ -1181,31 +1181,24 @@ def commit_draft(
         raise ValueError("switch on at least one topic: a scan searches by them")
     pruned = _prune_topic_filters(full_topics, set(selected_topic_ids))
 
-    profile = _load_profile(conn, row, topic_filters=pruned)
-    selector = _new_selector_for_draft(row, profile, threshold=threshold)
-    selector.fit(profile)
-    sel_cfg = selector.config()
-    # The seeds the fit was built from, not a second read: a seed attached
-    # in between was listed as fitted, so no later scan refitted for it.
-    sel_cfg[FIT_SEEDS] = sorted(p.openalex_id for p in profile.papers if p.openalex_id)
-    diag = sel_cfg.get("diagnostics_snapshot") or {}
-
-    centroid_blob: bytes | None = None
-    centroid_list = sel_cfg.get("centroid")
-    if centroid_list:
-        centroid_blob = encode_vector(centroid_list)
-
-    flipped = profiles_repo.commit_draft(
-        conn,
-        profile_id,
-        threshold=threshold,
-        topic_filters=pruned,
-        centroid=centroid_blob,
-        selector_config=sel_cfg,
-        coherence_median=diag.get("coherence_median"),
-        coherence_iqr=diag.get("coherence_iqr"),
-        coherence_bimodal=diag.get("coherence_bimodal"),
-        n_seed=len(profile.papers),
+    def write(profile, sel_cfg, diag, centroid_blob, band):
+        return profiles_repo.commit_draft(
+            conn,
+            profile_id,
+            threshold=threshold,
+            topic_filters=pruned,
+            centroid=centroid_blob,
+            selector_config=sel_cfg,
+            coherence_median=diag.get("coherence_median"),
+            coherence_iqr=diag.get("coherence_iqr"),
+            coherence_bimodal=diag.get("coherence_bimodal"),
+            fit_seeds=sel_cfg[FIT_SEEDS],
+            band=band,
+        )
+    flipped, _profile = _fit_and_write(
+        conn, lambda: _require_draft(conn, user_id, slug),
+        lambda r, prof: _new_selector_for_draft(r, prof, threshold=threshold),
+        write, topic_filters=pruned,
     )
     if not flipped:
         # Discarded in another tab while fitting, or committed there first.
@@ -1213,13 +1206,6 @@ def commit_draft(
         if now is None or int(now["id"]) != profile_id or now["is_draft"]:
             raise LookupError(f"draft '{slug}' not found")
         return {"slug": slug, "id": profile_id}
-    try:
-        band = calibration.seed_similarity_band(
-            profile.seed_embeddings(profile.embedding_model)
-        )
-    except ValueError:
-        band = None
-    profiles_repo.update_seed_similarity(conn, profile_id, band)
     try:
         schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
     except sqlite3.IntegrityError:
@@ -1323,6 +1309,47 @@ def embed_missing(
     return n
 
 
+class SeedsChanging(RuntimeError):
+    """Seeds were added or removed in another tab under every fit tried."""
+
+
+def _fit_and_write(conn, reread, new_selector, write, *, topic_filters):
+    """Fit the profile on its seeds and ``write`` the result, which
+    raises ``profiles_repo.SeedsChanged`` when the seeds moved meanwhile:
+    then fit again on the new ones, up to three times.
+
+    ``reread()`` returns the profile row (and raises if it is gone);
+    ``topic_filters`` None means the stored ones. Returns ``write``'s result
+    and the profile fitted.
+    """
+    for _ in range(3):
+        row = reread()
+        profile_id = int(row["id"])
+        tf = topic_filters if topic_filters is not None else profiles_repo.topic_filters(conn, profile_id)
+        profile = _load_profile(conn, row, topic_filters=tf)
+        selector = new_selector(row, profile)
+        selector.fit(profile)
+        sel_cfg = selector.config()
+        # The seeds the fit was built from, not a second read: a seed
+        # attached in between was listed as fitted, so no later scan
+        # refitted for it.
+        sel_cfg[FIT_SEEDS] = sorted(p.openalex_id for p in profile.papers if p.openalex_id)
+        diag = sel_cfg.get("diagnostics_snapshot") or {}
+        centroid_list = sel_cfg.get("centroid")
+        try:
+            band = calibration.seed_similarity_band(
+                profile.seed_embeddings(profile.embedding_model)
+            )
+        except ValueError:
+            band = None
+        try:
+            return write(profile, sel_cfg, diag,
+                         encode_vector(centroid_list) if centroid_list else None, band), profile
+        except profiles_repo.SeedsChanged:
+            log.info("wizard.refit_after_seed_change", profile_id=profile_id)
+    raise SeedsChanging(profile_id)
+
+
 class ScanRunning(RuntimeError):
     """A scan of the interest is still running; a refit now would score part
     of the pool against one centroid and part against another."""
@@ -1378,38 +1405,33 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str,
     running = gather_runs_repo.running_scan(conn, profile_id)
     if running is not None and (own_run_id is None or int(running["id"]) != int(own_run_id)):
         raise ScanRunning(f"a scan of '{slug}' is still running; refit when it has finished")
-    embed_missing(conn, row["embedding_model"],
-                  profiles_repo.list_seed_openalex_ids(conn, profile_id))
-    profile = _load_profile(conn, row,
-                            topic_filters=profiles_repo.topic_filters(conn, profile_id))
-    embedded = [p for p in profile.papers if profile.embedding_model in p.embeddings]
-    if not embedded:
-        raise ValueError(f"'{slug}' has no embedded seed papers to fit")
-    selector = _new_selector_for_draft(row, profile, threshold=row["threshold"])
-    selector.fit(profile)
-    sel_cfg = selector.config()
-    # The seeds the fit was built from, not a second read: a seed attached
-    # in between was listed as fitted, so no later scan refitted for it.
-    sel_cfg[FIT_SEEDS] = sorted(p.openalex_id for p in profile.papers if p.openalex_id)
-    diag = sel_cfg.get("diagnostics_snapshot") or {}
-    centroid_list = sel_cfg.get("centroid")
-    profiles_repo.update_fit(
-        conn,
-        profile_id,
-        centroid=encode_vector(centroid_list) if centroid_list else None,
-        selector_config=sel_cfg,
-        coherence_median=diag.get("coherence_median"),
-        coherence_iqr=diag.get("coherence_iqr"),
-        coherence_bimodal=diag.get("coherence_bimodal"),
-        n_seed=len(profile.papers),
-    )
-    try:
-        band = calibration.seed_similarity_band(
-            profile.seed_embeddings(profile.embedding_model)
+    def reread():
+        r = profiles_repo.get_by_slug(conn, user_id, slug)
+        if r is None or int(r["id"]) != profile_id:
+            raise LookupError(f"profile '{slug}' not found for current user")
+        embed_missing(conn, r["embedding_model"],
+                      profiles_repo.list_seed_openalex_ids(conn, profile_id))
+        return r
+
+    def selector_for(r, profile):
+        if not any(profile.embedding_model in p.embeddings for p in profile.papers):
+            raise ValueError(f"'{slug}' has no embedded seed papers to fit")
+        return _new_selector_for_draft(r, profile, threshold=r["threshold"])
+
+    def write(profile, sel_cfg, diag, centroid_blob, band):
+        return profiles_repo.update_fit(
+            conn,
+            profile_id,
+            centroid=centroid_blob,
+            selector_config=sel_cfg,
+            coherence_median=diag.get("coherence_median"),
+            coherence_iqr=diag.get("coherence_iqr"),
+            coherence_bimodal=diag.get("coherence_bimodal"),
+            fit_seeds=sel_cfg[FIT_SEEDS],
+            band=band,
         )
-    except ValueError:
-        band = None
-    profiles_repo.update_seed_similarity(conn, profile_id, band)
+    _n, profile = _fit_and_write(conn, reread, selector_for, write, topic_filters=None)
+    embedded = [p for p in profile.papers if profile.embedding_model in p.embeddings]
     # The stored candidates were scored against the old seeds; without this
     # a new seed changed nothing in the feed until the next morning's scan.
     from rag_lib.scoring.rescore import rescore_candidates

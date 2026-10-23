@@ -337,7 +337,7 @@ class OpenAlexClient:
         """Convert a raw OpenAlex work dict into a Paper record."""
         slim = self.slim_work(work) or {}
         primary_topic = _topic_from_slim(slim.get("primary_topic")) if slim.get("primary_topic") else None
-        topics = [_topic_from_slim(t) for t in (slim.get("topics") or [])]
+        topics = [_topic_from_slim(t) for t in (slim.get("topics") or []) if isinstance(t, dict)]
         abstract = self.reconstruct_abstract(slim.get("abstract_inverted_index"))
         # OpenAlex DOIs come back as full URLs ("https://doi.org/10.x/y").
         # Strip to the bare DOI for consistency with user-provided DOIs.
@@ -364,9 +364,9 @@ class OpenAlexClient:
             oa_status=slim.get("oa_status"),
             # Straight from the raw work: slim_work does not carry them.
             authors=[
-                (a.get("author") or {}).get("display_name")
+                ((a or {}).get("author") or {}).get("display_name")
                 for a in (work.get("authorships") or [])
-                if (a.get("author") or {}).get("display_name")
+                if ((a or {}).get("author") or {}).get("display_name")
             ],
             publication_date=work.get("publication_date"),
         )

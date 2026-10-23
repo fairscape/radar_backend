@@ -191,6 +191,15 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={
             "detail": "the interest's topics changed while the list was being rebuilt; try again"})
 
+    from .services.wizard import SeedsChanging
+
+    @app.exception_handler(SeedsChanging)
+    async def _seeds_changing(request: Request, exc: SeedsChanging):
+        # Seeds were added or removed in another tab under three fits in a
+        # row; none was written (each would undo a change). Try again.
+        return JSONResponse(status_code=409, content={
+            "detail": "the interest's seeds changed while it was being fitted; try again"})
+
     @app.exception_handler(OverflowError)
     async def _overflow(request: Request, exc: OverflowError):
         # An id past SQLite's 64-bit integers (2**63 and up) cannot name a

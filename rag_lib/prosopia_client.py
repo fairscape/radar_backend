@@ -140,23 +140,33 @@ class PagedApiStorage(ApiArtifactStorage):
         return value if isinstance(value, str) else ""
 
     def load_papers(self) -> list[PaperRecord]:
-        return [
-            PaperRecord.model_validate(
-                {
-                    "paper_id": e.get("paper_id"),
-                    "title": e.get("title", ""),
-                    "year": e.get("year"),
-                    "journal": e.get("journal"),
-                    "first_author": e.get("first_author"),
-                    "authors": e.get("authors"),
-                    "doi": e.get("doi"),
-                    "pmid": e.get("pmid"),
-                    "openalex_id": e.get("openalex_id"),
-                    "full_text_link": e.get("full_text_link"),
-                }
-            )
-            for e in self._paper_entries()
-        ]
+        # One work at a time: a single malformed entry (a null title, a null
+        # in its authors) failed the whole profile with a 502. It is skipped.
+        out: list[PaperRecord] = []
+        for e in self._paper_entries():
+            if not isinstance(e, dict):
+                continue
+            authors = e.get("authors")
+            if isinstance(authors, list):
+                authors = [a for a in authors if isinstance(a, str) and a.strip()]
+            try:
+                out.append(PaperRecord.model_validate(
+                    {
+                        "paper_id": e.get("paper_id"),
+                        "title": e.get("title") or "",
+                        "year": e.get("year"),
+                        "journal": e.get("journal"),
+                        "first_author": e.get("first_author"),
+                        "authors": authors,
+                        "doi": e.get("doi"),
+                        "pmid": e.get("pmid"),
+                        "openalex_id": e.get("openalex_id"),
+                        "full_text_link": e.get("full_text_link"),
+                    }
+                ))
+            except ValueError as exc:  # pydantic's ValidationError is one
+                log.warning("prosopia.paper_skipped", paper_id=e.get("paper_id"), error=str(exc)[:200])
+        return out
 
     def _fetch_summary(self, paper_id: str) -> str:
         data = self._request("GET", self._api_path("summaries"), params={"ids": paper_id})

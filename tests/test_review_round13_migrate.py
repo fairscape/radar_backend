@@ -105,7 +105,7 @@ def test_0021_to_head_keeps_every_row_and_adds_the_new_rules(db_at_0020):
         profiles_before = [tuple(r) for r in conn.execute("SELECT * FROM profiles ORDER BY id")]
 
         applied = apply_migrations(conn)
-        assert applied == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid"]
+        assert applied == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates"]
 
         assert _counts(conn) == before
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

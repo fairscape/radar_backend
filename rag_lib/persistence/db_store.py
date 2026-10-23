@@ -262,6 +262,17 @@ def dedup_and_insert_candidates(
     # ``_COMMIT_EVERY`` rows bounds both the fsync count and the lock hold.
     batch = _BatchConn(conn)
 
+    # The same paper already stored under another id (an earlier scan
+    # brought the other copy): by DOI or title, as the seeds are kept out
+    # (profiles_repo.seed_keys). Deduped within the batch only, it came
+    # back as a second card -- and, the first saved, as one still to review.
+    known_ids: set[str] = set()
+    owner_of: dict[str, str] = {}   # "doi:<doi>" / "title:<key>" -> stored id
+    for row in candidates_repo.stored_paper_keys(conn, profile_id):
+        known_ids.add(row["openalex_id"])
+        for k in _paper_keys(row["doi"], row["title"]):
+            owner_of.setdefault(k, row["openalex_id"])
+
     n_new = 0
     n_redup = 0
     try:
@@ -277,6 +288,16 @@ def dedup_and_insert_candidates(
             score, paper, breakdown = _unpack_entry(entry)
             if not paper.openalex_id:
                 continue
+            if paper.openalex_id not in known_ids:
+                keys = _paper_keys(paper.doi, paper.title)
+                if any(owner_of.get(k, paper.openalex_id) != paper.openalex_id for k in keys):
+                    # Another id of a paper the interest has: a resurfacing.
+                    if n_counted is None or i < n_counted:
+                        n_redup += 1
+                    continue
+                for k in keys:
+                    owner_of.setdefault(k, paper.openalex_id)
+                known_ids.add(paper.openalex_id)
             if not math.isfinite(float(score)):
                 # SQLite stores NaN as NULL and the column is NOT NULL: one
                 # such score (a reranker or embedder glitch) failed the
@@ -319,6 +340,17 @@ def dedup_and_insert_candidates(
         raise
 
     return n_new, n_redup
+
+
+def _paper_keys(doi: str | None, title: str | None) -> list[str]:
+    """What makes two OpenAlex works the same paper: the DOI, or the title."""
+    keys = []
+    if doi:
+        keys.append("doi:" + doi.strip().lower())
+    tk = title_key(title)
+    if tk:
+        keys.append("title:" + tk)
+    return keys
 
 
 def _unpack_entry(entry) -> tuple[float, Paper, dict]:

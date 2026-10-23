@@ -52,6 +52,7 @@ EXPECTED_VERSIONS = [
     "0023_researcher_marks",
     "0024_reserve_all_slug",
     "0025_bars_on_grid",
+    "0026_merge_duplicate_candidates",
 ]
 
 

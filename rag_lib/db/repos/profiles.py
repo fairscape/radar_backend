@@ -219,9 +219,13 @@ def commit_draft(
     coherence_median: float | None,
     coherence_iqr: float | None,
     coherence_bimodal: bool | None,
-    n_seed: int,
+    fit_seeds: list[str],
+    band: dict | None,
 ) -> int:
     """Flip a draft to a real profile and persist its calibrated fields.
+
+    Written only while the draft's seeds are still ``fit_seeds`` (see
+    ``_write_fit``); raises ``SeedsChanged`` otherwise.
 
     Called by the wizard's commit endpoint after the user picks a
     threshold and selected topics. Centroid + selector_config are the
@@ -232,30 +236,62 @@ def commit_draft(
     bimodal_int = (
         None if coherence_bimodal is None else (1 if coherence_bimodal else 0)
     )
-    cur = conn.execute(
-        """
-        UPDATE profiles SET
-          is_draft           = 0,
-          threshold          = ?,
-          topic_filters_json = ?,
-          centroid           = ?,
-          selector_config_json = ?,
-          coherence_median   = ?,
-          coherence_iqr      = ?,
-          coherence_bimodal  = ?,
-          n_seed             = ?,
-          updated_at         = datetime('now')
-        WHERE id = ? AND is_draft = 1
-        """,
-        (
-            bar(threshold), tf_json, centroid, sel_json,
-            coherence_median, coherence_iqr, bimodal_int,
-            n_seed, profile_id,
-        ),
-    )
-    conn.commit()
     # 0: no longer a draft (discarded, or committed by another tab).
-    return cur.rowcount
+    return _write_fit(
+        conn, profile_id, fit_seeds, band,
+        "is_draft = 0, threshold = ?, topic_filters_json = ?, centroid = ?,"
+        " selector_config_json = ?, coherence_median = ?, coherence_iqr = ?,"
+        " coherence_bimodal = ?",
+        (bar(threshold), tf_json, centroid, sel_json,
+         coherence_median, coherence_iqr, bimodal_int),
+        "AND is_draft = 1",
+    )
+
+
+class SeedsChanged(RuntimeError):
+    """The seeds a fit was made from changed before it was written."""
+
+
+def _write_fit(conn, profile_id, fit_seeds, band, set_sql, params, where_extra="") -> int:
+    """Write a fit (and the seed band it came with) only if the profile's
+    seeds are still the ones it was made from.
+
+    A fit takes seconds, read from a seed snapshot. Written unconditionally,
+    one made before another tab added or removed a seed landed after that
+    tab's own refit: the removed paper back in the centroid, ``n_seed``
+    counting it, both requests 200 (round 19). Compared under the write
+    lock; ``n_seed`` is counted there too. Raises ``SeedsChanged`` on a
+    mismatch: the caller fits again. Returns the rows written.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        now = [r[0] for r in conn.execute(
+            "SELECT openalex_id FROM profile_seeds WHERE profile_id = ? ORDER BY openalex_id",
+            (profile_id,),
+        )]
+        if now != sorted(fit_seeds):
+            raise SeedsChanged(profile_id)
+        cur = conn.execute(
+            f"""
+            UPDATE profiles SET {set_sql},
+              n_seed = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = profiles.id),
+              seed_sim_min = ?, seed_sim_median = ?, seed_sim_max = ?,
+              updated_at = datetime('now')
+            WHERE id = ? {where_extra}
+            """,
+            (*params,
+             band["min"] if band else None,
+             band["median"] if band else None,
+             band["max"] if band else None,
+             profile_id),
+        )
+        conn.commit()
+        return cur.rowcount
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def update_fit(
@@ -267,9 +303,11 @@ def update_fit(
     coherence_median: float | None,
     coherence_iqr: float | None,
     coherence_bimodal: bool | None,
-    n_seed: int,
-) -> None:
-    """Persist a re-fit of a live profile's selector on its current seeds.
+    fit_seeds: list[str],
+    band: dict | None,
+) -> int:
+    """Persist a re-fit of a live profile's selector on its current seeds,
+    if they are still ``fit_seeds`` (``SeedsChanged`` otherwise).
 
     The fitted half of ``commit_draft``: it leaves ``is_draft``, the
     threshold and the topic filters alone, because those are the user's
@@ -279,22 +317,12 @@ def update_fit(
     bimodal_int = (
         None if coherence_bimodal is None else (1 if coherence_bimodal else 0)
     )
-    conn.execute(
-        """
-        UPDATE profiles SET
-          centroid             = ?,
-          selector_config_json = ?,
-          coherence_median     = ?,
-          coherence_iqr        = ?,
-          coherence_bimodal    = ?,
-          n_seed               = ?,
-          updated_at           = datetime('now')
-        WHERE id = ?
-        """,
-        (centroid, sel_json, coherence_median, coherence_iqr, bimodal_int,
-         n_seed, profile_id),
+    return _write_fit(
+        conn, profile_id, fit_seeds, band,
+        "centroid = ?, selector_config_json = ?, coherence_median = ?,"
+        " coherence_iqr = ?, coherence_bimodal = ?",
+        (centroid, sel_json, coherence_median, coherence_iqr, bimodal_int),
     )
-    conn.commit()
 
 
 def delete(conn: sqlite3.Connection, profile_id: int) -> None:

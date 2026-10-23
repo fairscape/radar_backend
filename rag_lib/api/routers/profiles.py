@@ -1714,7 +1714,7 @@ def topic_yield(
     from rag_lib.db.repos import profiles as profiles_repo
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")  # as datetime('now'), the 30-day counts
 
     tallies = {
         row["topic_id"]: row

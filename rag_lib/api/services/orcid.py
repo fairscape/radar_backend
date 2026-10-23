@@ -182,7 +182,7 @@ def _strip_openalex(value: str | None) -> str:
 
 def _authorship_for(work: dict, orcid: str) -> dict | None:
     for entry in work.get("authorships") or []:
-        author = entry.get("author") or {}
+        author = (entry or {}).get("author") or {}
         if (author.get("orcid") or "").upper().endswith(orcid):
             return entry
     return None
@@ -200,7 +200,7 @@ def _author_name(works: list[dict], orcid: str) -> str | None:
 def _summary(work: dict, orcid: str) -> dict[str, Any]:
     authorships = work.get("authorships") or []
     names = [
-        (a.get("author") or {}).get("display_name")
+        ((a or {}).get("author") or {}).get("display_name")
         for a in authorships
     ]
     names = [n for n in names if n]

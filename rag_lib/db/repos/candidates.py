@@ -416,6 +416,22 @@ def top_for_profile(
     ).fetchall()
 
 
+def stored_paper_keys(conn: sqlite3.Connection, profile_id: int) -> list[sqlite3.Row]:
+    """``(openalex_id, doi, title)`` of every paper the interest already has.
+
+    For telling a paper a later scan brings under another OpenAlex id (a
+    versioned Zenodo DOI, the preprint and the article) from a new one.
+    """
+    return conn.execute(
+        """
+        SELECT pc.openalex_id, p.doi, p.title
+        FROM profile_candidates pc JOIN papers p USING (openalex_id)
+        WHERE pc.profile_id = ?
+        """,
+        (profile_id,),
+    ).fetchall()
+
+
 def count_untriaged_for_feed(
     conn: sqlite3.Connection,
     profile_id: int,
