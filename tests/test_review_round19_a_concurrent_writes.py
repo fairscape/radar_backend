@@ -99,7 +99,10 @@ def _state(w):
         sched = c.execute("SELECT * FROM profile_schedules WHERE profile_id = ?", (w["pid"],)).fetchone() \
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='profile_schedules'").fetchone() else None
         rmark = c.execute("SELECT * FROM researchers WHERE id = ?", (w["rid"],)).fetchone()
-        return dict(p=p, seeds=seeds, embedded=embedded, open_runs=open_runs, card=card, sched=sched, r=rmark)
+        last = c.execute("SELECT action FROM feedback_events WHERE profile_id = ? AND openalex_id = ? ORDER BY id DESC LIMIT 1",
+                         (w["pid"], w["cards"][0])).fetchone()
+        return dict(p=p, seeds=seeds, embedded=embedded, open_runs=open_runs, card=card, sched=sched, r=rmark,
+                    last_event=last[0] if last else None)
     finally:
         c.close()
 
@@ -133,6 +136,12 @@ def _invariants(st):
     t = _topics(p)
     if t and not any(x.get("on", True) for x in t):
         bad.append("no topic on")
+    # The activity log's latest event for the card agrees with its state.
+    card, last = st["card"], st.get("last_event")
+    if card is not None and last is not None:
+        state = "saved" if card["saved_at"] else "dismissed" if card["dismissed_at"] else None
+        if state is not None and last != state:
+            bad.append(f"card {state} but the log's latest event is {last}")
     return bad
 
 

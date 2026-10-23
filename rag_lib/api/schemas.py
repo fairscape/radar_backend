@@ -644,6 +644,8 @@ class OrcidWorksResponse(_Model):
     orcid: str
     name: str | None = None
     works: list[OrcidWork]
+    # More works than are listed: the newest ``orcid.MAX_WORKS`` are.
+    truncated: bool = False
 
 
 class OrcidImportRequest(_Model):
@@ -868,6 +870,7 @@ class ResearcherWorks(_Model):
     name: str | None = None
     works: list[dict[str, Any]] = Field(default_factory=list)
     saved_ids: list[str] = Field(default_factory=list)
+    truncated: bool = False
 
 
 class ResearcherSuggestions(_Model):

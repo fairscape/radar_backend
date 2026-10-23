@@ -85,6 +85,7 @@ class FakeOpenAlexClient:
         *,
         limit: int | None = None,
         per_page: int = 200,
+        sort: str | None = None,
     ) -> list[dict]:
         """In-memory stand-in for ``OpenAlexClient.paginate_filter``.
 

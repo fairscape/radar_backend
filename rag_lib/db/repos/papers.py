@@ -8,9 +8,25 @@ the conversion so this module stays import-free of the dataclasses.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import sqlite3
 from typing import Any
+
+
+def plausible_year(year: Any) -> int | None:
+    """``year``, or None when it cannot be a publication year yet.
+
+    OpenAlex carries works dated 2029, 2040, 2050 -- placeholders and typos.
+    Stored, an interest whose years run "to now" let them into its feed as
+    the newest papers (round 19). Next year stays: journals date issues
+    ahead. An unknown year passes every year filter, so the paper stays.
+    """
+    try:
+        y = int(year)
+    except (TypeError, ValueError):
+        return None
+    return y if 1000 <= y <= _dt.date.today().year + 1 else None
 
 
 def get_by_openalex_id(
@@ -54,7 +70,7 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
         paper.get("doi"),
         paper.get("title") or "",
         paper.get("abstract"),
-        paper.get("year"),
+        plausible_year(paper.get("year")),
         paper.get("venue"),
         paper.get("publication_date"),
         topics_json,

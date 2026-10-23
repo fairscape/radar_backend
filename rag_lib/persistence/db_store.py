@@ -35,7 +35,7 @@ from ..db.repos import (
     schedules as schedules_repo,
     users as users_repo,
 )
-from ..paper import Paper, title_key
+from ..paper import Paper, paper_keys, title_key
 from ..profile import Profile
 
 
@@ -270,7 +270,7 @@ def dedup_and_insert_candidates(
     owner_of: dict[str, str] = {}   # "doi:<doi>" / "title:<key>" -> stored id
     for row in candidates_repo.stored_paper_keys(conn, profile_id):
         known_ids.add(row["openalex_id"])
-        for k in _paper_keys(row["doi"], row["title"]):
+        for k in paper_keys(row["doi"], row["title"], row["year"], papers_repo.decode_authors(row)):
             owner_of.setdefault(k, row["openalex_id"])
 
     n_new = 0
@@ -289,7 +289,7 @@ def dedup_and_insert_candidates(
             if not paper.openalex_id:
                 continue
             if paper.openalex_id not in known_ids:
-                keys = _paper_keys(paper.doi, paper.title)
+                keys = paper_keys(paper.doi, paper.title, paper.year, paper.authors)
                 if any(owner_of.get(k, paper.openalex_id) != paper.openalex_id for k in keys):
                     # Another id of a paper the interest has: a resurfacing.
                     if n_counted is None or i < n_counted:
@@ -340,17 +340,6 @@ def dedup_and_insert_candidates(
         raise
 
     return n_new, n_redup
-
-
-def _paper_keys(doi: str | None, title: str | None) -> list[str]:
-    """What makes two OpenAlex works the same paper: the DOI, or the title."""
-    keys = []
-    if doi:
-        keys.append("doi:" + doi.strip().lower())
-    tk = title_key(title)
-    if tk:
-        keys.append("title:" + tk)
-    return keys
 
 
 def _unpack_entry(entry) -> tuple[float, Paper, dict]:

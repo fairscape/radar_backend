@@ -417,6 +417,7 @@ def works_for_refresh(
     return {
         "source": row["source"], "key": row["key"], "name": name or row["name"],
         "works": works, "saved_ids": sorted(known),
+        "truncated": bool(listing.get("truncated")),
     }
 
 

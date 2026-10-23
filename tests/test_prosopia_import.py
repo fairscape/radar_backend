@@ -70,7 +70,7 @@ class StubOpenAlex:
         self.api_calls = 0
         self.calls: list[tuple[str, str]] = []
 
-    def paginate_filter(self, filter_str, *, limit=None, per_page=200):
+    def paginate_filter(self, filter_str, *, limit=None, per_page=200, sort=None):
         self.api_calls += 1
         self.calls.append(("paginate_filter", filter_str))
         if not self.batched or not filter_str.startswith("doi:"):
@@ -387,7 +387,7 @@ def test_prefetch_chunks_at_the_batch_size():
 
 def test_prefetch_batch_failure_degrades_to_per_paper():
     class Failing(StubOpenAlex):
-        def paginate_filter(self, filter_str, *, limit=None, per_page=200):
+        def paginate_filter(self, filter_str, *, limit=None, per_page=200, sort=None):
             raise RuntimeError("OpenAlex 429: rate-limited.")
 
     work = _work("10.1101/2025.11.03.685753", "W4415881950", "Atacformer", 2025)

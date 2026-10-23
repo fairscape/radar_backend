@@ -174,13 +174,11 @@ def daily(
             seed_sim_min = prow["seed_sim_min"]
         except (IndexError, KeyError):
             seed_sim_min = None
-        band = float(seed_sim_min) if seed_sim_min is not None and threshold is not None else None
 
         def cards_for(triaged: bool, limit: int) -> list[Card]:
             rows = candidates_repo.top_for_profile(
                 conn, pid, limit=limit, year_from=year_from, below=bucket == "low",
-                sim_at_least=band if bucket == "high" else None,
-                sim_below=band if bucket == "medium" else None,
+                bucket=bucket if bucket in ("high", "medium") else None,
                 triaged=triaged,
             )
             out: list[Card] = []
@@ -214,8 +212,7 @@ def daily(
             # went unmarked.
             n, n_high = candidates_repo.count_untriaged_for_feed(
                 conn, pid, year_from=year_from,
-                sim_at_least=band if bucket == "high" else None,
-                sim_below=band if bucket == "medium" else None, band=band,
+                bucket=bucket if bucket in ("high", "medium") else None,
             )
             k_high = sum(1 for c in kept if c.bucket == "high")
             out = {"high": max(n_high - k_high, 0), "medium": max(n - n_high - (len(kept) - k_high), 0)}
@@ -323,37 +320,41 @@ def _resolve_card(
 
 def _set(
     conn: sqlite3.Connection, user_id: int, card_id: str, column: str,
-    profile_slug: str | None, on: bool | None,
+    profile_slug: str | None, on: bool | None, on_change=None,
 ) -> tuple[CardActionResponse, bool] | None:
     resolved = _resolve_card(conn, user_id, card_id, profile_slug)
     if resolved is None:
         return None
     profile_id, openalex_id = resolved
-    res = candidates_repo.set_state(conn, profile_id, openalex_id, column, on)
-    if res is None:
-        return None
-    state, changed = res
     slug = profile_slug
     if slug is None:
         row = conn.execute("SELECT slug FROM profiles WHERE id = ?", (profile_id,)).fetchone()
         slug = row["slug"] if row is not None else None
+    res = candidates_repo.set_state(
+        conn, profile_id, openalex_id, column, on,
+        None if on_change is None else (lambda state: on_change(state, slug)),
+    )
+    if res is None:
+        return None
+    state, changed = res
     return CardActionResponse(id=card_id, state=state, profile=slug), changed
 
 
 def save(
     conn: sqlite3.Connection, user_id: int, card_id: str,
-    profile_slug: str | None = None, on: bool | None = None,
+    profile_slug: str | None = None, on: bool | None = None, on_change=None,
 ) -> tuple[CardActionResponse, bool] | None:
-    """Save (``on=True``), un-save (``False``) or toggle (None). ``(response, changed)``."""
-    return _set(conn, user_id, card_id, "saved_at", profile_slug, on)
+    """Save (``on=True``), un-save (``False``) or toggle (None). ``(response, changed)``.
+    ``on_change(state)``: see ``candidates_repo.set_state``."""
+    return _set(conn, user_id, card_id, "saved_at", profile_slug, on, on_change)
 
 
 def dismiss(
     conn: sqlite3.Connection, user_id: int, card_id: str,
-    profile_slug: str | None = None, on: bool | None = None,
+    profile_slug: str | None = None, on: bool | None = None, on_change=None,
 ) -> tuple[CardActionResponse, bool] | None:
     """Dismiss / un-dismiss / toggle, as ``save``."""
-    return _set(conn, user_id, card_id, "dismissed_at", profile_slug, on)
+    return _set(conn, user_id, card_id, "dismissed_at", profile_slug, on, on_change)
 
 
 def card_feedback_context(

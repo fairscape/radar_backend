@@ -116,21 +116,21 @@ def save_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    out = radar_service.save(db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on)
+    # Only a real transition is feedback: re-saving a saved card is not a
+    # second vote for it. The undo is logged too, so the activity log
+    # agrees with the counts. Logged inside the state change's own write.
+    out = radar_service.save(
+        db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on,
+        on_change=lambda state, slug: _log_feedback_for(
+            db, settings, int(user["id"]), body.card_id,
+            "saved" if state == "saved" else "unsaved", slug),
+    )
     if out is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="card not found for current user",
         )
-    res, changed = out
-    # Only a real transition is feedback: re-saving a saved card is not a
-    # second vote for it. The undo is logged too, so the activity log
-    # agrees with the counts.
-    if changed and res.state == "saved":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "saved", body.profile or res.profile)
-    elif changed and res.state is None:
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "unsaved", body.profile or res.profile)
-    return res
+    return out[0]
 
 
 @router.post("/cards/dismiss", response_model=CardActionResponse)
@@ -140,17 +140,16 @@ def dismiss_card(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CardActionResponse:
-    out = radar_service.dismiss(db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on)
+    # As save: real transitions only, logged inside the change's own write.
+    out = radar_service.dismiss(
+        db, int(user["id"]), body.card_id, profile_slug=body.profile, on=body.on,
+        on_change=lambda state, slug: _log_feedback_for(
+            db, settings, int(user["id"]), body.card_id,
+            "dismissed" if state == "dismissed" else "undismissed", slug),
+    )
     if out is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="card not found for current user",
         )
-    res, changed = out
-    # Only a real transition is feedback: re-dismissing a dismissed card is
-    # not a second vote against it. The undo is logged too.
-    if changed and res.state == "dismissed":
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "dismissed", body.profile or res.profile)
-    elif changed and res.state is None:
-        _log_feedback_for(db, settings, int(user["id"]), body.card_id, "undismissed", body.profile or res.profile)
-    return res
+    return out[0]

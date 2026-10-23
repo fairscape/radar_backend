@@ -156,9 +156,11 @@ def test_bucket_bounds_are_applied_before_the_limit(tmp_path):
         candidates_repo.insert_dedup(conn, profile_id=pid, openalex_id=oa, score=0.9 - i * 0.03,
                                      score_raw=0.9 - i * 0.03)
     # The two weakest are under a 0.67 seed band; a limit of 2 still finds them.
-    rows = candidates_repo.top_for_profile(conn, pid, limit=2, sim_below=0.67)
+    conn.execute("UPDATE profiles SET seed_sim_min = 0.67 WHERE id = ?", (pid,)); conn.commit()
+    rows = candidates_repo.top_for_profile(conn, pid, limit=2, bucket="medium")
     assert sorted(r["openalex_id"] for r in rows) == ["W8", "W9"]
-    rows = candidates_repo.top_for_profile(conn, pid, limit=50, sim_at_least=0.85)
+    conn.execute("UPDATE profiles SET seed_sim_min = 0.85 WHERE id = ?", (pid,)); conn.commit()
+    rows = candidates_repo.top_for_profile(conn, pid, limit=50, bucket="high")
     assert [r["openalex_id"] for r in rows] == ["W0", "W1"]
 
 
@@ -272,7 +274,7 @@ def test_rebuilding_profiles_keeps_every_child_row(tmp_path):
     gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")
     conn.execute("DELETE FROM profiles WHERE id = ?", (_interest(conn, uid, "Gone"),))
     conn.commit()
-    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates"]
+    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions"]
     for table in ("profile_seeds", "profile_candidates", "gather_runs"):
         assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1, table
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

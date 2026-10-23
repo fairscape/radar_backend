@@ -53,6 +53,8 @@ EXPECTED_VERSIONS = [
     "0024_reserve_all_slug",
     "0025_bars_on_grid",
     "0026_merge_duplicate_candidates",
+    "0027_implausible_years",
+    "0028_merge_zenodo_versions",
 ]
 
 

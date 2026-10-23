@@ -205,3 +205,46 @@ def normalize_title(title: str | None) -> str:
     Kept as the one definition so the two can never drift apart.
     """
     return "".join(c for c in (title or "").lower() if c.isalnum())
+
+
+def surname(name: str | None) -> str:
+    """"Clark, Timothy" and "Tim W. Clark" both -> "clark"."""
+    name = (name or "").strip()
+    if "," in name:
+        name = name.split(",", 1)[0]
+    else:
+        parts = name.split()
+        name = parts[-1] if parts else ""
+    return normalize_title(name)
+
+
+_ZENODO_DOI = "10.5281/zenodo."
+
+
+def paper_keys(doi: str | None, title: str | None, year: int | None = None,
+               authors: list[str] | None = None) -> list[str]:
+    """What makes two OpenAlex works the same paper: the DOI, the title, or
+    -- for a short title -- being two Zenodo records of one work.
+
+    ``title_key`` refuses short titles, and a Zenodo concept DOI and its
+    version DOI never match, so "The Trust Dial" came back as two cards
+    even within one scan (round 19). Two Zenodo DOIs with the same short
+    title, year and authors are one record's versions; any other short
+    title is left alone (every "Editorial" is not one paper).
+    """
+    keys = []
+    d = (doi or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+    if d:
+        keys.append("doi:" + d)
+    tk = title_key(title)
+    if tk:
+        keys.append("title:" + tk)
+    elif d.startswith(_ZENODO_DOI) and year is not None:
+        t = normalize_title(title)
+        names = sorted({surname(a) for a in (authors or []) if surname(a)})
+        if t and names:
+            keys.append(f"zenodo:{t}|{year}|{','.join(names)}|{len(authors or [])}")
+    return keys

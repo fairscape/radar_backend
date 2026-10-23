@@ -16,6 +16,20 @@ import sqlite3
 # Same rule as ``scoring.pool.passes``.
 PASSES = "(pc.score_raw IS NULL OR pr.threshold IS NULL OR pc.score_raw >= pr.threshold)"
 
+# A card's bucket, as ``mappers.bucket_for_similarity`` gives it -- the
+# percentile fallback included (no raw cosine, or no threshold). The feed's
+# bucket filter and its "not shown" counts used the raw-cosine rule alone,
+# so a fallback card the page called "Like your seeds" was counted as
+# "Above the bar" (round 19). ``tests`` hold the two to the same answers.
+BUCKET_SQL = """(CASE
+  WHEN pc.score_raw IS NOT NULL AND pr.threshold IS NOT NULL THEN
+    CASE WHEN pc.score_raw < pr.threshold THEN 'low'
+         WHEN pr.seed_sim_min IS NOT NULL AND pc.score_raw >= pr.seed_sim_min THEN 'high'
+         ELSE 'medium' END
+  WHEN COALESCE(pc.score_pct, pc.score) >= 0.90 THEN 'high'
+  WHEN COALESCE(pc.score_pct, pc.score) >= 0.67 THEN 'medium'
+  ELSE 'low' END)"""
+
 # ... and when its publication year is within the interest's range
 # (migration 0018). An open bound, or a paper with no year, passes. Needs
 # ``p`` (papers) and ``pr``. Same rule as ``scoring.pool.in_years``.
@@ -145,7 +159,7 @@ def mark_shown(
 
 def set_state(
     conn: sqlite3.Connection, profile_id: int, openalex_id: str,
-    column: str, on: bool | None = None,
+    column: str, on: bool | None = None, on_change=None,
 ) -> tuple[str | None, bool] | None:
     """Set (``on``) or toggle (``on=None``) ``saved_at`` / ``dismissed_at``.
 
@@ -155,14 +169,32 @@ def set_state(
     feedback log records the save once. Setting one state clears the
     other. Toggling is for older clients: a double click toggled a save
     straight back off.
+
+    ``on_change(state)`` runs after a real change, in the same write
+    transaction: the feedback event was logged in a second one, so a save
+    and a dismiss racing on one card left it dismissed with "saved" as the
+    log's latest event (round 19).
     """
     other = {"saved_at": "dismissed_at", "dismissed_at": "saved_at"}[column]
     label = {"saved_at": "saved", "dismissed_at": "dismissed"}[column]
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        return _set_state_locked(conn, profile_id, openalex_id, column, other, label, on, on_change)
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _set_state_locked(conn, profile_id, openalex_id, column, other, label, on, on_change):
     row = conn.execute(
         f"SELECT {column} FROM profile_candidates WHERE profile_id = ? AND openalex_id = ?",
         (profile_id, openalex_id),
     ).fetchone()
     if row is None:
+        conn.rollback()
         return None
     if on is None:
         on = row[column] is None
@@ -183,8 +215,13 @@ def set_state(
             """,
             (profile_id, openalex_id),
         )
-    conn.commit()
-    return (label if on else None), cur.rowcount > 0
+    changed = cur.rowcount > 0
+    state = label if on else None
+    if changed and on_change is not None:
+        on_change(state)
+    if conn.in_transaction:
+        conn.commit()
+    return state, changed
 
 
 def mark_saved(
@@ -357,8 +394,7 @@ def top_for_profile(
     limit: int = 50,
     year_from: int | None = None,
     below: bool = False,
-    sim_at_least: float | None = None,
-    sim_below: float | None = None,
+    bucket: str | None = None,
     triaged: bool | None = None,
 ) -> list[sqlite3.Row]:
     """Top-N candidates for the daily radar (no shown/dismissed filter).
@@ -368,9 +404,8 @@ def top_for_profile(
     triaged paper used to hold its place in an interest's share, so once
     the top share was triaged the feed showed nothing new.
 
-    ``sim_at_least`` / ``sim_below`` narrow on the raw cosine, so a feed
-    bucket ("Like your seeds" is at least the least typical seed) is
-    filtered before the ``LIMIT`` rather than after it.
+    ``bucket`` keeps the cards of that bucket (``BUCKET_SQL``, the rule the
+    card itself shows), filtered before the ``LIMIT`` rather than after it.
 
     ``below``: the papers under the threshold instead (the feed's "Below
     the bar" filter), closest to it first. They are stored but not in the
@@ -405,26 +440,25 @@ def top_for_profile(
           AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS} AND {NOT_SEED}
           -- The feed's own "published since" filter, on top of the interest's range.
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
-          AND (? IS NULL OR pc.score_raw >= ?)
-          AND (? IS NULL OR pc.score_raw IS NULL OR pc.score_raw < ?)
+          AND (? IS NULL OR {BUCKET_SQL} = ?)
           AND (? IS NULL OR (pc.saved_at IS NOT NULL OR pc.dismissed_at IS NOT NULL) = ?)
         ORDER BY {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
         LIMIT ?
         """,
-        (profile_id, year_from, year_from, sim_at_least, sim_at_least,
-         sim_below, sim_below, triaged, None if triaged is None else int(triaged), limit),
+        (profile_id, year_from, year_from, bucket, bucket,
+         triaged, None if triaged is None else int(triaged), limit),
     ).fetchall()
 
 
 def stored_paper_keys(conn: sqlite3.Connection, profile_id: int) -> list[sqlite3.Row]:
-    """``(openalex_id, doi, title)`` of every paper the interest already has.
+    """``(openalex_id, doi, title, year, authors_json)`` of every paper the interest already has.
 
     For telling a paper a later scan brings under another OpenAlex id (a
     versioned Zenodo DOI, the preprint and the article) from a new one.
     """
     return conn.execute(
         """
-        SELECT pc.openalex_id, p.doi, p.title
+        SELECT pc.openalex_id, p.doi, p.title, p.year, p.authors_json
         FROM profile_candidates pc JOIN papers p USING (openalex_id)
         WHERE pc.profile_id = ?
         """,
@@ -437,32 +471,29 @@ def count_untriaged_for_feed(
     profile_id: int,
     *,
     year_from: int | None = None,
-    sim_at_least: float | None = None,
-    sim_below: float | None = None,
-    band: float | None = None,
+    bucket: str | None = None,
 ) -> tuple[int, int]:
     """``(all, like the seeds)`` of the papers to review ``top_for_profile``
     would list without its ``LIMIT`` (the passing ones, ``triaged`` False).
 
-    "Like the seeds" is a raw cosine at least ``band``. The feed's counts of
-    papers past its cap: the rows read past it held only the top bucket.
+    "Like the seeds" is the card's own bucket (``BUCKET_SQL``). The feed's
+    counts of papers past its cap: the rows read past it held only the top
+    bucket.
     """
     row = conn.execute(
         f"""
         SELECT COUNT(*) AS n,
-               COALESCE(SUM(? IS NOT NULL AND pc.score_raw IS NOT NULL AND pc.score_raw >= ?), 0) AS n_high
+               COALESCE(SUM({BUCKET_SQL} = 'high'), 0) AS n_high
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
           AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
-          AND (? IS NULL OR pc.score_raw >= ?)
-          AND (? IS NULL OR pc.score_raw IS NULL OR pc.score_raw < ?)
+          AND (? IS NULL OR {BUCKET_SQL} = ?)
           AND pc.saved_at IS NULL AND pc.dismissed_at IS NULL
         """,
-        (band, band, profile_id, year_from, year_from, sim_at_least, sim_at_least,
-         sim_below, sim_below),
+        (profile_id, year_from, year_from, bucket, bucket),
     ).fetchone()
     return int(row["n"]), int(row["n_high"])
 

@@ -58,7 +58,7 @@ class StubOrcidOpenAlex(StubOpenAlex):
         )
         self.works = list(works)
 
-    def paginate_filter(self, filter_str, *, limit=None, per_page=200):
+    def paginate_filter(self, filter_str, *, limit=None, per_page=200, sort=None):
         if filter_str.startswith("author.orcid:"):
             self.api_calls += 1
             self.calls.append(("paginate_filter", filter_str))
@@ -298,7 +298,7 @@ def test_list_works_leaves_the_order_alone_when_nothing_is_duplicated():
 
 def test_list_works_for_an_orcid_with_nothing_has_no_name():
     listing = list_works(OTHER, StubOrcidOpenAlex(WORKS))
-    assert listing == {"orcid": OTHER, "name": None, "works": []}
+    assert listing == {"orcid": OTHER, "name": None, "works": [], "truncated": False}
 
 
 # --- routes ----------------------------------------------------------------

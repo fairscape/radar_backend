@@ -1193,9 +1193,9 @@ def refit_profile(
         result = apply_recommended(db, profile_id)
         if result["applied"]:
             old_str = (
-                f"{result['old']:.2f}" if result["old"] is not None else "—"
+                f"{result['old']:.3f}" if result["old"] is not None else "—"
             )
-            cost = f"{cost} · autotune {old_str}→{result['new']:.2f}"
+            cost = f"{cost} · autotune {old_str}→{result['new']:.3f}"
         else:
             cost = f"{cost} · autotune skipped (n={result['n_events']})"
     return RefitResponse(ok=True, key=key, cost=cost)

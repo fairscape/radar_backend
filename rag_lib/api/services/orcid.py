@@ -34,9 +34,10 @@ import structlog
 
 from ...db.repos import gather_runs as gather_runs_repo
 from ...db.repos import users as users_repo
+from ...db.repos.papers import plausible_year
 from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, fetch_claimed
-from ...paper import normalize_title, title_key
+from ...paper import normalize_title, surname, title_key
 from ...prosopia_seeds import normalize_doi
 from .prosopia import ImportPlan, open_draft, target_draft
 
@@ -210,7 +211,7 @@ def _summary(work: dict, orcid: str) -> dict[str, Any]:
         "openalex_id": _strip_openalex(work.get("id")),
         "doi": normalize_doi(work.get("doi")),
         "title": (work.get("title") or work.get("display_name") or "").strip(),
-        "year": work.get("publication_year"),
+        "year": plausible_year(work.get("publication_year")),
         "venue": venue,
         "type": work.get("type"),
         "cited_by_count": work.get("cited_by_count"),
@@ -249,15 +250,7 @@ def _dedupe_key(s: dict[str, Any]) -> str:
 _SHORT_TITLE_MERGEABLE = frozenset({"dataset", "software", "preprint"})
 
 
-def _surname(name: str) -> str:
-    """"Clark, Timothy" and "Tim W. Clark" both -> "clark"."""
-    name = (name or "").strip()
-    if "," in name:
-        name = name.split(",", 1)[0]
-    else:
-        parts = name.split()
-        name = parts[-1] if parts else ""
-    return normalize_title(name)
+_surname = surname
 
 
 def _short_title_key(s: dict[str, Any]) -> str:
@@ -411,7 +404,12 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
     ``check_registry=False`` skips the one extra HTTP call, for tests and
     for callers that have already decided.
     """
-    works = client.paginate_filter(f"author.orcid:{orcid}", limit=limit) or []
+    # Newest first from OpenAlex itself: unsorted, the cap kept an arbitrary
+    # ``limit`` of a prolific author's works, recent ones possibly not among
+    # them, and nothing said the list was cut (round 19).
+    works = client.paginate_filter(f"author.orcid:{orcid}", limit=limit,
+                                   sort="publication_date:desc") or []
+    truncated = limit is not None and len(works) >= limit
     summaries = [_summary(w, orcid) for w in works]
     # abstract presence only feeds _version_rank, so it is read off the
     # raw work here rather than carried in the response.
@@ -445,7 +443,8 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
     log.info("orcid.list_works", orcid=orcid, n=len(summaries),
              n_duplicates=n_dup, n_unclaimed=n_unclaimed,
              n_claim_unknown=n_unknown, registry_read=registry is not None)
-    return {"orcid": orcid, "name": _author_name(works, orcid), "works": summaries}
+    return {"orcid": orcid, "name": _author_name(works, orcid), "works": summaries,
+            "truncated": truncated}
 
 
 def prepare_import(

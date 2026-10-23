@@ -26,6 +26,8 @@ from typing import Any
 
 import requests
 import structlog
+
+from .db.repos.papers import plausible_year
 from researcher_profiles.client import ApiArtifactStorage
 from researcher_profiles.profile.storage import LazySummaries
 from researcher_profiles.schema import PaperRecord
@@ -154,7 +156,7 @@ class PagedApiStorage(ApiArtifactStorage):
                     {
                         "paper_id": e.get("paper_id"),
                         "title": e.get("title") or "",
-                        "year": e.get("year"),
+                        "year": plausible_year(e.get("year")),
                         "journal": e.get("journal"),
                         "first_author": e.get("first_author"),
                         "authors": authors,
