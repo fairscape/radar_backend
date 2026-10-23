@@ -148,6 +148,33 @@ def _unit_rows(vecs: Sequence[Sequence[float]] | np.ndarray) -> np.ndarray:
     return arr / (norms + 1e-12)
 
 
+# One rule for every score shown beside a bar. Bars (a threshold, the seed
+# band's floor) sit on the 3-place grid the UI enters and shows them on;
+# scores are sent rounded down to 4 places and shown rounded down to 3.
+# Then "shown score >= shown bar" is exactly the server's ``>=`` on the raw
+# score. Rounding a score to nearest anywhere (server or page), or a bar
+# off the grid, made the two disagree: 0.8996 shown "0.900" beside a 0.900
+# bar, and left out (rounds 8, 9 found the Threshold tab, the wizard trial
+# and the seed band apart).
+BAR_PLACES = 3
+
+
+def floor4(x: float) -> float:
+    """A score as the API sends it: ``x`` to 4 places, rounded down."""
+    return math.floor(float(x) * 10_000 + 1e-9) / 10_000
+
+
+def bar(x: float | None) -> float | None:
+    """A threshold as stored: on the grid."""
+    return None if x is None else round(float(x), BAR_PLACES)
+
+
+def bar_floor(x: float) -> float:
+    """A bar computed from scores (the seed band's floor): on the grid, rounded
+    down so every seed it was computed from still reaches it."""
+    return math.floor(float(x) * 10 ** BAR_PLACES + 1e-9) / 10 ** BAR_PLACES
+
+
 def seed_similarity_band(vecs: Sequence[Sequence[float]] | np.ndarray) -> dict | None:
     """Leave-one-out cosine of each seed to the centroid of the others.
 
@@ -166,7 +193,8 @@ def seed_similarity_band(vecs: Sequence[Sequence[float]] | np.ndarray) -> dict |
         others = others / (np.linalg.norm(others) + 1e-12)
         vals.append(float(u[i] @ others))
     return {
-        "min": float(min(vals)),
+        # A bar ("as close as your least typical seed"): on the grid.
+        "min": bar_floor(min(vals)),
         "median": float(np.median(vals)),
         "max": float(max(vals)),
         "values": vals,
@@ -209,9 +237,9 @@ def suggest_threshold(
             thr = min(max(thr, lo), hi)
         # Down, as autotune rounds: up could lift the clamped bar over
         # the top 2% it promises to let through.
-        return math.floor(thr * 1000 + 1e-9) / 1000
+        return bar_floor(thr)
     if arr.size >= 10:
-        return math.floor(float(np.percentile(arr, 90)) * 1000 + 1e-9) / 1000
+        return bar_floor(float(np.percentile(arr, 90)))
     return THRESHOLD_FALLBACK
 
 

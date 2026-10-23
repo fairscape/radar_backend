@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as pkg_version
@@ -195,6 +196,22 @@ def create_app() -> FastAPI:
         # An id past SQLite's 64-bit integers (2**63 and up) cannot name a
         # row; it was a 500 from the driver.
         return JSONResponse(status_code=404, content={"detail": "not found"})
+
+    @app.exception_handler(sqlite3.IntegrityError)
+    async def _integrity(request: Request, exc: sqlite3.IntegrityError):
+        # A write that names a row deleted meanwhile (another tab deleted
+        # the interest, draft or researcher mid-request) fails its foreign
+        # key. Each route found so far turned this into a 404 one at a time;
+        # this is the backstop for the ones not found. The request's own
+        # connection is closed uncommitted by get_db.
+        if "FOREIGN KEY" in str(exc):
+            structlog.get_logger(__name__).warning(
+                "request.target_gone", method=request.method, path=request.url.path)
+            return JSONResponse(status_code=404, content={
+                "detail": "what this request works on no longer exists (deleted in another tab?)"})
+        structlog.get_logger(__name__).warning(
+            "request.conflict", method=request.method, path=request.url.path, error=str(exc))
+        return JSONResponse(status_code=409, content={"detail": "conflicting change; reload and try again"})
 
     access_log = structlog.get_logger("rag_lib.api.access")
 

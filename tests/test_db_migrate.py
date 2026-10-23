@@ -51,6 +51,7 @@ EXPECTED_VERSIONS = [
     "0022_score_raw_backfill",
     "0023_researcher_marks",
     "0024_reserve_all_slug",
+    "0025_bars_on_grid",
 ]
 
 

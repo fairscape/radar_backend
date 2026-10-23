@@ -15,6 +15,7 @@ import re
 import sqlite3
 from typing import Any
 
+from ...calibration import bar
 from .gather_runs import IMPORT_TIERS
 
 
@@ -247,7 +248,7 @@ def commit_draft(
         WHERE id = ? AND is_draft = 1
         """,
         (
-            threshold, tf_json, centroid, sel_json,
+            bar(threshold), tf_json, centroid, sel_json,
             coherence_median, coherence_iqr, bimodal_int,
             n_seed, profile_id,
         ),
@@ -357,7 +358,7 @@ def upsert(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id, name, slug, embedding_model, centroid, threshold,
+                user_id, name, slug, embedding_model, centroid, bar(threshold),
                 tf_json, sel_json, gat_json,
                 coherence_median, coherence_iqr, bimodal_int, n_seed,
             ),
@@ -376,7 +377,7 @@ def upsert(
         WHERE id = ?
         """,
         (
-            embedding_model, centroid, threshold,
+            embedding_model, centroid, bar(threshold),
             tf_json, sel_json, gat_json,
             coherence_median, coherence_iqr, bimodal_int, n_seed,
             # The slug is the interest's URL key: an existing row keeps it
@@ -515,7 +516,7 @@ def update_threshold(
 ) -> None:
     conn.execute(
         "UPDATE profiles SET threshold = ?, updated_at = datetime('now') WHERE id = ?",
-        (threshold, profile_id),
+        (bar(threshold), profile_id),
     )
     conn.commit()
 

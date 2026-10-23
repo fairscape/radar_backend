@@ -15,9 +15,9 @@ against 0.50..0.95, and an un-save stayed counted as a save.
 
 from __future__ import annotations
 
-import math
 import sqlite3
 
+from rag_lib import calibration
 from rag_lib.db.repos import profiles as profiles_repo
 
 MIN_EVENTS = 30
@@ -77,7 +77,7 @@ def recommend_threshold(
             best_score = f1
             best_th = th
     # Three decimals, as the slider; down, so the save it was cut at stays in.
-    return None if best_th is None else math.floor(best_th * 1000 + 1e-9) / 1000
+    return None if best_th is None else calibration.bar_floor(best_th)
 
 
 def apply_recommended(

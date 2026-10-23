@@ -680,7 +680,10 @@ def set_researcher_topics(
                 "this interest was not built from a researcher whose profile lists topics"
             )
     for _attempt in range(3):
-        raw = conn.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()[0]
+        got = conn.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        if got is None:
+            raise LookupError(f"interest '{slug}' not found")  # deleted in another tab
+        raw = got[0]
         out = _set_researcher_topics_once(conn, row, profile_id, enabled=enabled, raw=raw)
         if out is not None:
             return out

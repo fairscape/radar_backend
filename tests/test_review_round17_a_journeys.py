@@ -195,7 +195,9 @@ def test_threshold_edit_feed_matches_histogram(app, env):
     assert len(feed0["cards"]) == sum(1 for x in scores if x >= 0.0)
     thr = scores[len(scores) // 2]
     p = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": thr}))
-    assert p["threshold"] == thr
+    # Stored on the 3-place grid (calibration.bar), which the feed then uses.
+    assert p["threshold"] == round(thr, 3)
+    thr = p["threshold"]
     feed1 = _feed(app, slug)
     expect = sum(1 for s in scores if s >= thr)
     print("THR", thr, "expect", expect, "feed", len(feed1["cards"]), [c["similarity"] for c in feed1["cards"]])
