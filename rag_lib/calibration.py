@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import math
+
 import numpy as np
 
 EMBEDDING_REGIME = "specter2-proximity"
@@ -205,9 +207,11 @@ def suggest_threshold(
             lo = float(np.percentile(arr, THRESHOLD_MIN_PERCENTILE))
             hi = float(np.percentile(arr, THRESHOLD_MAX_PERCENTILE))
             thr = min(max(thr, lo), hi)
-        return round(thr, 3)
+        # Down, as autotune rounds: up could lift the clamped bar over
+        # the top 2% it promises to let through.
+        return math.floor(thr * 1000 + 1e-9) / 1000
     if arr.size >= 10:
-        return round(float(np.percentile(arr, 90)), 3)
+        return math.floor(float(np.percentile(arr, 90)) * 1000 + 1e-9) / 1000
     return THRESHOLD_FALLBACK
 
 

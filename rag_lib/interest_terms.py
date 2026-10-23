@@ -154,7 +154,12 @@ def prosopia_terms(base_url: str, slug: str, *, timeout: float = 30.0) -> dict |
     def norm(text: str) -> str:
         return " ".join(str(text).replace("-", " ").lower().split())
 
-    unwanted = {norm(n) for n in not_interests}
+    # The weighted shape lists not_interests in unwanted_labels as well as
+    # in its own field: listed once, as first spelled.
+    seen: set[str] = set()
+    not_interests = [n for n in not_interests
+                     if not (norm(n) in seen or seen.add(norm(n)))]
+    unwanted = seen
     terms = [t for t in terms if norm(t["label"]) not in unwanted]
     if not terms:
         return None

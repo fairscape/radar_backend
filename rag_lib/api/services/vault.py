@@ -115,7 +115,8 @@ def _row_to_vault_doc(
         "tags": vault_repo.tags_for_paper(conn, user_id, row["openalex_id"]),
         "pages": int(row["n_pages"] or 0),
         "chunks": chunk_count,
-        "added": row["first_seen_at"] or "",
+        # This user's own time: first_seen_at is whoever uploaded it first.
+        "added": (row["added_at"] if "added_at" in row.keys() else vault_repo.added_at(conn, user_id, row["openalex_id"], row["first_seen_at"])) or "",
     }
 
 

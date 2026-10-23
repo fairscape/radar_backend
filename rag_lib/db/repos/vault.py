@@ -40,6 +40,10 @@ _VAULT_COLS = """
   p.first_seen_at, p.n_pages, p.authors_json,
   p.uploaded_by_user_id, p.file_hash
 """
+# When this user added the paper: their own upload, else when Radar first
+# saw it. papers.first_seen_at alone is the first uploader's time, which
+# told a second user who uploaded the same file that someone had, and when.
+_ADDED = "COALESCE((SELECT u.uploaded_at FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?), p.first_seen_at)"
 
 
 def list_for_user(
@@ -52,13 +56,13 @@ def list_for_user(
 
     The returned rows are distinct on ``openalex_id`` even when a paper
     is both an uploaded seed and a saved candidate (or saved in multiple
-    profiles). Sort matches the previous behavior: most-recent
-    ``first_seen_at`` first, then openalex_id for stability.
+    profiles). Most recently added by this user first (``added_at``),
+    then openalex_id for stability.
     """
     if tag in (None, "", "all"):
         return conn.execute(
             f"""
-            SELECT {_VAULT_COLS}
+            SELECT {_VAULT_COLS}, {_ADDED} AS added_at
             FROM papers p
             WHERE EXISTS (SELECT 1 FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?)
                OR EXISTS (
@@ -83,13 +87,13 @@ def list_for_user(
                  WHERE ps.openalex_id = p.openalex_id
                    AND pr.user_id = ?
                )
-            ORDER BY p.first_seen_at DESC, p.openalex_id
+            ORDER BY added_at DESC, p.openalex_id
             """,
-            (user_id, user_id, user_id, user_id),
+            (user_id, user_id, user_id, user_id, user_id),
         ).fetchall()
     return conn.execute(
         f"""
-        SELECT {_VAULT_COLS}
+        SELECT {_VAULT_COLS}, {_ADDED} AS added_at
         FROM papers p
         WHERE EXISTS (
               SELECT 1
@@ -108,9 +112,9 @@ def list_for_user(
                 AND pr.slug = ?
                 AND pc.saved_at IS NOT NULL
             )
-        ORDER BY p.first_seen_at DESC, p.openalex_id
+        ORDER BY added_at DESC, p.openalex_id
         """,
-        (user_id, tag, user_id, tag),
+        (user_id, user_id, tag, user_id, tag),
     ).fetchall()
 
 
@@ -124,9 +128,10 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
     row = conn.execute(
         """
         WITH vault_papers AS (
-          SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
+          -- The user's own upload time (first_seen_at is the first uploader's).
+          SELECT p.openalex_id, p.n_pages, u.uploaded_at AS first_seen_at, NULL AS event_at
           FROM papers p
-          WHERE EXISTS (SELECT 1 FROM paper_uploads u WHERE u.openalex_id = p.openalex_id AND u.user_id = ?)
+          JOIN paper_uploads u ON u.openalex_id = p.openalex_id AND u.user_id = ?
           UNION
           -- A researcher's imported papers, as list_for_user counts them.
           -- Imports used to stamp uploaded_by_user_id, which is how they
@@ -230,3 +235,12 @@ def tags_for_paper(
         (user_id, openalex_id, user_id, openalex_id),
     ).fetchall()
     return [r["slug"] for r in rows]
+
+
+def added_at(conn: sqlite3.Connection, user_id: int, openalex_id: str, first_seen_at: str | None) -> str | None:
+    """``_ADDED`` for one paper."""
+    row = conn.execute(
+        "SELECT uploaded_at FROM paper_uploads WHERE openalex_id = ? AND user_id = ?",
+        (openalex_id, user_id),
+    ).fetchone()
+    return row["uploaded_at"] if row is not None else first_seen_at

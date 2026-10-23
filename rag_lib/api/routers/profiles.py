@@ -398,8 +398,9 @@ def draft_dry_run(
 
     # Open the audit row eagerly so we can echo a real run_id even when
     # the inline / test path runs synchronously.
-    run_id = gather_runs_repo.start(
-        db,
+    # Discarded in another tab since it was looked up: 404, not a 500.
+    run_id = _open_scan_run(
+        db, slug,
         profile_id=profile_id,
         user_id=int(user["id"]),
         tier_used="dry_run",

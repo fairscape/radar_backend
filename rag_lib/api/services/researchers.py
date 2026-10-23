@@ -555,10 +555,19 @@ def create_interest(
     if draft_row is None:  # pragma: no cover
         raise RuntimeError(f"draft '{draft['slug']}' vanished after create")
     profile_id = int(draft_row["id"])
-    researchers_repo.set_profile_researcher(conn, profile_id, researcher_id)
     n = 0
-    for openalex_id in chosen:
-        n += profiles_repo.attach_seed(conn, profile_id, openalex_id)
+    try:
+        researchers_repo.set_profile_researcher(conn, profile_id, researcher_id)
+        for openalex_id in chosen:
+            n += profiles_repo.attach_seed(conn, profile_id, openalex_id)
+    except sqlite3.IntegrityError:
+        # Forgotten in another tab while the papers were embedded: the
+        # link (or their papers) are gone. No empty draft left behind.
+        conn.rollback()
+        profiles_repo.delete(conn, profile_id)
+        if researchers_repo.get(conn, researcher_id) is not None:
+            raise
+        raise ResearcherNotFound(f"researcher {researcher_id} not found") from None
     log.info(
         "researchers.create_interest",
         researcher_id=researcher_id, draft_slug=draft["slug"], n_seeds=n,

@@ -188,13 +188,22 @@ def launch_import(
 
     # Opened eagerly so the response can echo a real run_id even on the
     # inline path below.
-    run_id = gather_runs_repo.start(
-        db,
-        profile_id=plan.profile_id,
-        researcher_id=plan.researcher_id,
-        user_id=user_id,
-        tier_used=tier,
-    )
+    try:
+        run_id = gather_runs_repo.start(
+            db,
+            profile_id=plan.profile_id,
+            researcher_id=plan.researcher_id,
+            user_id=user_id,
+            tier_used=tier,
+        )
+    except sqlite3.IntegrityError as exc:
+        # The draft or the researcher was deleted in another tab while the
+        # source was read: the run's foreign key fails (it was a 500).
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="the draft or researcher to import into no longer exists",
+        ) from exc
     if plan.researcher_id is not None:
         # Point the researcher at its run right away, so a listing made
         # while the job is still resolving papers can say "importing".

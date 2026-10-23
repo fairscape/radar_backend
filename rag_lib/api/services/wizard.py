@@ -54,7 +54,7 @@ from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
 from ...profile import Profile
 from ...selectors import get_selector
-from ..mappers import _read_minutes, bucket_for_similarity
+from ..mappers import _read_minutes, bucket_for_similarity, floor4
 from ..schemas import (
     MAX_NAME,
     Card,
@@ -1104,7 +1104,9 @@ def compute_dry_run_for_profile(
     # histogram instead of a coarse grid of bucket cards. ``e[0]`` is the
     # selector's cosine here — the dry run does not rerank — but read
     # ``score_raw`` when present so this stays true if it ever does.
-    scores = [round(float(e[2].get("score_raw", e[0])), 4) for e in ranked]
+    # Rounded down as the Threshold tab does: 0.89996 shown as 0.9 would
+    # pass a 0.9 bar here that the feed does not let it pass.
+    scores = [floor4(e[2].get("score_raw", e[0])) for e in ranked]
     papers = sorted(
         (
             DryRunPaper(
@@ -1190,7 +1192,7 @@ def commit_draft(
     if centroid_list:
         centroid_blob = encode_vector(centroid_list)
 
-    profiles_repo.commit_draft(
+    flipped = profiles_repo.commit_draft(
         conn,
         profile_id,
         threshold=threshold,
@@ -1202,6 +1204,12 @@ def commit_draft(
         coherence_bimodal=diag.get("coherence_bimodal"),
         n_seed=len(profile.papers),
     )
+    if not flipped:
+        # Discarded in another tab while fitting, or committed there first.
+        now = profiles_repo.get_by_slug(conn, user_id, slug)
+        if now is None or int(now["id"]) != profile_id or now["is_draft"]:
+            raise LookupError(f"draft '{slug}' not found")
+        return {"slug": slug, "id": profile_id}
     try:
         band = calibration.seed_similarity_band(
             profile.seed_embeddings(profile.embedding_model)
@@ -1209,7 +1217,14 @@ def commit_draft(
     except ValueError:
         band = None
     profiles_repo.update_seed_similarity(conn, profile_id, band)
-    schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
+    try:
+        schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
+    except sqlite3.IntegrityError:
+        # Deleted in another tab since the flip.
+        conn.rollback()
+        if profiles_repo.get_by_slug(conn, user_id, slug) is not None:
+            raise
+        raise LookupError(f"interest '{slug}' not found") from None
     return {"slug": slug, "id": profile_id}
 
 
@@ -1440,7 +1455,13 @@ def remove_seed(
         embed_missing(conn, row["embedding_model"], remaining)
         if not any(embeddings_repo.has(conn, s, row["embedding_model"]) for s in remaining):
             raise ValueError("none of the remaining seeds can be placed (no vector); add one that can before removing this one")
-    profiles_repo.detach_seed(conn, profile_id, stored)
+    if not profiles_repo.detach_seed(
+        conn, profile_id, stored,
+        keep_embedded=None if row["is_draft"] else row["embedding_model"],
+    ):
+        if _as_seed_id(conn, profile_id, openalex_id) is None:
+            return False  # removed meanwhile, in another tab
+        raise ValueError("an interest needs at least one seed that can be placed; add another before removing this one")
     if not row["is_draft"]:
         refit_profile(conn, user_id=user_id, slug=slug)
     return True
@@ -1671,7 +1692,7 @@ def _paper_to_card(
     dataclass instead of a sqlite row, since wizard previews don't
     persist candidates.
     """
-    score = round(float(score), 4)
+    score = floor4(score)
     terms = _paper_terms(paper)
     matched = [t.display_name for t in _matched_topics(paper, set(active_topic_ids))]
     abstract = paper.abstract or ""

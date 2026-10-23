@@ -219,7 +219,7 @@ def commit_draft(
     coherence_iqr: float | None,
     coherence_bimodal: bool | None,
     n_seed: int,
-) -> None:
+) -> int:
     """Flip a draft to a real profile and persist its calibrated fields.
 
     Called by the wizard's commit endpoint after the user picks a
@@ -231,7 +231,7 @@ def commit_draft(
     bimodal_int = (
         None if coherence_bimodal is None else (1 if coherence_bimodal else 0)
     )
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE profiles SET
           is_draft           = 0,
@@ -244,7 +244,7 @@ def commit_draft(
           coherence_bimodal  = ?,
           n_seed             = ?,
           updated_at         = datetime('now')
-        WHERE id = ?
+        WHERE id = ? AND is_draft = 1
         """,
         (
             threshold, tf_json, centroid, sel_json,
@@ -253,6 +253,8 @@ def commit_draft(
         ),
     )
     conn.commit()
+    # 0: no longer a draft (discarded, or committed by another tab).
+    return cur.rowcount
 
 
 def update_fit(
@@ -417,15 +419,25 @@ def attach_seed(
 
 
 def detach_seed(
-    conn: sqlite3.Connection, profile_id: int, openalex_id: str
+    conn: sqlite3.Connection, profile_id: int, openalex_id: str,
+    *, keep_embedded: str | None = None,
 ) -> int:
     """Remove one seed. Returns 1 if a row was deleted, 0 if it was not a seed.
 
     The paper itself stays in the vault; only the link to the profile goes.
+    ``keep_embedded`` (a model): delete only while another seed has a
+    vector under it, checked in the DELETE itself -- two tabs each
+    removing one of the last two seeds both passed a check made before.
     """
     cur = conn.execute(
-        "DELETE FROM profile_seeds WHERE profile_id = ? AND openalex_id = ?",
-        (profile_id, openalex_id),
+        """
+        DELETE FROM profile_seeds WHERE profile_id = ? AND openalex_id = ?
+          AND (? IS NULL OR EXISTS (
+            SELECT 1 FROM profile_seeds s JOIN paper_embeddings e
+              ON e.openalex_id = s.openalex_id AND e.embedding_model = ?
+            WHERE s.profile_id = ? AND s.openalex_id != ?))
+        """,
+        (profile_id, openalex_id, keep_embedded, keep_embedded, profile_id, openalex_id),
     )
     conn.execute(
         """

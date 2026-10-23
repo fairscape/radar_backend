@@ -15,6 +15,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from rag_lib.db.repos import (
     candidates as candidates_repo,
@@ -156,7 +157,7 @@ def daily(
     # Each card's own interest's threshold, for "closest to the bar" across interests.
     bar_of: dict[int, float] = {}
     profile_ids: list[int] = []
-    per_profile: list[tuple[int, list[Card], list[Card]]] = []
+    per_profile: list[tuple[int, list[Card], list[Card], Any]] = []
 
     for prow in profile_rows:
         pid = int(prow["id"])
@@ -207,21 +208,39 @@ def daily(
         # and when they shared one budget they crowded the first out.
         # One row over the limit for the papers still to look at, so an
         # interest past the cap alone still reports papers not shown.
-        per_profile.append((pid, cards_for(False, _DAILY_LIMIT + 1), cards_for(True, _DAILY_LIMIT)))
+        def hidden_by_bucket(kept: list[Card]) -> dict[str, int]:
+            # Counted, not read off the row past the cap: ranked by cosine
+            # that row is always "high", and the medium papers behind it
+            # went unmarked.
+            n, n_high = candidates_repo.count_untriaged_for_feed(
+                conn, pid, year_from=year_from,
+                sim_at_least=band if bucket == "high" else None,
+                sim_below=band if bucket == "medium" else None, band=band,
+            )
+            k_high = sum(1 for c in kept if c.bucket == "high")
+            out = {"high": max(n_high - k_high, 0), "medium": max(n - n_high - (len(kept) - k_high), 0)}
+            return {b: v for b, v in out.items() if v}
+
+        per_profile.append((pid, cards_for(False, _DAILY_LIMIT + 1), cards_for(True, _DAILY_LIMIT),
+                            hidden_by_bucket))
 
     cards: list[Card] = []
     n_unshown = 0
-    # By bucket, as far as the rows read show: the feed marks only those
-    # counts as "at least".
+    # By bucket: the feed marks only those counts as "at least".
     unshown_by_bucket: dict[str, int] = {}
-    fresh_shares = fair_shares([len(f) for _, f, _ in per_profile], _DAILY_LIMIT)
-    done_shares = fair_shares([len(d) for _, _, d in per_profile], _DAILY_LIMIT)
-    for (pid, fresh, done), n_fresh, n_done in zip(per_profile, fresh_shares, done_shares):
+    fresh_shares = fair_shares([len(f) for _, f, _, _ in per_profile], _DAILY_LIMIT)
+    done_shares = fair_shares([len(d) for _, _, d, _ in per_profile], _DAILY_LIMIT)
+    for (pid, fresh, done, hidden_by_bucket), n_fresh, n_done in zip(per_profile, fresh_shares, done_shares):
         kept = fresh[:n_fresh]
-        n_unshown += len(fresh) - len(kept)
-        for card in fresh[len(kept):]:
-            if card.bucket:
-                unshown_by_bucket[card.bucket] = unshown_by_bucket.get(card.bucket, 0) + 1
+        if len(fresh) > len(kept):
+            if bucket == "low":
+                # Below the bar is not split by bucket; the rows read are all low.
+                hidden = {"low": len(fresh) - len(kept)}
+            else:
+                hidden = hidden_by_bucket(kept)
+            n_unshown += sum(hidden.values())
+            for b, v in hidden.items():
+                unshown_by_bucket[b] = unshown_by_bucket.get(b, 0) + v
         cards.extend(kept)
         for card in done[:n_done]:
             cards.append(card)

@@ -416,6 +416,41 @@ def top_for_profile(
     ).fetchall()
 
 
+def count_untriaged_for_feed(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    *,
+    year_from: int | None = None,
+    sim_at_least: float | None = None,
+    sim_below: float | None = None,
+    band: float | None = None,
+) -> tuple[int, int]:
+    """``(all, like the seeds)`` of the papers to review ``top_for_profile``
+    would list without its ``LIMIT`` (the passing ones, ``triaged`` False).
+
+    "Like the seeds" is a raw cosine at least ``band``. The feed's counts of
+    papers past its cap: the rows read past it held only the top bucket.
+    """
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS n,
+               COALESCE(SUM(? IS NOT NULL AND pc.score_raw IS NOT NULL AND pc.score_raw >= ?), 0) AS n_high
+        FROM profile_candidates pc
+        JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
+        WHERE pc.profile_id = ?
+          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+          AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
+          AND (? IS NULL OR pc.score_raw >= ?)
+          AND (? IS NULL OR pc.score_raw IS NULL OR pc.score_raw < ?)
+          AND pc.saved_at IS NULL AND pc.dismissed_at IS NULL
+        """,
+        (band, band, profile_id, year_from, year_from, sim_at_least, sim_at_least,
+         sim_below, sim_below),
+    ).fetchone()
+    return int(row["n"]), int(row["n_high"])
+
+
 def topic_yield_for_profile(
     conn: sqlite3.Connection,
     profile_id: int,
