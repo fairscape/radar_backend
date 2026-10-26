@@ -1,7 +1,7 @@
 """Retriever tests: scope filtering and result shaping.
 
 A FakeCollection emulates Chroma's ``query`` semantics for the
-operators the retriever relies on (``$contains``, ``$or``).
+operators the retriever relies on (``$in``, ``$contains``, ``$or``).
 """
 
 from __future__ import annotations
@@ -42,6 +42,8 @@ def _matches(metadata: dict, where: dict | None) -> bool:
             field = metadata.get(k, "")
             for op, val in v.items():
                 if op == "$contains" and val not in str(field):
+                    return False
+                if op == "$in" and field not in val:
                     return False
         else:
             if metadata.get(k) != v:

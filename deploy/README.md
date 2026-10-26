@@ -55,6 +55,11 @@ UUID itself is not one: it is public in DNS as `<uuid>.cfargotunnel.com`.
 **`~/.config/rclone/rclone.conf`** — the R2 access key and secret
 (mode 600).
 
+**`$DEPLOY/bin/`** (`/bigtemp/nkw3mr/radar_deployment/bin`) — the `caddy`,
+`rclone` and `cloudflared` binaries `radar.sh` and `backup.sh` run. They
+are plain upstream releases, kept out of git for their size; to rebuild,
+download the same versions (`<binary> --version`) into that directory.
+
 ## The one thing a reader should know before changing Caddyfile
 
 The backend trusts the `X-User-Email` request header as identity with

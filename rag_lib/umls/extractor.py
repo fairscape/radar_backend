@@ -145,30 +145,19 @@ def extract_umls_concepts(
     # Collect concepts, dedup by CUI (keep highest confidence)
     seen: dict[str, UmlsConcept] = {}
 
-    # [umls-probe] 临时诊断 — 确认后整块删除（本文件两处 + vault.py + wizard.py）
-    from collections import Counter as _Counter
-
-    _p_drop = _Counter()          # 每个过滤器丢了多少 mention
-    _p_freq = _Counter()          # 存活概念被提及几次
-    _p_surf: dict[str, set] = {}  # 它们的原文写法
-    _p_head = text[:200].lower()  # 标题大致落在这里
-
     for ent in doc.ents:
         if not ent._.kb_ents:
-            _p_drop["linker 没给出候选"] += 1
             continue
 
         # Take the top match only (max_entities_per_mention=1)
         cui, score = ent._.kb_ents[0]
 
         if score < min_confidence:
-            _p_drop[f"分数 < {min_confidence}"] += 1
             continue
 
         # Look up full entity from KB
         kb_entry = linker.kb.cui_to_entity.get(cui)
         if kb_entry is None:
-            _p_drop["CUI 不在 KB 里"] += 1
             continue
 
         # Filter by relevant semantic types
@@ -180,11 +169,7 @@ def extract_umls_concepts(
                 break
 
         if relevant_tui is None:
-            _p_drop["语义类型不相关"] += 1
             continue
-
-        _p_freq[cui] += 1
-        _p_surf.setdefault(cui, set()).add(ent.text)
 
         # Dedup: keep highest confidence per CUI
         if cui in seen and seen[cui].confidence >= score:
@@ -200,28 +185,6 @@ def extract_umls_concepts(
 
     # Sort by confidence descending, truncate
     results = sorted(seen.values(), key=lambda c: c.confidence, reverse=True)
-
-    # [umls-probe] 漏斗 + 截断线。截断是整条链上唯一看不见的损失：被
-    # max_concepts 切掉的概念和"从没被抽出来"在下游长得一模一样。
-    print(f"\n[umls] 输入 {len(text):,} 字符 -> NER {len(doc.ents)} 个实体 "
-          f"-> {len(seen)} 个概念通过全部过滤器 -> 返回 {min(len(results), max_concepts)} "
-          f"(cap {max_concepts})", flush=True)
-    for _why, _n in _p_drop.most_common():
-        print(f"[umls]   丢弃 {_n:5d}  {_why}", flush=True)
-    print(f"[umls] 保留的（排序键=linker 字符串匹配分, T=出现在开头200字符内）:",
-          flush=True)
-    for _i, _c in enumerate(results[:max_concepts], 1):
-        _t = "T" if any(m.lower() in _p_head for m in _p_surf.get(_c.cui, ())) else " "
-        print(f"[umls]   {_i:3d} {_c.confidence:.4f} x{_p_freq[_c.cui]:<3d} {_t} "
-              f"{_c.name[:38]:40s}{sorted(_p_surf.get(_c.cui, []))[:3]}", flush=True)
-    if len(results) > max_concepts:
-        _cut = sorted(results[max_concepts:], key=lambda c: -_p_freq[c.cui])[:10]
-        print(f"[umls] 被 cap 切掉 {len(results) - max_concepts} 个，"
-              f"其中提及次数最多的 10 个:", flush=True)
-        for _c in _cut:
-            _r = results.index(_c) + 1
-            print(f"[umls]   x{_p_freq[_c.cui]:<3d} {_c.confidence:.4f} "
-                  f"(分数排名 {_r:3d})  {_c.name[:44]}", flush=True)
 
     return results[:max_concepts]
 
