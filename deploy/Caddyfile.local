@@ -1,0 +1,45 @@
+# RADAR on one machine without Cloudflare (see DEPLOY.md).
+#
+# Serves the built frontend and proxies /api to the backend, so the
+# browser stays same-origin. Run with:
+#
+#   caddy run --config deploy/Caddyfile.local --adapter caddyfile
+#
+# Replace /path/to/radar_frontend/dist with the frontend's build output.
+#
+# Identity: this file sets no X-User-Email, so every request is the
+# default user (single-user mode, RADAR_REQUIRE_AUTH=false). It strips a
+# client-sent one, or anyone could pick an account. For several users,
+# put a proxy that signs people in in front of this and have it set
+# X-User-Email (deploy/Caddyfile shows how the live site does it with
+# Cloudflare Access).
+{
+	admin off
+	auto_https off
+}
+
+http://:8080 {
+	# Loopback only: open it to the network (or put TLS in front) on purpose.
+	bind 127.0.0.1
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up -X-User-Email
+			header_down Cache-Control "no-store"
+			# Trial scans and PDF uploads run for minutes.
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	handle {
+		root * /path/to/radar_frontend/dist
+		@shell not path /assets/*
+		header @shell Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

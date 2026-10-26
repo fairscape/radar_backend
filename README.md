@@ -29,25 +29,20 @@ per-user PDFs/feedback under `./vault/`, vector indexes under `./chroma/`.
 
 ## Install
 
-Requires Python 3.12+.
+To deploy RADAR (backend and frontend) on a machine of your own, follow
+[DEPLOY.md](DEPLOY.md). For development:
 
 ```sh
-git clone https://github.com/fairscape/radar_backend.git
-cd radar_backend
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[phase1b,dev]'   # phase1b = SPECTER2 + chroma + ollama + pdfplumber
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-py312.txt --extra-index-url https://download.pytorch.org/whl/cu124
+pip install -e . --no-deps
 cp .env.example .env
 python -m cli.db init             # create SQLite + apply migrations
 python -m cli.serve               # 127.0.0.1:8000
 ```
 
-Verify: `curl http://localhost:8000/api/health`.
-
-Settings load from env / `.env`; see `.env.example` for every key. The
-ones most likely to need tuning: `RADAR_DEFAULT_MAILTO` (OpenAlex
-polite-pool), `RADAR_OLLAMA_URL` (defaults to `http://ollama:11434` for
-compose; set to `http://localhost:11434` for local dev), and
-`RADAR_CORS_ORIGINS`.
+Verify: `curl http://localhost:8000/api/health`. Settings load from env /
+`.env`; see `.env.example` for every key.
 
 ## CLI
 
