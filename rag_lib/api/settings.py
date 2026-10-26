@@ -131,6 +131,11 @@ class Settings(BaseSettings):
     RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 10
     RADAR_UMLS_MIN_TOPIC_SIMILARITY: float = 0.40
     RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"
+    # OpenAlex topics mapped from LLM-generated research topics (rag_lib.llm_topics):
+    # a label's best match from MIN, more from EXTRA; at most MAX added per run.
+    RADAR_LLM_TOPIC_MIN_SIMILARITY: float = 0.65
+    RADAR_LLM_TOPIC_EXTRA_SIMILARITY: float = 0.80
+    RADAR_LLM_MAX_TOPIC_ADDITIONS: int = 10
     # Topics for an upload OpenAlex does not have, read from the PDF's own
     # text against the same topic index (rag_lib.content_topics).
     RADAR_CONTENT_TOPICS_ENABLED: bool = True

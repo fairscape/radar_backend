@@ -48,7 +48,7 @@ from ...db.repos import (
     users as users_repo,
     schedules as schedules_repo,
 )
-from ... import researcher_topics
+from ... import interest_terms, llm_topics, researcher_topics
 from ...gatherers.openalex import OpenAlexGatherer
 from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
@@ -421,6 +421,7 @@ def _aggregate_topics(
     topic_filters = Profile.aggregate_topic_filters(papers)
     _keep_content_topics(topic_filters, from_content)
     _keep_adopted_topics(stored, topic_filters)
+    llm_topics.keep_stored(stored, topic_filters)
 
     # Best-effort UMLS topic merge: read the per-paper mapped topics
     # that vault.upload() stored and merge novel ones into the filters.
@@ -914,6 +915,63 @@ def save_topics(
     from rag_lib.scheduler.jobs import request_rerank_refresh
     request_rerank_refresh(profile_id)
     return pruned
+
+
+class NoLlmTopics(ValueError):
+    """The interest has no saved research topics an LLM generated."""
+
+
+def map_llm_topics(conn: sqlite3.Connection, settings: Any, *, user_id: int, slug: str) -> dict:
+    """Add the OpenAlex topics nearest the interest's saved LLM research
+    topics to its topic list, switched off (``llm_topics``).
+
+    Only research topics an LLM generated are mapped (Prosopia's own, the
+    cluster method's and hand-entered lists are not), as saved: an unsaved
+    preview is not read. Returns ``{"topic_filters", "added", "n_labels"}``.
+
+    The labels are embedded first, with no lock held; the stored list is
+    then read, merged and written under one write lock, so a topic switched
+    in another tab meanwhile is not undone.
+    """
+    row = _require_profile(conn, user_id, slug)
+    profile_id = int(row["id"])
+    if gather_runs_repo.has_unfinished_import(conn, profile_id):
+        raise ImportInProgress(slug)
+    record = interest_terms.load(row)
+    if not record or record.get("source") not in llm_topics.LLM_RECORD_SOURCES or not record.get("saved", True):
+        raise NoLlmTopics("generate research topics with Claude and save them first")
+    labels = [t.get("label") for t in record.get("terms") or [] if t.get("label")]
+    if not labels:
+        raise NoLlmTopics("the saved research topics are empty")
+    matches = llm_topics.map_labels(
+        labels,
+        embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
+        cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+        min_similarity=settings.RADAR_LLM_TOPIC_MIN_SIMILARITY,
+        extra_similarity=settings.RADAR_LLM_TOPIC_EXTRA_SIMILARITY,
+    )
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if profiles_repo.get_by_slug(conn, user_id, slug) is None:
+            raise LookupError(f"interest '{slug}' not found")
+        merged, added = llm_topics.merge(
+            _stored_topic_filters(conn, profile_id), matches,
+            max_additions=settings.RADAR_LLM_MAX_TOPIC_ADDITIONS,
+            cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+        )
+        conn.execute(
+            "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(merged), profile_id),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    log.info("wizard.llm_topics_mapped", profile_id=profile_id, n_labels=len(labels),
+             n_matches=len(matches), n_added=len(added))
+    return {"topic_filters": merged, "added": added, "n_labels": len(labels)}
 
 
 # ---------------------------------------------------------------------------

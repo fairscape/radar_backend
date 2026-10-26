@@ -175,6 +175,16 @@ class Topic(_Model):
     # What the researcher's profile says about it, when its topics are applied:
     # ``interest`` or ``not_interest`` (rag_lib/researcher_topics.py).
     profile: str | None = None
+    # ``source: llm``: the research topic it was mapped from (rag_lib/llm_topics.py).
+    llm_label: str | None = None
+
+
+class LlmTopicsResult(_Model):
+    """``POST /api/profiles/{key}/llm-topics``: the topics added (off) and the list now."""
+
+    added: list[Topic]
+    topics: list[Topic]
+    n_labels: int
 
 
 class TopicSelection(_Model):

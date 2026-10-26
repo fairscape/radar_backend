@@ -333,6 +333,7 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
             on=bool(it.get("on", True)),
             source=it.get("source"),
             profile=it.get("profile"),
+            llm_label=it.get("llm_label"),
         ))
     return out
 

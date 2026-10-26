@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
     FeedbackThresholdResponse,
+    LlmTopicsResult,
     SeedUmlsStatus,
     CommitDraftRequest,
     Draft,
@@ -61,6 +62,7 @@ from ..services import wizard as wizard_service
 from ..settings import Settings
 
 log = structlog.get_logger("rag_lib.api.routers.profiles")
+from ...redact import public_error
 
 router = APIRouter()
 
@@ -342,6 +344,7 @@ def draft_topics(
             papers=int(entry["papers"]) if entry.get("papers") is not None else None,
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            llm_label=entry.get("llm_label"),
             profile=entry.get("profile"),
         ))
     return out
@@ -926,6 +929,7 @@ def _topics_out(topic_filters: dict, new: set[str] | None = None) -> list[Topic]
             papers=int(entry["papers"]) if entry.get("papers") is not None else None,
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            llm_label=entry.get("llm_label"),
             new=(tid in new) if new is not None else None,
             profile=entry.get("profile"),
         ))
@@ -1073,6 +1077,35 @@ def save_topics(
     return _topics_out(topic_filters)
 
 
+@router.post("/{key}/llm-topics", response_model=LlmTopicsResult)
+def map_llm_topics(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> LlmTopicsResult:
+    """Map the interest's saved LLM research topics to OpenAlex topics and
+    add the new ones, switched off, as ``source: llm``. No LLM call: the
+    labels are embedded locally. 409 without saved LLM topics or mid-import;
+    503 when the topic index or the embedder is unavailable."""
+    try:
+        out = wizard_service.map_llm_topics(db, settings, user_id=int(user["id"]), slug=key)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"an import is still filling '{exc.slug}'") from exc
+    except wizard_service.NoLlmTopics as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        # No topic index, one built with another model, or the embedder down.
+        log.warning("profile.llm_topics_unavailable", key=key, error=str(exc))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"topic mapping is not available right now: {public_error(exc)}") from exc
+    return LlmTopicsResult(added=_topics_out({"topics": out["added"]}),
+                           topics=_topics_out(out["topic_filters"]), n_labels=out["n_labels"])
+
+
 @router.post("/{key}/recompute-topics", response_model=list[Topic])
 def recompute_topics(
     key: str,
@@ -1106,6 +1139,7 @@ def recompute_topics(
             papers=int(entry["papers"]) if entry.get("papers") is not None else None,
             on=bool(entry.get("on", True)),
             source=entry.get("source"),
+            llm_label=entry.get("llm_label"),
             profile=entry.get("profile"),
         ))
     return out
