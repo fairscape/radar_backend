@@ -86,9 +86,11 @@ Models download on first use. To keep them off a small home directory:
 export HF_HOME=/big/disk/radar-cache/huggingface    # SPECTER2, MedCPT
 ```
 
-The UMLS knowledge base (~2 GB) downloads into
-`RADAR_UMLS_CACHE_DIR/datasets` the first time a paper's concepts are
-extracted.
+With `RADAR_UMLS_ENABLED=true` the backend loads the UMLS linker before
+it opens its port, so **the first start downloads the UMLS knowledge
+base (~2 GB) into `RADAR_UMLS_CACHE_DIR/datasets` and does not answer
+until that is done** -- several minutes on a fresh machine. Later starts
+take about a minute. Watch the backend's output for the progress bars.
 
 ### The OpenAlex topic index
 
@@ -101,7 +103,9 @@ data/umls_cache/openalex_topics.json
 data/umls_cache/openalex_topic_embeddings.npz
 ```
 
-Ask the RADAR maintainers for these two files (18 MB) and copy them in.
+Ask the RADAR maintainers for `radar-openalex-topic-index.tar.gz`
+(17 MB) and unpack it in the backend directory:
+`tar xzf radar-openalex-topic-index.tar.gz -C data`.
 `scripts/build_topic_index.py` can rebuild them, but it pages through
 OpenAlex (see the API key note above), and it must be run with
 `--embedding-model mxbai-embed-large`: its default embedder produces
@@ -193,10 +197,14 @@ header and checks nothing behind it.
 ## Check that it works
 
 1. `curl http://127.0.0.1:8080/api/health` answers with the version.
-2. In the browser, **New interest**: add a few seed papers (a DOI list,
+2. In single-user mode you are the built-in `demo@example.com`, whose
+   OpenAlex contact address is that too (`RADAR_DEFAULT_MAILTO` only
+   applies to users created later). Set your own under **Settings ->
+   Contact email for OpenAlex** before the first scan.
+3. In the browser, **New interest**: add a few seed papers (a DOI list,
    an ORCID, or PDFs), let step 3 suggest topics, run the trial scan in
    step 4, save.
-3. The feed fills once the first scan finishes (**Scans** shows it).
+4. The feed fills once the first scan finishes (**Scans** shows it).
 
 ## Known issues in this release
 
