@@ -89,8 +89,10 @@ export HF_HOME=/big/disk/radar-cache/huggingface    # SPECTER2, MedCPT
 With `RADAR_UMLS_ENABLED=true` the backend loads the UMLS linker before
 it opens its port, so **the first start downloads the UMLS knowledge
 base (~2 GB) into `RADAR_UMLS_CACHE_DIR/datasets` and does not answer
-until that is done** -- several minutes on a fresh machine. Later starts
-take about a minute. Watch the backend's output for the progress bars.
+until that is done** -- about seven minutes on a fresh machine. Later
+starts still load the models and linker before answering: one to four
+minutes depending on the machine's load. Watch the backend's output for
+the progress bars.
 
 ### The OpenAlex topic index
 
@@ -201,9 +203,10 @@ header and checks nothing behind it.
    OpenAlex contact address is that too (`RADAR_DEFAULT_MAILTO` only
    applies to users created later). Set your own under **Settings ->
    Contact email for OpenAlex** before the first scan.
-3. In the browser, **New interest**: add a few seed papers (a DOI list,
-   an ORCID, or PDFs), let step 3 suggest topics, run the trial scan in
-   step 4, save.
+3. In the browser, **New interest**: add a few seed papers (upload PDFs,
+   pick works from an ORCID, or import a Prosopia profile by its URL),
+   let step 3 suggest topics, run the trial scan in step 4, save.
+   Concept extraction in step 3 took about a minute per PDF here.
 4. The feed fills once the first scan finishes (**Scans** shows it).
 
 ## Known issues in this release
