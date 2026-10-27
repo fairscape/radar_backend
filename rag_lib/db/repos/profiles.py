@@ -221,11 +221,15 @@ def commit_draft(
     coherence_bimodal: bool | None,
     fit_seeds: list[str],
     band: dict | None,
+    topic_filters_was: str | None,
 ) -> int:
     """Flip a draft to a real profile and persist its calibrated fields.
 
     Written only while the draft's seeds are still ``fit_seeds`` (see
-    ``_write_fit``); raises ``SeedsChanged`` otherwise.
+    ``_write_fit``); raises ``SeedsChanged`` otherwise. And only while its
+    stored topic list is still ``topic_filters_was`` (the raw JSON the
+    pruned list was made from): 0 rows otherwise, as for a draft that is
+    gone.
 
     Called by the wizard's commit endpoint after the user picks a
     threshold and selected topics. Centroid + selector_config are the
@@ -244,7 +248,8 @@ def commit_draft(
         " coherence_bimodal = ?",
         (bar(threshold), tf_json, centroid, sel_json,
          coherence_median, coherence_iqr, bimodal_int),
-        "AND is_draft = 1",
+        "AND is_draft = 1 AND topic_filters_json IS ?",
+        (topic_filters_was,),
     )
 
 
@@ -252,7 +257,7 @@ class SeedsChanged(RuntimeError):
     """The seeds a fit was made from changed before it was written."""
 
 
-def _write_fit(conn, profile_id, fit_seeds, band, set_sql, params, where_extra="") -> int:
+def _write_fit(conn, profile_id, fit_seeds, band, set_sql, params, where_extra="", where_params=()) -> int:
     """Write a fit (and the seed band it came with) only if the profile's
     seeds are still the ones it was made from.
 
@@ -285,7 +290,7 @@ def _write_fit(conn, profile_id, fit_seeds, band, set_sql, params, where_extra="
              band["min"] if band else None,
              band["median"] if band else None,
              band["max"] if band else None,
-             profile_id),
+             profile_id, *where_params),
         )
         conn.commit()
         return cur.rowcount

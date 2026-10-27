@@ -195,9 +195,10 @@ def test_a_label_mapping_to_both_sides_is_kept_on_both_and_a_dead_embedder_chang
     rt.reset_label_cache()
     # The view comes back as read, saying its labels are not mapped; with
     # UMLS off there is nothing to map, which is not an outage.
-    assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == {**rt.read(DOCUMENT), "labels_unmapped": True}
+    assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == {**rt.read(DOCUMENT), "labels_unmapped": True, "label_matching": True}
     off = rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False))
-    assert off == {**rt.read(DOCUMENT), "labels_unmapped": False, "unmatched_labels": rt.read(DOCUMENT)["unwanted_labels"]}
+    assert off == {**rt.read(DOCUMENT), "labels_unmapped": False, "label_matching": False,
+                   "unmatched_labels": rt.read(DOCUMENT)["unwanted_labels"]}
 
 
 def test_the_mapper_carries_the_profile_mark():
@@ -412,7 +413,7 @@ def test_a_profile_without_interests_reads_as_unavailable(env):
     rid = _import_prosopia(app)
     assert _request(app, "GET", f"/api/researchers/{rid}").json()["topics"] == {
         "available": False, "wanted": [], "unwanted": [], "wanted_labels": [], "unwanted_labels": [],
-        "labels_unmapped": False, "unmatched_labels": [], "not_interest": []}
+        "labels_unmapped": False, "unmatched_labels": [], "label_matching": False, "not_interest": []}
 
 
 def _import_prosopia(app) -> int:
@@ -571,11 +572,11 @@ def test_label_mapping_remembers_a_miss_and_backs_off_after_a_failure(monkeypatc
         raise RuntimeError("ollama down")
     monkeypatch.setattr("rag_lib.embedders.get_embedder", boom)
     rt.reset_label_cache()
-    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True}
+    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True, "label_matching": True}
     # Backing off: nothing is asked for a while, so the next call does not raise and maps nothing.
     monkeypatch.setattr("rag_lib.embedders.get_embedder", lambda m: (lambda text: calls.append(text) or np.array([ord(c) for c in text], dtype=np.float32)))
     n = len(calls)
-    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True}
+    assert rt.with_labels(rt.read(doc), settings=settings) == {**rt.read(doc), "labels_unmapped": True, "label_matching": True}
     assert len(calls) == n
     # No labels at all: nothing to map, not an outage.
     assert rt.with_labels(rt.read({"research_interests": []}), settings=settings)["labels_unmapped"] is False
@@ -1261,3 +1262,122 @@ def test_choices_are_not_carried_once_the_researcher_is_gone(env):
         conn.close()
     _topics(app, slug)
     assert "not_interest_choices" not in _stored(env, slug)
+
+
+# --- not-wanted choices: after the second review -----------------------------------
+
+
+@pytest.mark.parametrize("first,then,expect", [
+    ("filter", "keep", (True, None)),           # back on, unmarked
+    ("add", "filter", None),                    # only the profile had brought it: gone
+])
+def test_a_choice_on_a_draft_is_made_while_the_mapper_is_down(env, monkeypatch, first, then, expect):
+    """The draft's choice went through a rebuild, which keeps the stored
+    marks while the labels cannot be mapped: recorded, not applied."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    tid = "T10001" if first == "filter" else "https://openalex.org/T11986"
+    chosen = _choose(app, slug, tid, first)
+    assert (chosen[tid]["on"], chosen[tid]["profile"]) == ((False, "not_interest") if first == "filter" else (True, "interest"))
+    monkeypatch.setattr(wizard.researcher_topics, "with_labels",
+                        lambda view, *, settings: {**view, "labels_unmapped": True})
+    after = _choose(app, slug, tid, then)
+    stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    if expect is None:
+        assert tid not in after and tid not in stored
+    else:
+        assert (after[tid]["on"], after[tid]["profile"]) == expect
+        assert stored[tid]["on"] is True and "profile" not in stored[tid]
+
+
+def test_a_commit_does_not_write_over_a_choice_made_while_it_fitted(env, monkeypatch):
+    """The commit pruned the list it read and wrote it after the fit,
+    seconds later: a choice from another tab in between was lost."""
+    from rag_lib.api.services import wizard
+    from rag_lib.db.repos import profiles as profiles_repo
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    real = profiles_repo.commit_draft
+    calls = []
+
+    def racing(conn, profile_id, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            other = connect(env)
+            try:
+                wizard.set_not_interest_choice(other, user_id=1, slug=slug, topic_id="https://openalex.org/T11986", choice="add")
+            finally:
+                other.close()
+        return real(conn, profile_id, **kw)
+
+    monkeypatch.setattr(profiles_repo, "commit_draft", racing)
+    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    stored = _stored(env, slug)
+    assert len(calls) == 2
+    assert stored["not_interest_choices"]["T11986"] == "add"
+    assert any(t["id"] == "https://openalex.org/T11986" for t in stored["topics"])
+
+
+def test_an_apply_retried_after_a_commit_works_on_the_saved_list(env, monkeypatch):
+    """The row was read once, before the retries: a draft committed in
+    between was rebuilt from its seeds as a draft, over the saved list."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    real_rebuilt, real_stored = wizard._researcher_topics_rebuilt, wizard._researcher_topics_on_stored
+    used = []
+
+    def rebuilt(conn, profile_id, **kw):
+        used.append("draft")
+        out = real_rebuilt(conn, profile_id, **kw)
+        other = connect(env)
+        try:                                     # the commit lands in another tab
+            other.execute("UPDATE profiles SET is_draft = 0 WHERE id = ?", (profile_id,))
+            other.commit()
+        finally:
+            other.close()
+        return out
+
+    def on_stored(*a, **kw):
+        used.append("saved")
+        return real_stored(*a, **kw)
+
+    monkeypatch.setattr(wizard, "_researcher_topics_rebuilt", rebuilt)
+    monkeypatch.setattr(wizard, "_researcher_topics_on_stored", on_stored)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    assert used == ["draft", "saved"]
+
+
+def test_the_view_survives_a_rebuild_that_fails(env, monkeypatch):
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+
+    def boom(*a, **k):
+        raise RuntimeError("umls index gone")
+
+    monkeypatch.setattr(wizard, "_aggregate_topics", boom)
+    rows = _rows(app, slug)
+    assert rows["https://openalex.org/T10001"]["overlap"] == ["openalex"]   # from the stored list
+
+
+def test_a_choice_records_only_itself(env):
+    """A choice also wrote the defaults of the other unrecorded not-wanted
+    topics, without applying them: one then read "filter" while still on."""
+    profile = _profile_with_document()
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
+                                                           _topic("T12345", "Something New", weight=-0.4, method="declared")]}
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    recorded = dict(_stored(env, slug)["not_interest_choices"])
+    _choose(app, slug, "T10001", "filter")
+    assert _stored(env, slug)["not_interest_choices"] == {**recorded, "T10001": "filter"}
+    assert _rows(app, slug)["https://openalex.org/T10001"]["marked"] == "not_interest"

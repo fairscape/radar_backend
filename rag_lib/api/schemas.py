@@ -766,6 +766,8 @@ class NotInterestTopic(_Model):
     choice: Literal["filter", "keep", "add"]
     in_list: bool = False
     on: bool | None = None
+    # The listed topic's mark (``interest`` / ``not_interest``), None unmarked.
+    marked: str | None = None
 
 
 class ResearcherTopics(_Model):
@@ -786,6 +788,8 @@ class ResearcherTopics(_Model):
     # The not-wanted labels that map to no topic (none is known while
     # ``labels_unmapped``).
     unmatched_labels: list[str] = Field(default_factory=list)
+    # Labels are matched to topics at all (UMLS on); off, every label is unmatched.
+    label_matching: bool = False
     # ``unwanted`` with each topic's choice on this interest (the interest's
     # researcher-topics view only; empty on the researcher page).
     not_interest: list[NotInterestTopic] = Field(default_factory=list)

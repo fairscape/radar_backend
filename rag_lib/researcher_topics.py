@@ -174,6 +174,7 @@ def public(view: dict) -> dict:
         "unwanted_labels": list(view.get("unwanted_labels") or []),
         "labels_unmapped": bool(view.get("labels_unmapped")),
         "unmatched_labels": list(view.get("unmatched_labels") or []),
+        "label_matching": bool(view.get("label_matching")),
     }
 
 
@@ -292,6 +293,36 @@ def apply(topic_filters: dict, view: dict, *, basis: dict | None = None) -> dict
     return out
 
 
+def chosen_topic(topic_filters: dict | None, view: dict, topic_code: str, choice: str) -> dict | None:
+    """The not-wanted topic coded ``topic_code`` as ``choice`` leaves it in
+    ``topic_filters`` -- as :func:`apply` would mark it -- or None when it
+    is not in the list then. ``filter`` marks a listed topic; ``add``
+    marks it as wanted, or brings it in (``source = "researcher"``, on);
+    ``keep`` leaves it unmarked unless the profile wants it as well. A
+    topic only the profile had brought leaves the list unless wanted."""
+    item = next((t for t in view.get("unwanted") or [] if _code(t["id"]) == topic_code), None)
+    listed = next((t for t in (topic_filters or {}).get("topics") or []
+                   if t.get("id") and _code(t["id"]) == topic_code), None)
+    wanted = any(_code(t["id"]) == topic_code for t in view.get("wanted") or [])
+    if choice == FILTER:
+        mark = NOT_INTEREST
+    elif choice == ADD or wanted:
+        mark = INTEREST
+    else:
+        mark = None
+    if listed is None:
+        if mark != INTEREST or item is None:
+            return None
+        return {"id": item["id"], "display_name": item["display_name"], "count": 0, "papers": 0,
+                "source": SOURCE, "profile": INTEREST, "on": True, BEFORE: False}
+    if mark != INTEREST and listed.get("source") == SOURCE:
+        return None       # only the profile had brought it
+    out = {k: v for k, v in listed.items() if k != "profile"}
+    if mark:
+        out["profile"] = mark
+    return out
+
+
 def not_interest_rows(view: dict, topic_filters: dict | None, *, basis: dict | None = None) -> list[dict]:
     """Each not-wanted topic as the topic step lists it: what it was
     matched from, where else it comes from, its choice (recorded on
@@ -319,6 +350,10 @@ def not_interest_rows(view: dict, topic_filters: dict | None, *, basis: dict | N
             "choice": choices.get(c) or default_choice(overlap.get(c, [])),
             "in_list": listed is not None,
             "on": bool(listed.get("on", True)) if listed is not None else None,
+            # Whether the list carries the choice yet: a list applied before
+            # choices were recorded gets a topic a new seed brought marked
+            # on its next rebuild.
+            "marked": listed.get("profile") if listed is not None else None,
         })
     return rows
 
@@ -436,7 +471,8 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     an aggregation keeps what its last full read stored of it. With UMLS
     off there is nothing to map against, which is not an outage.
     ``unmatched_labels`` are the not-wanted labels that map to no topic
-    (all of them with UMLS off; none is known while the mapper is down).
+    (all of them with UMLS off; none is known while the mapper is down);
+    ``label_matching`` says whether labels are matched at all (UMLS on).
     """
     import time
 
@@ -445,11 +481,13 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     # The topic-name index is part of the UMLS cache: without it there is
     # nothing to map against.
     if settings is None or not getattr(settings, "RADAR_UMLS_ENABLED", False):
-        return {**view, "labels_unmapped": False, "unmatched_labels": list(view.get("unwanted_labels") or [])}
+        return {**view, "labels_unmapped": False, "label_matching": False,
+                "unmatched_labels": list(view.get("unwanted_labels") or [])}
     if time.monotonic() < _DOWN_UNTIL:
-        return {**view, "labels_unmapped": labels}
+        return {**view, "labels_unmapped": labels, "label_matching": True}
     out = {k: (list(v) if isinstance(v, list) else v) for k, v in view.items()}
     out["labels_unmapped"] = False
+    out["label_matching"] = True
     out["unmatched_labels"] = []
     on_side = {side: {t["id"] for t in out[side]} for side in ("wanted", "unwanted")}
     for side in ("wanted", "unwanted"):
@@ -462,7 +500,7 @@ def with_labels(view: dict, *, settings: Any) -> dict:
                 structlog.get_logger("rag_lib.researcher_topics").warning(
                     "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160],
                     retry_in_s=LABEL_RETRY_SECONDS)
-                return {**view, "labels_unmapped": labels}
+                return {**view, "labels_unmapped": labels, "label_matching": True}
             if hit is None:
                 if side == "unwanted":
                     out["unmatched_labels"].append(label)

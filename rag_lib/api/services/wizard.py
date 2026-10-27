@@ -408,7 +408,6 @@ class TopicsChanging(RuntimeError):
 
 def _aggregate_topics(
     conn: sqlite3.Connection, profile_id: int, *, new_on: bool, profile_topics: bool | None = None,
-    choices: dict[str, str] | None = None,
 ) -> dict:
     """The seeds' aggregated topics, carrying forward prior on/off states.
 
@@ -419,7 +418,6 @@ def _aggregate_topics(
     ``profile_topics`` says whether the researcher's profile topics are folded
     in: None reads the stored flag, True/False overrides it (the apply and
     remove paths, which then write what this returns in one go).
-    ``choices`` replaces the stored not-wanted choices (a choice being set).
     """
     prior_on = _prior_topic_states(conn, profile_id)
     stored = _stored_topic_filters(conn, profile_id)
@@ -440,8 +438,7 @@ def _aggregate_topics(
     applied = researcher_topics.is_applied(stored) if profile_topics is None else bool(profile_topics)
     from_profile = _researcher_topics_for(conn, profile_id) if applied else None
     if from_profile is not None:
-        topic_filters[researcher_topics.CHOICES] = (
-            dict(choices) if choices is not None else researcher_topics.stored_choices(stored, from_profile))
+        topic_filters[researcher_topics.CHOICES] = researcher_topics.stored_choices(stored, from_profile)
         topic_filters = researcher_topics.apply(topic_filters, from_profile)
         if from_profile.get("labels_unmapped"):
             # Part of the profile (its text labels) could not be mapped just
@@ -701,10 +698,18 @@ def _not_interest_rows(conn: sqlite3.Connection, row: sqlite3.Row, view: dict, s
 
 
 def _overlap_basis(conn: sqlite3.Connection, profile_id: int) -> dict:
-    """The seeds' topic list without the profile: what a not-wanted topic's
-    default is counted against. (Which topics are listed does not depend
-    on ``new_on``, only their states.)"""
-    return _aggregate_topics(conn, profile_id, new_on=False, profile_topics=False)
+    """The list rebuilt from the seeds without the profile: what a
+    not-wanted topic's default is counted against, as every rebuild
+    counts it -- so the default shown is the one recorded. (A read-only
+    copy of the rebuild would have to repeat its UMLS, PDF-text, Claude
+    and adopted rules and drift from them.) Should the rebuild fail, the
+    stored list's topics stand in rather than the view failing."""
+    try:
+        return _aggregate_topics(conn, profile_id, new_on=False, profile_topics=False)
+    except Exception as exc:  # noqa: BLE001 -- a view, not a write
+        log.warning("wizard.overlap_basis_from_stored", profile_id=profile_id, reason=type(exc).__name__)
+        return {"topics": [t for t in _stored_topic_filters(conn, profile_id).get("topics") or []
+                           if t.get("source") != researcher_topics.SOURCE]}
 
 
 def set_researcher_topics(
@@ -745,10 +750,12 @@ def set_researcher_topics(
                 "this interest was not built from a researcher whose profile lists topics"
             )
     for _attempt in range(3):
-        got = conn.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()
-        if got is None:
+        # The row again each time: a commit in between makes a draft a saved
+        # interest, whose list must not be rebuilt from the seeds.
+        row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        if row is None:
             raise LookupError(f"interest '{slug}' not found")  # deleted in another tab
-        raw = got[0]
+        raw = row["topic_filters_json"]
         out = _set_researcher_topics_once(conn, row, profile_id, enabled=enabled, raw=raw, choice=choice)
         if out is not None:
             return out
@@ -768,18 +775,23 @@ def _set_researcher_topics_once(
         # Nothing applied, nothing to take off: the stored list stays as it
         # is (a rebuild here would bring in topics the user has not seen).
         return stored
-    choices = None
     if choice is not None:
         if not researcher_topics.is_applied(stored):
             raise ValueError("apply the profile's topics before choosing what to do with the ones it does not want")
         view = _researcher_topics_for(conn, profile_id)
-        choices = {**researcher_topics.stored_choices(stored, view), researcher_topics.code(choice[0]): choice[1]}
-    if row["is_draft"]:
-        full = _researcher_topics_rebuilt(conn, profile_id, enabled=enabled, choices=choices)
+        if view is None:
+            raise ValueError("this interest was not built from a researcher whose profile lists topics")
+        # Draft or saved, the one topic moves on the stored list and nothing
+        # else does: no rebuild, so neither the label mapper being down
+        # (which keeps the stored marks) nor a re-import that changed other
+        # marks can undo or widen the choice. The next rebuild settles the rest.
+        c = researcher_topics.code(choice[0])
+        choices = {**researcher_topics.stored_choices(stored, view), c: choice[1]}
+        full = _with_one_topic_from(stored, researcher_topics.chosen_topic(stored, view, c, choice[1]), c, choices)
+    elif row["is_draft"]:
+        full = _researcher_topics_rebuilt(conn, profile_id, enabled=enabled)
     else:
-        full = _researcher_topics_on_stored(
-            conn, profile_id, stored, enabled=enabled, choices=choices,
-            only=researcher_topics.code(choice[0]) if choice is not None else None)
+        full = _researcher_topics_on_stored(conn, profile_id, stored, enabled=enabled)
     if enabled:
         topics = full.get("topics") or []
         if topics and not any(t.get("on", True) for t in topics):
@@ -791,8 +803,9 @@ def _set_researcher_topics_once(
         if not row["is_draft"] and kept and not any(t.get("on", True) for t in kept):
             raise NoTopicOn("removing the profile's topics would leave none on: switch one on first")
     cur = conn.execute(
-        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ? AND topic_filters_json IS ?",
-        (json.dumps(full), profile_id, raw),
+        "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now')"
+        " WHERE id = ? AND topic_filters_json IS ? AND is_draft = ?",
+        (json.dumps(full), profile_id, raw, row["is_draft"]),
     )
     conn.commit()
     if cur.rowcount == 0:
@@ -807,7 +820,7 @@ def _set_researcher_topics_once(
 
 
 def _researcher_topics_rebuilt(
-    conn: sqlite3.Connection, profile_id: int, *, enabled: bool, choices: dict[str, str] | None = None,
+    conn: sqlite3.Connection, profile_id: int, *, enabled: bool,
 ) -> dict:
     """A draft's list with the profile applied or taken off: rebuilt from
     the seeds, as step 3 shows it anyway (a new topic starts on there).
@@ -815,10 +828,8 @@ def _researcher_topics_rebuilt(
     the states itself: only a topic whose mark changed moves, so the
     user's other switches stay."""
     prior_on = _prior_topic_states(conn, profile_id)
-    full = _aggregate_topics(conn, profile_id, new_on=True, profile_topics=True, choices=choices)
+    full = _aggregate_topics(conn, profile_id, new_on=True, profile_topics=True)
     topics = full.get("topics") or []
-    if enabled and choices is not None:
-        return full
     if enabled:
         for t in topics:
             if t.get("profile"):
@@ -833,7 +844,6 @@ def _researcher_topics_rebuilt(
 
 def _researcher_topics_on_stored(
     conn: sqlite3.Connection, profile_id: int, stored: dict, *, enabled: bool,
-    choices: dict[str, str] | None = None, only: str | None = None,
 ) -> dict:
     """A saved interest's list with the profile applied or taken off,
     worked on the stored list itself.
@@ -852,27 +862,20 @@ def _researcher_topics_on_stored(
     not keep stale marks) and folds the profile in as the aggregation
     does: wanted topics on, not-wanted ones off, the prior state remembered.
 
-    With ``only`` (the code of a not-wanted topic whose choice is being
-    set, in ``choices``) only that topic moves; every other topic stays as
-    stored, the user's switches and the marks included -- also those a
-    re-import changed since, which the next rebuild settles as it settles
-    any.
     """
     topics = [dict(t) for t in stored.get("topics") or []]
     for t in topics:
         _restore_before(t)
     plain = researcher_topics.strip({**stored, "topics": topics})
     view = _researcher_topics_for(conn, profile_id)
-    plain[researcher_topics.CHOICES] = (
-        choices if choices is not None else researcher_topics.stored_choices(stored, view))
+    plain[researcher_topics.CHOICES] = researcher_topics.stored_choices(stored, view)
     if not enabled:
         return plain
     if view is None:  # pragma: no cover -- set_researcher_topics checked
         raise ValueError("this interest was not built from a researcher whose profile lists topics")
-    if view.get("labels_unmapped") and researcher_topics.is_applied(stored) and only is None:
+    if view.get("labels_unmapped") and researcher_topics.is_applied(stored):
         # Part of the profile (its text labels) cannot be read just now:
         # the list as last applied in full is better than one missing them.
-        # (A choice touches one topic the view has; it goes ahead.)
         return stored
     before = {t["id"]: bool(t.get("on", True)) for t in plain.get("topics") or [] if t.get("id")}
     full = researcher_topics.apply(plain, view, basis=_overlap_basis(conn, profile_id))
@@ -884,19 +887,16 @@ def _researcher_topics_on_stored(
             # profile then leaves it off rather than widening the scan.
             t[researcher_topics.BEFORE] = before.get(t["id"], False)
             t["on"] = t["profile"] == researcher_topics.INTEREST
-    if only is not None:
-        return _with_one_topic_from(stored, full, only)
     return full
 
 
-def _with_one_topic_from(stored: dict, full: dict, only: str) -> dict:
-    """``stored`` with the topic coded ``only`` as ``full`` has it, and
-    ``full``'s choices. The topic keeps its stored state when its mark is
-    the same; one that gains a mark is set as the mark says, its state
-    before remembered; one that loses it goes back to that state (or out,
-    if only the profile brought it)."""
+def _with_one_topic_from(stored: dict, new: dict | None, only: str, choices: dict[str, str]) -> dict:
+    """``stored`` with the topic coded ``only`` as ``new`` has it (None: not
+    in the list), and ``choices``. The topic keeps its stored state when
+    its mark is the same; one that gains a mark is set as the mark says,
+    its state before remembered; one that loses it goes back to that state
+    (unless the user switched it since)."""
     code = researcher_topics.code
-    new = next((t for t in full.get("topics") or [] if t.get("id") and code(t["id"]) == only), None)
     out = dict(stored)
     topics, seen = [], False
     for old in stored.get("topics") or []:
@@ -924,7 +924,7 @@ def _with_one_topic_from(stored: dict, full: dict, only: str) -> dict:
     if not seen and new is not None:
         topics.append(dict(new))
     out["topics"] = topics
-    out[researcher_topics.CHOICES] = full.get(researcher_topics.CHOICES) or {}
+    out[researcher_topics.CHOICES] = dict(choices)
     out[researcher_topics.FLAG] = True
     return out
 
@@ -1364,38 +1364,51 @@ def commit_draft(
     if gather_runs_repo.has_unfinished_import(conn, profile_id):
         raise ImportInProgress(slug)
 
-    full_topics = profiles_repo.topic_filters(conn, profile_id)
-    # As save_topics: with every topic off, each scan gathers nothing.
-    ids = {t["id"] for t in (full_topics or {}).get("topics") or [] if t.get("id")}
-    if ids and not (set(selected_topic_ids) & ids):
-        raise ValueError("switch on at least one topic: a scan searches by them")
-    pruned = _prune_topic_filters(full_topics, set(selected_topic_ids))
+    # The list is pruned from the stored one as read, and written only if
+    # that is still what is stored: the fit takes seconds, and a profile-topic
+    # choice or an apply made meanwhile in another tab was written over.
+    for _attempt in range(3):
+        raw = _raw_topic_filters(conn, profile_id)
+        try:
+            full_topics = json.loads(raw) if raw else {}
+        except ValueError:
+            full_topics = {}
+        # As save_topics: with every topic off, each scan gathers nothing.
+        ids = {t["id"] for t in (full_topics or {}).get("topics") or [] if t.get("id")}
+        if ids and not (set(selected_topic_ids) & ids):
+            raise ValueError("switch on at least one topic: a scan searches by them")
+        pruned = _prune_topic_filters(full_topics, set(selected_topic_ids))
 
-    def write(profile, sel_cfg, diag, centroid_blob, band):
-        return profiles_repo.commit_draft(
-            conn,
-            profile_id,
-            threshold=threshold,
-            topic_filters=pruned,
-            centroid=centroid_blob,
-            selector_config=sel_cfg,
-            coherence_median=diag.get("coherence_median"),
-            coherence_iqr=diag.get("coherence_iqr"),
-            coherence_bimodal=diag.get("coherence_bimodal"),
-            fit_seeds=sel_cfg[FIT_SEEDS],
-            band=band,
+        def write(profile, sel_cfg, diag, centroid_blob, band, pruned=pruned, raw=raw):
+            return profiles_repo.commit_draft(
+                conn,
+                profile_id,
+                threshold=threshold,
+                topic_filters=pruned,
+                centroid=centroid_blob,
+                selector_config=sel_cfg,
+                coherence_median=diag.get("coherence_median"),
+                coherence_iqr=diag.get("coherence_iqr"),
+                coherence_bimodal=diag.get("coherence_bimodal"),
+                fit_seeds=sel_cfg[FIT_SEEDS],
+                band=band,
+                topic_filters_was=raw,
+            )
+        flipped, _profile = _fit_and_write(
+            conn, lambda: _require_draft(conn, user_id, slug),
+            lambda r, prof: _new_selector_for_draft(r, prof, threshold=threshold),
+            write, topic_filters=pruned,
         )
-    flipped, _profile = _fit_and_write(
-        conn, lambda: _require_draft(conn, user_id, slug),
-        lambda r, prof: _new_selector_for_draft(r, prof, threshold=threshold),
-        write, topic_filters=pruned,
-    )
-    if not flipped:
-        # Discarded in another tab while fitting, or committed there first.
+        if flipped:
+            break
         now = profiles_repo.get_by_slug(conn, user_id, slug)
-        if now is None or int(now["id"]) != profile_id or now["is_draft"]:
-            raise LookupError(f"draft '{slug}' not found")
-        return {"slug": slug, "id": profile_id}
+        if now is None or int(now["id"]) != profile_id:
+            raise LookupError(f"draft '{slug}' not found")   # discarded in another tab while fitting
+        if not now["is_draft"]:
+            return {"slug": slug, "id": profile_id}           # committed there first
+        log.info("wizard.commit_after_topics_change", profile_id=profile_id)
+    else:
+        raise TopicsChanging(profile_id)
     try:
         schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
     except sqlite3.IntegrityError:

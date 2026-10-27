@@ -147,7 +147,7 @@ def test_a_topic_list_that_keeps_changing_is_a_409_not_a_500(monkeypatch):
         def execute(self, *a):
             class R:
                 def fetchone(self):
-                    return ["[]"]
+                    return {"topic_filters_json": "[]", "is_draft": 0}
             return R()
 
     import pytest
