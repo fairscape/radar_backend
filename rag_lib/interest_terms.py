@@ -335,7 +335,7 @@ def generate(conn: sqlite3.Connection, settings: Any, profile_row: sqlite3.Row, 
     from researcher_profiles.embeddings.backends import get_backend
 
     be = backend if backend is not None else get_backend(BACKEND_SPEC)
-    root = Path(getattr(settings, "RADAR_RP_PROFILES_DIR", None) or Path(settings.RADAR_VAULT_DIR).parent / "rp_profiles") / str(pid)
+    root = Path(settings.RADAR_VAULT_DIR).parent / "rp_profiles" / str(pid)
     t0 = time.monotonic()
     prof, ids = build_lite_profile(root, profile_row, seeds, backend=be)
     sources = _chunk_sources(root)

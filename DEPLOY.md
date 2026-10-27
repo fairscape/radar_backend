@@ -56,29 +56,29 @@ imported ahead of the environment's and breaks model loading.
 ### Configuration
 
 Settings come from environment variables and `.env` in the directory
-you start the backend from. **The repository tracks a `.env` holding the
-live site's choices; replace it:**
+you start the backend from. `.env` is not in the repository; start from
+the live site's settings, which make RADAR behave as the site does
+(UMLS topics on, MedCPT reranking of scan results with seed titles and
+abstracts as its query, no nightly scans):
 
 ```sh
-cp .env.example .env
+cp deploy/env.example .env
 ```
 
-then set at least:
+and change the four values that belong to the live machine:
 
 ```sh
+RADAR_DB_PATH=data/radar.db            # a local disk, see below
 RADAR_DEFAULT_MAILTO=you@your.org      # OpenAlex contact address
 RADAR_REQUIRE_AUTH=false               # single user, see "Users" below
-RADAR_UMLS_ENABLED=true                # topics from UMLS concepts and PDF content
-RADAR_UMLS_EMBEDDING_MODEL=mxbai-embed-large
-RADAR_RERANKER_ENABLED=true            # MedCPT reranking of scan results
-RADAR_RERANKER_DEVICE=cuda             # or cpu
+RADAR_RERANKER_DEVICE=cuda             # or cpu without an NVIDIA GPU
 ```
 
-Paths default to `data/` under the backend directory (`RADAR_DB_PATH`,
-`RADAR_VAULT_DIR`, `RADAR_CHROMA_DIR`, `RADAR_UMLS_CACHE_DIR`). Keep the
-database on a local disk: on NFS RADAR falls back to SQLite's slower
-rollback journal, because WAL is not safe there. `.env.example` documents
-every other key.
+The vault and Chroma index go in `vault/` and `chroma/`, logs in `logs/`,
+all beside the backend; the UMLS data and topic index in
+`data/umls_cache/`. Keep the database on a local disk: on NFS RADAR falls
+back to SQLite's slower rollback journal, because WAL is not safe there.
+`.env.example` documents every key.
 
 Models download on first use. To keep them off a small home directory:
 
