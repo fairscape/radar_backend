@@ -487,15 +487,15 @@ def delete_researcher(
     # filling lost its "still importing" state and could be committed half
     # done.
     _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
-    interests = [(int(p["id"]), not p["is_draft"]) for p in researchers_repo.interests_for(conn, researcher_id)]
+    interests = [int(p["id"]) for p in researchers_repo.interests_for(conn, researcher_id)]
     researchers_repo.delete(conn, researcher_id)
     # Their profile topics, where applied, go with them: the saved list is
     # what every scan reads, and with the researcher gone nothing else
     # would rebuild it (the box that offers "Remove" needs the researcher).
     # After the delete, so a delete that fails changes no list; a drop that
     # fails is met by the next aggregation, which finds the researcher gone.
-    for profile_id, live in interests:
-        wizard_service.drop_profile_topics(conn, profile_id, live=live)
+    for profile_id in interests:
+        wizard_service.drop_profile_topics(conn, profile_id)
 
 
 # ---------------------------------------------------------------------------

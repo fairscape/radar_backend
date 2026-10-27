@@ -293,16 +293,24 @@ def apply(topic_filters: dict, view: dict, *, basis: dict | None = None) -> dict
     return out
 
 
-def chosen_topic(topic_filters: dict | None, view: dict, topic_code: str, choice: str) -> dict | None:
+def chosen_topic(topic_filters: dict | None, view: dict, topic_code: str, choice: str, *,
+                 basis: dict | None = None) -> dict | None:
     """The not-wanted topic coded ``topic_code`` as ``choice`` leaves it in
-    ``topic_filters`` -- as :func:`apply` would mark it -- or None when it
-    is not in the list then. ``filter`` marks a listed topic; ``add``
-    marks it as wanted, or brings it in (``source = "researcher"``, on);
-    ``keep`` leaves it unmarked unless the profile wants it as well. A
-    topic only the profile had brought leaves the list unless wanted."""
+    ``topic_filters`` -- as :func:`apply` on the list rebuilt from the seeds
+    (``basis``) would have it -- or None when it is not in the list then.
+
+    ``filter`` marks it; ``add`` marks it as wanted, or brings it in, on;
+    ``keep`` leaves it unmarked unless the profile wants it as well. Whether
+    a topic is the profile's alone is read from ``basis``, not from the
+    stored ``source``: a saved list is rebuilt only when saved, so a topic a
+    seed has brought since still reads ``researcher`` there. One no other
+    source lists leaves the list unless the profile wants it (``apply``
+    keeps a wanted one it filters, marked and off)."""
     item = next((t for t in view.get("unwanted") or [] if _code(t["id"]) == topic_code), None)
     listed = next((t for t in (topic_filters or {}).get("topics") or []
                    if t.get("id") and _code(t["id"]) == topic_code), None)
+    elsewhere = next((t for t in (basis or {}).get("topics") or []
+                      if t.get("id") and _code(t["id"]) == topic_code and t.get("source") != SOURCE), None)
     wanted = any(_code(t["id"]) == topic_code for t in view.get("wanted") or [])
     if choice == FILTER:
         mark = NOT_INTEREST
@@ -313,11 +321,19 @@ def chosen_topic(topic_filters: dict | None, view: dict, topic_code: str, choice
     if listed is None:
         if mark != INTEREST or item is None:
             return None
+        if elsewhere is not None:     # a seed has it now: as the next rebuild lists it
+            return {**{k: v for k, v in elsewhere.items() if k != "profile"}, "profile": INTEREST,
+                    "on": True, BEFORE: False}
         return {"id": item["id"], "display_name": item["display_name"], "count": 0, "papers": 0,
                 "source": SOURCE, "profile": INTEREST, "on": True, BEFORE: False}
-    if mark != INTEREST and listed.get("source") == SOURCE:
-        return None       # only the profile had brought it
     out = {k: v for k, v in listed.items() if k != "profile"}
+    if listed.get("source") == SOURCE:
+        if elsewhere is not None:
+            out["source"] = elsewhere.get("source") or "openalex"
+            if elsewhere.get("source") is None:
+                out.pop("source")
+        elif not wanted and mark != INTEREST:
+            return None       # only the profile had brought it
     if mark:
         out["profile"] = mark
     return out

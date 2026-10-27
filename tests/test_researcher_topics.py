@@ -1309,6 +1309,7 @@ def test_a_commit_does_not_write_over_a_choice_made_while_it_fitted(env, monkeyp
             other = connect(env)
             try:
                 wizard.set_not_interest_choice(other, user_id=1, slug=slug, topic_id="https://openalex.org/T11986", choice="add")
+                wizard.set_not_interest_choice(other, user_id=1, slug=slug, topic_id="T10001", choice="filter")
             finally:
                 other.close()
         return real(conn, profile_id, **kw)
@@ -1318,7 +1319,10 @@ def test_a_commit_does_not_write_over_a_choice_made_while_it_fitted(env, monkeyp
     stored = _stored(env, slug)
     assert len(calls) == 2
     assert stored["not_interest_choices"]["T11986"] == "add"
-    assert any(t["id"] == "https://openalex.org/T11986" for t in stored["topics"])
+    # And its effect: the commit's ticks were for the list before the choice.
+    by = {t["id"]: t for t in stored["topics"]}
+    assert by["https://openalex.org/T11986"]["on"] is True and by["https://openalex.org/T11986"]["profile"] == "interest"
+    assert by["T10001"]["on"] is False and by["T10001"]["profile"] == "not_interest"
 
 
 def test_an_apply_retried_after_a_commit_works_on_the_saved_list(env, monkeypatch):
@@ -1381,3 +1385,137 @@ def test_a_choice_records_only_itself(env):
     _choose(app, slug, "T10001", "filter")
     assert _stored(env, slug)["not_interest_choices"] == {**recorded, "T10001": "filter"}
     assert _rows(app, slug)["https://openalex.org/T10001"]["marked"] == "not_interest"
+
+
+
+# --- not-wanted choices: after the third review ------------------------------------
+
+
+def test_keep_on_a_saved_interest_keeps_a_topic_a_seed_has_brought_since(env):
+    """Added (only the profile had it), saved; a seed carries it since. Keep
+    read the stored ``source: researcher`` and took it out of the list --
+    scans stopped searching it, and the next save brought it back off."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    t11986 = "https://openalex.org/T11986"
+    _choose(app, slug, t11986, "add")
+    _commit(app, slug, [t["id"] for t in applied if t["on"]] + [t11986])
+    _add_seed_topics(env, slug, [("T11986", "Scientific Computing")])
+    assert _rows(app, slug)[t11986]["overlap"] == ["openalex"]
+    kept = _choose(app, slug, t11986, "keep")
+    # Still listed, as the seed's; back to its state before the add -- off,
+    # as any topic a seed brings to a saved interest starts -- and the next
+    # rebuild agrees rather than bringing it back as new.
+    assert t11986 in kept and kept[t11986]["profile"] is None and kept[t11986]["source"] != "researcher"
+    preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
+    assert preview[t11986]["on"] is kept[t11986]["on"] is False
+    assert preview[t11986].get("new") is not True
+
+
+def test_filtering_a_topic_the_profile_also_wants_keeps_it_listed_off(env, monkeypatch):
+    """A not-wanted label that maps onto a wanted topic only the profile
+    brings: filtered, apply keeps it (marked, off); the choice took it out,
+    and the next rebuild put it back."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    t10222 = "https://openalex.org/T10222"
+    real = wizard.researcher_topics.with_labels
+
+    def with_labels(view, *, settings):
+        out = real(view, settings=settings)
+        return {**out, "unwanted": [*out["unwanted"], {"id": t10222, "display_name": "Genomics and Chromatin Dynamics",
+                                                        "weight": None, "method": "label", "label": "chromatin stuff",
+                                                        "similarity": 0.8}]}
+
+    monkeypatch.setattr(wizard.researcher_topics, "with_labels", with_labels)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    chosen = _choose(app, slug, t10222, "filter")
+    assert chosen[t10222]["on"] is False and chosen[t10222]["profile"] == "not_interest"
+    again = _topics(app, slug)
+    assert again[t10222]["on"] is False and again[t10222]["profile"] == "not_interest"
+
+
+def test_a_step_3_read_overtaken_by_the_commit_does_not_rebuild_the_saved_list(env, monkeypatch):
+    """The draft's rebuild was redone on the committed interest and written
+    over it: a topic the seeds had gained came in on, unseen."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    real = wizard._aggregate_topics
+    hits = []
+
+    def racing(conn, profile_id, **kw):
+        out = real(conn, profile_id, **kw)
+        if not hits:
+            hits.append(1)
+            other = connect(env)
+            try:
+                stored = json.loads(other.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()[0])
+                stored["marker"] = "committed"
+                other.execute("UPDATE profiles SET is_draft = 0, topic_filters_json = ? WHERE id = ?", (json.dumps(stored), profile_id))
+                other.commit()
+            finally:
+                other.close()
+        return out
+
+    monkeypatch.setattr(wizard, "_aggregate_topics", racing)
+    resp = _request(app, "GET", f"/api/profiles/draft/{slug}/topics")
+    assert resp.status_code == 409
+    assert _stored(env, slug)["marker"] == "committed"
+
+
+def test_forgetting_after_a_commit_treats_the_interest_as_saved(env, monkeypatch):
+    """Draft or saved was read before the delete, outside the lock: a commit
+    in between had the saved list stripped as a draft's."""
+    from rag_lib.api.services import researchers as researchers_service
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    applied = _apply_filtering(app, slug)
+    only_profile = [i for i, t in applied.items() if t["on"] and t.get("source") == "researcher"]
+    real = researchers_service.researchers_repo.delete
+
+    def committing(conn, researcher_id):
+        conn.execute("UPDATE profiles SET is_draft = 0 WHERE slug = ?", (slug,))
+        conn.commit()
+        return real(conn, researcher_id)
+
+    monkeypatch.setattr(researchers_service.researchers_repo, "delete", committing)
+    assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    assert only_profile and all(stored[i]["source"] == "adopted" and stored[i]["on"] for i in only_profile)
+
+
+def test_the_view_leaves_step_3s_umls_notice_as_it_was(env, monkeypatch):
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    conn = connect(env)
+    try:
+        pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]
+    finally:
+        conn.close()
+    wizard._UMLS_MERGE_STATE[pid] = {"available": False, "reason": "busy", "n": 0}
+    _rows(app, slug)
+    assert wizard._UMLS_MERGE_STATE[pid] == {"available": False, "reason": "busy", "n": 0}
+
+
+def test_keep_takes_the_source_another_source_now_lists_it_under():
+    from rag_lib.api.services import wizard
+    tid = "https://openalex.org/T11986"
+    stored = {"researcher_topics": True, "topics": [
+        {"id": "T10001", "display_name": "Test Topic", "on": True},
+        {"id": tid, "display_name": "Scientific Computing", "count": 0, "source": rt.SOURCE,
+         "profile": rt.INTEREST, "on": True, rt.BEFORE: True}]}
+    view = {"wanted": [], "unwanted": [{"id": tid, "display_name": "Scientific Computing"}]}
+    basis = {"topics": [{"id": tid, "display_name": "Scientific Computing", "count": 2, "source": "umls"}]}
+    new = rt.chosen_topic(stored, view, "T11986", rt.KEEP, basis=basis)
+    out = {t["id"]: t for t in wizard._with_one_topic_from(stored, new, "T11986", {"T11986": rt.KEEP})["topics"]}
+    assert out[tid]["source"] == "umls"
+    assert out[tid]["on"] is True and "profile" not in out[tid] and rt.BEFORE not in out[tid]
+    # No other source: only the profile had it, so it goes.
+    assert rt.chosen_topic(stored, view, "T11986", rt.KEEP, basis={"topics": []}) is None
