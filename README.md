@@ -24,8 +24,8 @@ This README covers the standalone backend.
 
 API surface lives at `rag_lib.api.app:app`; routers in
 `rag_lib/api/routers/` (`health`, `users`, `profiles`, `radar`,
-`vault`, `chat`). State persists in SQLite (`./data/radar.db`),
-per-user PDFs/feedback under `./vault/`, vector indexes under `./chroma/`.
+`vault`, `chat`). State persists under `./data/` by default: SQLite in
+`radar.db`, per-user PDFs/feedback in `vault/`, vector indexes in `chroma/`.
 
 ## Install
 
@@ -36,7 +36,7 @@ To deploy RADAR (backend and frontend) on a machine of your own, follow
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-py312.txt --extra-index-url https://download.pytorch.org/whl/cu124
 pip install -e . --no-deps
-cp .env.example .env
+cp .env.example .env              # code defaults; deploy/env.example is the live site's
 python -m cli.db init             # create SQLite + apply migrations
 python -m cli.serve               # 127.0.0.1:8000
 ```

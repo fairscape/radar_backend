@@ -152,8 +152,8 @@ register_selector("my_team_v1", MySelector)
 **Where to put these calls.** Put them in your package's top-level
 `__init__.py` so importing your package once at process start is enough.
 For the FastAPI service, that means importing your package in
-`rag_lib/api/app.py` (or via a `RADAR_PLUGINS` env var if your
-deployment prefers indirection — wire up to taste).
+`rag_lib/api/app.py`. RADAR has no setting that loads plugins by name;
+add one there if your deployment wants that indirection.
 
 **Naming.**
 - Embedder keys are user-facing (they show up in JSON and the API);

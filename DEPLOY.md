@@ -112,7 +112,7 @@ data/umls_cache/openalex_topic_embeddings.npz
 
 Ask the RADAR maintainers for `radar-openalex-topic-index.tar.gz`
 (17 MB) and unpack it in the backend directory:
-`tar xzf radar-openalex-topic-index.tar.gz -C data`.
+`mkdir -p data && tar xzf radar-openalex-topic-index.tar.gz -C data`.
 `scripts/build_topic_index.py` can rebuild them, but it pages through
 OpenAlex (see the API key note above), and it must be run with
 `--embedding-model mxbai-embed-large`: its default embedder produces
@@ -129,7 +129,9 @@ curl http://127.0.0.1:8000/api/health
 ```
 
 The backend applies any pending migrations at every start, so upgrading
-is `git pull`, then restart. Back the database up before an upgrade
+is `git pull`, then restart. A clone from before this release tracked a
+`.env`; move yours aside before that pull (`mv .env .env.mine`) and back
+after it, or git refuses the pull or deletes the file. Back the database up before an upgrade
 (safe while the backend runs):
 
 ```sh

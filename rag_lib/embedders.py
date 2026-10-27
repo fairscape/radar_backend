@@ -207,8 +207,6 @@ def _ollama_embed_factory(model_name: str) -> Embedder:
     this so a missing model / unreachable ollama doesn't break uploads.
     """
     import httpx  # local import — keeps module import cheap for tests
-    import os
-
     # mxbai / nomic / bge-large all cap input at 512 BPE tokens.
     # Char-to-token ratio is ~4 for typical English prose but can be
     # ~2 for dense scientific PDFs (formulas, URLs, fused words from
@@ -221,7 +219,10 @@ def _ollama_embed_factory(model_name: str) -> Embedder:
     _emb_log = structlog.get_logger("rag_lib.embedders.ollama")
 
     def _embed(text: str) -> list[float]:
-        url = os.environ.get("RADAR_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        # Through Settings, so a URL set in .env reaches the embeddings
+        # and not only chat (os.environ never sees .env).
+        from rag_lib.api.settings import get_settings
+        url = get_settings().RADAR_OLLAMA_URL.rstrip("/")
         endpoint = f"{url}/api/embeddings"
 
         last_error: Exception | None = None
