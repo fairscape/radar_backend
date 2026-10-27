@@ -161,6 +161,18 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
+    @field_validator(
+        "RADAR_ANTHROPIC_API_KEY", "RADAR_OPENAI_API_KEY", "RADAR_LOG_FILE",
+        "RADAR_GATHER_MAX_CANDIDATES", mode="before",
+    )
+    @classmethod
+    def _empty_is_unset(cls, value: object) -> object:
+        # "KEY=" in .env means unset, as .env.example presents it; an int
+        # field would otherwise refuse "" and stop the backend starting.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("RADAR_LLM_PROVIDER", mode="before")
     @classmethod
     def _normalize_provider(cls, value: object) -> str:

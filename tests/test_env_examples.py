@@ -27,13 +27,14 @@ CODE_DIRS = ("rag_lib/", "cli/", "scripts/")
 
 
 def _tracked() -> list[str]:
-    try:
-        out = subprocess.run(
-            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
+    # Skip only outside a checkout; a git that is there but fails (dubious
+    # ownership, say) fails the test rather than quietly checking nothing.
+    if not (ROOT / ".git").exists():
         pytest.skip("not a git checkout")
-    return [f for f in out.splitlines() if (ROOT / f).is_file()]
+    out = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout
+    return [f for f in out.split("\0") if f and (ROOT / f).is_file()]
 
 
 def _docs() -> list[str]:
@@ -53,7 +54,7 @@ COMMENTED = re.compile(r"^#\s*(RADAR_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
 
 
 def _text(name: str) -> str:
-    return (ROOT / name).read_text(encoding="utf-8")
+    return (ROOT / name).read_text(encoding="utf-8", errors="replace")
 
 
 def test_documented_keys_are_settings():
@@ -129,3 +130,11 @@ def test_deploy_env_example_has_no_comment_after_a_value():
 def test_env_is_not_tracked():
     tracked = [f for f in _tracked() if Path(f).name.startswith(".env") and f != ".env.example"]
     assert tracked == [], "ship deploy/env.example instead"
+
+
+@pytest.mark.parametrize("key", sorted(k for k, f in Settings.model_fields.items() if f.default is None))
+def test_an_empty_value_means_unset(key, monkeypatch):
+    # .env.example shows these as "# KEY=": uncommenting the line as it
+    # stands must not stop the backend starting.
+    monkeypatch.setenv(key, "")
+    assert getattr(Settings(_env_file=None), key) is None
