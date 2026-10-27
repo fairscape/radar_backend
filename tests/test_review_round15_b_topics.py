@@ -50,7 +50,9 @@ def test_draft_on_off_on_restores_manual_choices(tmp_path, monkeypatch):
     conn, uid, pid, slug, _ = _setup(tmp_path, monkeypatch, DOC, draft=True)
     wizard.aggregate_draft_topics(conn, user_id=uid, slug=slug)
     wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T2])   # user: T1 off, T2 on
-    a = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    # T2 is a seed topic as well: kept until the user filters it out.
+    a = wizard.set_not_interest_choice(conn, user_id=uid, slug=slug, topic_id=T2, choice="filter")
     assert _states(a) == {T1: True, T2: False, T3: True}
     r = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=False)
     assert _states(r) == {T1: False, T2: True}, _states(r)
@@ -68,7 +70,8 @@ def test_live_on_off_on_restores_manual_choices(tmp_path, monkeypatch):
                          {"id": T2, "display_name": "Two", "count": 1, "on": True}]}
     conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE id = ?", (json.dumps(stored), pid))
     conn.commit()
-    a = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    a = wizard.set_not_interest_choice(conn, user_id=uid, slug=slug, topic_id=T2, choice="filter")
     assert _states(a) == {T1: True, T2: False, T3: True}
     # edit page: preview then save without changes in between (user saves another tick)
     prev, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)

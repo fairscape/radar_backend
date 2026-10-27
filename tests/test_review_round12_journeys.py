@@ -423,7 +423,14 @@ def test_j2_researcher_profiles_end_to_end(app, env):
     assert view["researcher_id"] == rid and view["applied"] is False and view["topics"]["available"] is True
     before = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/topics"))}
     assert before["T10001"]["on"] is True and before["T10001"]["profile"] is None and before["T10001"]["source"] is None
-    applied = {t["id"]: t for t in _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}))}
+    kept = {t["id"]: t for t in _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}))}
+    # The seeds carry T10001 too, so it is kept until the user filters it out.
+    assert kept["T10001"]["on"] is True and kept["T10001"]["profile"] is None
+    rows = _ok(_request(app, "GET", f"/api/profiles/{slug}/researcher-topics"))["topics"]["not_interest"]
+    assert [(r["id"], r["choice"], r["overlap"]) for r in rows] == [
+        ("https://openalex.org/T10001", "keep", ["openalex"]), ("https://openalex.org/T11986", "filter", [])]
+    applied = {t["id"]: t for t in _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics/not-interest",
+                                                 json={"topic_id": "https://openalex.org/T10001", "choice": "filter"}))}
     assert applied["T10001"]["on"] is False and applied["T10001"]["profile"] == "not_interest"
     for tid in ("https://openalex.org/T10222", "https://openalex.org/T10515"):
         assert applied[tid]["on"] is True and applied[tid]["source"] == "researcher" and applied[tid]["profile"] == "interest"

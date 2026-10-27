@@ -745,6 +745,27 @@ class ResearcherTopic(_Model):
     # matched from a text concept the profile could not map itself.
     method: str = "inferred"
     label: str | None = None
+    # How close the label's nearest topic is (method ``label``).
+    similarity: float | None = None
+
+
+class NotInterestTopic(_Model):
+    """One topic the profile does not want, as the topic step lists it."""
+
+    id: str
+    name: str
+    method: str = "inferred"
+    label: str | None = None
+    weight: float | None = None
+    similarity: float | None = None
+    # Other sources listing the same topic: ``openalex`` (a seed), ``umls``,
+    # ``pdf_content``, ``llm``, ``adopted``, ``profile_interest``.
+    overlap: list[str] = Field(default_factory=list)
+    # ``filter`` it out, ``keep`` it as the other sources have it, or ``add``
+    # it as a topic; recorded once the profile is applied, the default before.
+    choice: Literal["filter", "keep", "add"]
+    in_list: bool = False
+    on: bool | None = None
 
 
 class ResearcherTopics(_Model):
@@ -762,6 +783,9 @@ class ResearcherTopics(_Model):
     # The labels could not be mapped to topics just now (the mapper is down);
     # ``wanted``/``unwanted`` then hold only the topics the profile asserts outright.
     labels_unmapped: bool = False
+    # ``unwanted`` with each topic's choice on this interest (the interest's
+    # researcher-topics view only; empty on the researcher page).
+    not_interest: list[NotInterestTopic] = Field(default_factory=list)
 
 
 class ProfileResearcherTopics(_Model):
@@ -779,6 +803,13 @@ class ResearcherTopicsUpdate(_Model):
     """Body of ``PUT /api/profiles/{key}/researcher-topics``."""
 
     enabled: bool
+
+
+class NotInterestChoiceUpdate(_Model):
+    """Body of ``PUT /api/profiles/{key}/researcher-topics/not-interest``."""
+
+    topic_id: str
+    choice: Literal["filter", "keep", "add"]
 
 
 class ResearcherMarkUpdate(_Model):

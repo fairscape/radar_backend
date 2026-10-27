@@ -16,6 +16,15 @@ profile has an opinion on is marked ``profile = "interest" | "not_interest"``
 so the lists can show it and the aggregation can start a not-wanted topic
 switched off. The profile's negatives are a filter, never a deletion: the
 topic stays in the list, off, and the user can switch it back on.
+
+Each not-wanted topic also carries the user's choice for it
+(``topic_filters["not_interest_choices"]``, by topic code): ``filter`` it out
+(off wherever the seeds bring it in), ``keep`` it as the other sources have
+it, or ``add`` it as a topic of the interest's own. Until the user picks,
+it is ``keep`` when another source lists the same topic -- the seeds, UMLS,
+a PDF, Claude, or the profile's own interests -- and ``filter`` otherwise;
+that default is recorded when the profile is applied, so a seed that brings
+a filtered topic in later finds it off.
 """
 
 from __future__ import annotations
@@ -34,6 +43,13 @@ ADOPTED = "adopted"          # topic_filters key: the profile's topics are appli
 # On a marked topic: its on/off before the profile was applied, restored when
 # the profile is removed again.
 BEFORE = "on_before_profile"
+CHOICES = "not_interest_choices"   # topic_filters key: {topic code: choice}
+FILTER = "filter"
+KEEP = "keep"
+ADD = "add"
+CHOICE_VALUES = (FILTER, KEEP, ADD)
+#: How the profile's own interests show among a not-wanted topic's other sources.
+PROFILE_INTEREST = "profile_interest"
 
 _TOPIC_ID = re.compile(r"^(?:https?://(?:api\.)?openalex\.org/(?:topics/)?)?(T\d+)$", re.IGNORECASE)
 
@@ -149,7 +165,8 @@ def public(view: dict) -> dict:
     """``view`` in the API's spelling: each topic's ``display_name`` as ``name``."""
     def _t(t: dict) -> dict:
         return {"id": t["id"], "name": t.get("display_name") or t["id"], "weight": t.get("weight"),
-                "method": t.get("method") or "inferred", "label": t.get("label")}
+                "method": t.get("method") or "inferred", "label": t.get("label"),
+                "similarity": t.get("similarity")}
     return {
         "wanted": [_t(t) for t in view.get("wanted") or []],
         "unwanted": [_t(t) for t in view.get("unwanted") or []],
@@ -179,12 +196,48 @@ def is_applied(topic_filters: dict | None) -> bool:
     return bool((topic_filters or {}).get(FLAG))
 
 
+def other_sources(topic_filters: dict | None, view: dict) -> dict[str, list[str]]:
+    """``{topic code: [source, ...]}``: where each topic in the list came
+    from other than the profile, plus the profile's own interests
+    (:data:`PROFILE_INTEREST`). A seed's OpenAlex topic is ``openalex``."""
+    found: dict[str, set[str]] = {}
+    for t in (topic_filters or {}).get("topics") or []:
+        if t.get("id") and t.get("source") != SOURCE:
+            found.setdefault(_code(t["id"]), set()).add(t.get("source") or "openalex")
+    for item in view.get("wanted") or []:
+        found.setdefault(_code(item["id"]), set()).add(PROFILE_INTEREST)
+    return {c: sorted(v) for c, v in found.items()}
+
+
+def default_choice(overlap: list[str] | set[str]) -> str:
+    """What a not-wanted topic is until the user picks: kept when another
+    source lists it too (the user decides), filtered out otherwise."""
+    return KEEP if overlap else FILTER
+
+
+def stored_choices(stored: dict | None) -> dict[str, str]:
+    """The choices recorded on a stored list. A list the profile was applied
+    to before choices were recorded switched every not-wanted topic it had
+    off: those read as ``filter``, so it keeps doing what it did."""
+    stored = stored or {}
+    if isinstance(stored.get(CHOICES), dict):
+        return {str(k): str(v) for k, v in stored[CHOICES].items() if v in CHOICE_VALUES}
+    if not is_applied(stored):
+        return {}
+    return {_code(t["id"]): FILTER for t in stored.get("topics") or []
+            if t.get("id") and t.get("profile") == NOT_INTEREST}
+
+
 def apply(topic_filters: dict, view: dict) -> dict:
     """``topic_filters`` with the profile's topics folded in; a new dict.
 
     Wanted topics the seeds did not bring in are appended with
     ``source = "researcher"`` and ``count = 0`` (no seed carries them).
-    Every listed topic the profile has an opinion on gets
+    Each not-wanted topic goes by its choice in
+    ``topic_filters[CHOICES]`` (the default recorded there for one with
+    none): ``filter`` marks it where it is listed, ``add`` treats it as a
+    wanted one, ``keep`` leaves it as the other sources have it. Every
+    listed topic the profile has an opinion on gets
     ``profile = "interest" | "not_interest"``. On/off is not touched here:
     the caller settles it (see ``wizard._aggregate_topics``).
     """
@@ -195,7 +248,10 @@ def apply(topic_filters: dict, view: dict) -> dict:
     by_code = {_code(t.get("id")): t for t in topics if t.get("id")}
     for t in topics:
         t.pop("profile", None)
-    for item in view.get("wanted") or []:
+    overlap = other_sources(out, view)
+    choices = {str(k): v for k, v in (out.get(CHOICES) or {}).items() if v in CHOICE_VALUES}
+
+    def _want(item: dict) -> None:
         have = by_code.get(_code(item["id"]))
         if have is not None:
             have["profile"] = INTEREST
@@ -204,13 +260,51 @@ def apply(topic_filters: dict, view: dict) -> dict:
                    "source": SOURCE, "profile": INTEREST}
             topics.append(new)
             by_code[_code(item["id"])] = new
+
+    for item in view.get("wanted") or []:
+        _want(item)
     for item in view.get("unwanted") or []:
-        have = by_code.get(_code(item["id"]))
-        if have is not None:
-            have["profile"] = NOT_INTEREST
+        c = _code(item["id"])
+        choice = choices.setdefault(c, default_choice(overlap.get(c, [])))
+        if choice == ADD:
+            _want(item)
+        elif choice == FILTER and c in by_code:
+            by_code[c]["profile"] = NOT_INTEREST
     out["topics"] = topics
+    out[CHOICES] = choices
     out[FLAG] = True
     return out
+
+
+def not_interest_rows(view: dict, topic_filters: dict | None, *, basis: dict | None = None) -> list[dict]:
+    """Each not-wanted topic as the topic step lists it: what it was
+    matched from, where else it comes from, its choice (recorded on
+    ``topic_filters``, or the default) and its place in the list now.
+
+    ``basis`` is the list the profile is applied to, when that is not
+    ``topic_filters`` itself: a draft's is rebuilt from the seeds, so its
+    overlaps are counted there -- the defaults shown are then the ones
+    applying records."""
+    stored = topic_filters or {}
+    base = basis if basis is not None else stored
+    overlap = other_sources(base, view)
+    choices = stored_choices(stored)
+    listed_in = stored if stored.get("topics") else base
+    by_code = {_code(t["id"]): t for t in listed_in.get("topics") or [] if t.get("id")}
+    rows = []
+    for item in view.get("unwanted") or []:
+        c = _code(item["id"])
+        listed = by_code.get(c)
+        rows.append({
+            "id": item["id"], "name": item.get("display_name") or item["id"],
+            "method": item.get("method") or "inferred", "label": item.get("label"),
+            "weight": item.get("weight"), "similarity": item.get("similarity"),
+            "overlap": overlap.get(c, []),
+            "choice": choices.get(c) or default_choice(overlap.get(c, [])),
+            "in_list": listed is not None,
+            "on": bool(listed.get("on", True)) if listed is not None else None,
+        })
+    return rows
 
 
 def code(topic_id: Any) -> str:
@@ -233,12 +327,14 @@ def adopt(topic_filters: dict) -> dict:
         t.pop(BEFORE, None)
         kept.append(t)
     out["topics"] = kept
+    out.pop(CHOICES, None)
     out[FLAG] = False
     return out
 
 
 def strip(topic_filters: dict) -> dict:
-    """``topic_filters`` without the profile's topics and marks; a new dict."""
+    """``topic_filters`` without the profile's topics and marks; a new dict.
+    The not-wanted choices are kept for a later apply."""
     out = dict(topic_filters or {})
     kept = []
     for t in out.get("topics") or []:
@@ -249,6 +345,8 @@ def strip(topic_filters: dict) -> dict:
         t.pop(BEFORE, None)
         kept.append(t)
     out["topics"] = kept
+    # The not-wanted choices stay: applying the profile again picks them up
+    # rather than going back to the defaults.
     out[FLAG] = False
     return out
 
@@ -310,8 +408,11 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     Best effort: a label that maps nowhere, or an index or embedder that is
     not available, leaves the view as it was. A mapped label joins the
     side it was on (``not_interests`` → ``unwanted``), carrying the label
-    in ``label``; a topic the profile already asserts outright is not
-    added again, and a topic a label would add to both sides is left out.
+    in ``label`` and the match's ``similarity``; a topic already on that
+    side is not added again. A not-wanted label whose topic is on the
+    wanted side as well is kept, not dropped: the two disagree, and
+    ``not_interest_rows`` shows it as overlapping so the user settles it.
+    A wanted label whose topic the profile rejects outright is left out.
 
     ``labels_unmapped`` on the result says the labels should have been
     mapped but could not be just now (the mapper failed, or is being left
@@ -331,9 +432,7 @@ def with_labels(view: dict, *, settings: Any) -> dict:
         return {**view, "labels_unmapped": labels}
     out = {k: (list(v) if isinstance(v, list) else v) for k, v in view.items()}
     out["labels_unmapped"] = False
-    have = {t["id"] for t in (*out["wanted"], *out["unwanted"])}
-    mapped: dict[str, tuple[str, dict]] = {}
-    clashes: set[str] = set()
+    on_side = {side: {t["id"] for t in out[side]} for side in ("wanted", "unwanted")}
     for side in ("wanted", "unwanted"):
         for label in out.get(f"{side}_labels") or []:
             try:
@@ -345,13 +444,10 @@ def with_labels(view: dict, *, settings: Any) -> dict:
                     "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160],
                     retry_in_s=LABEL_RETRY_SECONDS)
                 return {**view, "labels_unmapped": labels}
-            if hit is None or hit["id"] in have:
+            if hit is None or hit["id"] in on_side[side]:
                 continue
-            if hit["id"] in mapped and mapped[hit["id"]][0] != side:
-                clashes.add(hit["id"])
+            if side == "wanted" and hit["id"] in on_side["unwanted"]:
                 continue
-            mapped.setdefault(hit["id"], (side, {**hit, "weight": None, "method": "label", "label": label}))
-    for tid, (side, item) in mapped.items():
-        if tid not in clashes:
-            out[side].append(item)
+            out[side].append({**hit, "weight": None, "method": "label", "label": label})
+            on_side[side].add(hit["id"])
     return out

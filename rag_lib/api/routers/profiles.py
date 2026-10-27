@@ -50,6 +50,7 @@ from ..schemas import (
     Topic,
     ProfileResearcherTopics,
     ResearcherTopicsUpdate,
+    NotInterestChoiceUpdate,
     TopicSelection,
     YearRange,
     TopicYield,
@@ -1179,6 +1180,37 @@ def set_researcher_topics(
     try:
         topic_filters = wizard_service.set_researcher_topics(
             db, user_id=int(user["id"]), slug=key, enabled=body.enabled,
+        )
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"an import is still filling draft '{exc.slug}'",
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except wizard_service.NoTopicOn as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return _topics_out(topic_filters)
+
+
+@router.put("/{key}/researcher-topics/not-interest", response_model=list[Topic])
+def set_not_interest_choice(
+    key: str,
+    body: NotInterestChoiceUpdate,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> list[Topic]:
+    """What one topic the researcher's profile does not want does on this
+    interest: ``filter`` it out (off wherever the seeds bring it in),
+    ``keep`` it as the other sources have it, or ``add`` it as a topic.
+    The profile's topics must be applied. Saved straight away, like
+    applying them. 400 for a topic the profile does not reject or before
+    the profile is applied; 409 as ``PUT /researcher-topics``."""
+    try:
+        topic_filters = wizard_service.set_not_interest_choice(
+            db, user_id=int(user["id"]), slug=key, topic_id=body.topic_id, choice=body.choice,
         )
     except wizard_service.ImportInProgress as exc:
         raise HTTPException(

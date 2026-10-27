@@ -4,9 +4,11 @@ A Prosopia profile says, in ``research_interests``, which OpenAlex topics
 its owner wants (declared, or inferred from their papers) and which they do
 not (a negative weight), plus text concepts for what maps to no topic. The
 researcher row stores that document; an interest built from the researcher
-can take the topics from it: the wanted ones join its list switched on, the
-not-wanted ones are switched off. Offline: the Prosopia and OpenAlex stubs
-of the import suites.
+can take the topics from it: the wanted ones join its list switched on, and
+each not-wanted one is filtered out (switched off), kept as the other
+sources have it, or added, as the user chooses -- kept by default when
+another source lists it, filtered otherwise. Offline: the Prosopia and
+OpenAlex stubs of the import suites.
 """
 
 from __future__ import annotations
@@ -98,7 +100,12 @@ def test_apply_adds_wanted_marks_both_and_strip_undoes_it():
         {"id": "T10001", "display_name": "Test Topic", "count": 3, "on": True},
         {"id": "https://openalex.org/T10222", "display_name": "Genomics and Chromatin Dynamics", "count": 1, "on": False},
     ], "fields": [{"id": "F1", "display_name": "Test Field", "count": 4}]}
-    out = rt.apply(seeds, rt.read(DOCUMENT))
+    # By default a not-wanted topic the seeds carry is kept (the user decides);
+    # one nothing else lists is filtered.
+    kept = rt.apply(seeds, rt.read(DOCUMENT))
+    assert kept[rt.CHOICES] == {"T10001": rt.KEEP, "T11986": rt.FILTER}
+    assert {t["id"]: t.get("profile") for t in kept["topics"]}["T10001"] is None
+    out = rt.apply({**seeds, rt.CHOICES: {"T10001": rt.FILTER}}, rt.read(DOCUMENT))
     by = {t["id"]: t for t in out["topics"]}
     assert by["T10001"]["profile"] == rt.NOT_INTEREST and "source" not in by["T10001"]   # matched by bare code
     assert by["https://openalex.org/T10222"]["profile"] == rt.INTEREST and by["https://openalex.org/T10222"]["count"] == 1
@@ -110,6 +117,12 @@ def test_apply_adds_wanted_marks_both_and_strip_undoes_it():
     back = rt.strip(out)
     assert [t["id"] for t in back["topics"]] == ["T10001", "https://openalex.org/T10222"]
     assert all("profile" not in t for t in back["topics"]) and back[rt.FLAG] is False
+    assert back[rt.CHOICES] == out[rt.CHOICES]                        # kept for the next apply
+    assert rt.CHOICES not in rt.adopt(out)
+    # "add" treats a not-wanted topic as a wanted one, listed or not.
+    added = {t["id"]: t for t in rt.apply({**seeds, rt.CHOICES: {"T11986": rt.ADD}}, rt.read(DOCUMENT))["topics"]}
+    assert added["https://openalex.org/T11986"]["profile"] == rt.INTEREST
+    assert added["https://openalex.org/T11986"]["source"] == rt.SOURCE
 
 
 class _Index:
@@ -148,14 +161,31 @@ def test_labels_map_to_their_nearest_topic_on_their_own_side(monkeypatch):
     assert view["unwanted_labels"] == ["phylogenomics", "wet-lab-protocol-development"]   # the words stay listed
 
 
-def test_a_label_mapping_to_both_sides_is_left_out_and_a_dead_embedder_changes_nothing(monkeypatch):
-    doc = {"interests": ["chromatin"], "not_interests": ["chromatin biology"]}
+def test_a_label_mapping_to_both_sides_is_kept_on_both_and_a_dead_embedder_changes_nothing(monkeypatch):
+    """The two sides disagree on the topic: it stays on both, so the topic
+    step shows the not-wanted one as overlapping and the user settles it
+    (it used to be dropped without a word)."""
+    doc = {"interests": ["chromatin"], "not_interests": ["chromatin biology"],
+           "research_interests": [_topic("T2", "Genomics")]}
     settings = _label_settings(monkeypatch, {
         "chromatin": ("https://openalex.org/T1", "Chromatin", 0.8),
         "chromatin biology": ("https://openalex.org/T1", "Chromatin", 0.8),
+        "genomics data": ("https://openalex.org/T2", "Genomics", 0.9),
     })
     view = rt.with_labels(rt.read(doc), settings=settings)
-    assert view["wanted"] == [] and view["unwanted"] == []
+    assert [t["id"] for t in view["wanted"]] == ["https://openalex.org/T2", "https://openalex.org/T1"]
+    assert [(t["id"], t["label"], t["similarity"]) for t in view["unwanted"]] == [
+        ("https://openalex.org/T1", "chromatin biology", 0.8)]
+    rows = rt.not_interest_rows(view, {"topics": []})
+    assert [(r["id"], r["overlap"], r["choice"]) for r in rows] == [
+        ("https://openalex.org/T1", [rt.PROFILE_INTEREST], rt.KEEP)]
+    # A not-wanted label on a topic the profile wants outright is kept too.
+    view = rt.with_labels(rt.read({**doc, "not_interests": ["genomics data"]}), settings=settings)
+    assert [t["id"] for t in view["unwanted"]] == ["https://openalex.org/T2"]
+    # A wanted label on a topic the profile rejects outright is not added to the wanted side.
+    rejecting = {"interests": ["genomics data"], "research_interests": [_topic("T2", "Genomics", weight=-0.5)]}
+    view = rt.with_labels(rt.read(rejecting), settings=settings)
+    assert view["wanted"] == [] and [t["id"] for t in view["unwanted"]] == ["https://openalex.org/T2"]
 
     def boom(*a, **k):
         raise RuntimeError("ollama down")
@@ -199,6 +229,22 @@ def _topics(app, slug):
     return {t["id"]: t for t in resp.json()}
 
 
+def _choose(app, slug, topic_id, choice="filter"):
+    """What one not-wanted topic does on the interest; the list as returned."""
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics/not-interest",
+                    json={"topic_id": topic_id, "choice": choice})
+    assert resp.status_code == 200, resp.text
+    return {t["id"]: t for t in resp.json()}
+
+
+def _apply_filtering(app, slug, topic_id="T10001"):
+    """Apply the profile and filter out the not-wanted topic the seeds carry
+    (kept by default, as another source lists it)."""
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    assert resp.status_code == 200, resp.text
+    return _choose(app, slug, topic_id, "filter")
+
+
 def test_an_interest_takes_the_profiles_topics_and_keeps_them_across_aggregation(env):
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
@@ -213,10 +259,20 @@ def test_an_interest_takes_the_profiles_topics_and_keeps_them_across_aggregation
     before = _topics(app, slug)
     assert before["T10001"]["on"] is True and before["T10001"]["profile"] is None
 
+    rows = {r["id"]: r for r in view["topics"]["not_interest"]}
+    # The seeds carry T10001 too: kept unless the user filters it. Nothing else has T11986: filtered.
+    assert (rows["https://openalex.org/T10001"]["overlap"], rows["https://openalex.org/T10001"]["choice"]) == (["openalex"], "keep")
+    assert (rows["https://openalex.org/T11986"]["overlap"], rows["https://openalex.org/T11986"]["choice"]) == ([], "filter")
+    assert rows["https://openalex.org/T10001"]["in_list"] is True and rows["https://openalex.org/T11986"]["in_list"] is False
+
     resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
     assert resp.status_code == 200, resp.text
-    after = {t["id"]: t for t in resp.json()}
+    kept = {t["id"]: t for t in resp.json()}
+    assert kept["T10001"]["on"] is True and kept["T10001"]["profile"] is None
+    after = _choose(app, slug, "https://openalex.org/T10001", "filter")
     assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
+    assert {r["id"]: r["choice"] for r in _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["topics"]["not_interest"]} == {
+        "https://openalex.org/T10001": "filter", "https://openalex.org/T11986": "filter"}
     assert after["T10001"]["source"] is None and after["T10001"]["count"] == before["T10001"]["count"] > 0
     for tid in ("https://openalex.org/T10222", "https://openalex.org/T10515"):
         assert after[tid]["on"] is True and after[tid]["source"] == "researcher"
@@ -353,7 +409,7 @@ def test_a_profile_without_interests_reads_as_unavailable(env):
     rid = _import_prosopia(app)
     assert _request(app, "GET", f"/api/researchers/{rid}").json()["topics"] == {
         "available": False, "wanted": [], "unwanted": [], "wanted_labels": [], "unwanted_labels": [],
-        "labels_unmapped": False}
+        "labels_unmapped": False, "not_interest": []}
 
 
 def _import_prosopia(app) -> int:
@@ -387,18 +443,20 @@ def test_applying_that_would_switch_every_topic_off_is_refused(env):
     profile.rid = "0000-0001-5643-4068"
     app = _app(StubProsopia(profile), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
-    before = _topics(app, slug)
-    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    # Applied, the seeds' topic is kept (they list it); filtering it out is what is refused.
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    before = _stored(env, slug)
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics/not-interest",
+                    json={"topic_id": "T10001", "choice": "filter"})
     assert resp.status_code == 409 and "every topic off" in resp.json()["detail"]
-    assert _topics(app, slug) == before                      # nothing was written
-    assert _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["applied"] is False
+    assert _stored(env, slug) == before                      # nothing was written
 
 
 def test_removing_puts_the_seeds_topics_back_as_they_were(env):
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
     assert _topics(app, slug)["T10001"]["on"] is True
-    on = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    on = _apply_filtering(app, slug)
     assert on["T10001"]["on"] is False
     # Re-aggregation (step 3 reopened) keeps the pre-apply state around.
     _topics(app, slug)
@@ -430,10 +488,9 @@ def test_a_saved_interest_keeps_the_profile_and_its_new_wanted_topics_start_on(e
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
-    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
-    assert applied.status_code == 200
+    applied = _apply_filtering(app, slug)
     # Committed with step 3's ticks as the profile set them (T10001 off).
-    _commit(app, slug, [t["id"] for t in applied.json() if t["on"]])
+    _commit(app, slug, [i for i, t in applied.items() if t["on"]])
     stored = _stored(env, slug)
     assert stored["researcher_topics"] is True
     assert {t["id"] for t in stored["topics"] if t.get("source") == "researcher"} == {"https://openalex.org/T10222", "https://openalex.org/T10515"}
@@ -466,7 +523,7 @@ def test_the_profile_being_unreadable_for_a_moment_does_not_drop_it(env, monkeyp
     from rag_lib.api.services import wizard
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
-    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    _apply_filtering(app, slug)
     applied = {t["id"]: t for t in _topics(app, slug).values()}
     monkeypatch.setattr(wizard, "_researcher_topics_for", lambda conn, pid: None)
     during = _topics(app, slug)
@@ -555,8 +612,8 @@ def test_a_topic_marked_later_is_put_back_too(env):
 def test_re_applying_keeps_the_original_pre_apply_state(env):
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
-    for _ in range(2):
-        assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    _apply_filtering(app, slug)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
     stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
     assert stored["T10001"]["on"] is False and stored["T10001"]["on_before_profile"] is True
     off = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).json()}
@@ -573,8 +630,8 @@ def test_forgetting_the_researcher_takes_the_profile_off_a_saved_interest(env):
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
-    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
-    on_at_commit = [t["id"] for t in applied if t["on"]]
+    applied = _apply_filtering(app, slug)
+    on_at_commit = [i for i, t in applied.items() if t["on"]]
     assert "T10001" not in on_at_commit and len(on_at_commit) == 2
     _commit(app, slug, on_at_commit)
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
@@ -615,7 +672,8 @@ def test_a_list_read_that_overlaps_an_apply_does_not_undo_it(env, monkeypatch):
     topics = _topics(app, slug)
     stored = _stored(env, slug)
     assert stored["researcher_topics"] is True
-    assert "https://openalex.org/T10222" in topics and topics["T10001"]["on"] is False
+    assert "https://openalex.org/T10222" in topics and topics["T10001"]["on"] is True
+    assert stored["not_interest_choices"] == {"T10001": "keep", "T11986": "filter"}
     assert len(hits) == 1 and wizard._aggregate_topics is racing
 
 
@@ -628,7 +686,7 @@ def test_a_researcher_removed_underneath_restores_the_seeds_topics_on_the_next_r
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
-    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    _apply_filtering(app, slug)
     assert _topics(app, slug)["T10001"]["on"] is False
     conn = connect(env)
     try:
@@ -799,7 +857,7 @@ def test_a_topic_the_profile_stops_rejecting_goes_back_to_what_it_was(env):
     app = _app(StubProsopia(profile), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
-    applied = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    applied = _apply_filtering(app, slug)
     assert applied["T10001"]["on"] is False and applied["T10001"]["profile"] == "not_interest"
 
     profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
@@ -820,7 +878,7 @@ def test_a_topic_the_profile_stops_rejecting_keeps_the_users_own_switch(env):
     profile.rid = "0000-0001-5643-4068"
     app = _app(StubProsopia(profile), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
-    _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    _apply_filtering(app, slug)
     # The user switches the rejected topic back on themselves (a trial scan saves the ticks).
     _switch(env, slug, {"T10001": True})
     profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
@@ -872,3 +930,100 @@ def test_adopted_topics_survive_the_next_rebuild_and_a_save(env):
     stored = _stored(env, slug)
     assert {t["id"] for t in stored["topics"] if t["on"]} == set(only_profile)
     assert all(t.get("source") == "adopted" for t in stored["topics"] if t["id"] in only_profile)
+
+
+# --- not-wanted topics: the user's choice --------------------------------------------
+
+
+def _rows(app, slug):
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    return {r["id"]: r for r in view["topics"]["not_interest"]}
+
+
+def test_a_not_wanted_topic_can_be_added_and_taken_back(env):
+    """A not-wanted topic nothing else lists (filtered by default) can be
+    added as a topic of the interest's own, switched on; back to filtered,
+    it leaves the list again."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    t11986 = "https://openalex.org/T11986"
+    added = _choose(app, slug, t11986, "add")
+    assert added[t11986]["on"] is True and added[t11986]["source"] == "researcher" and added[t11986]["profile"] == "interest"
+    assert _rows(app, slug)[t11986]["choice"] == "add" and _rows(app, slug)[t11986]["in_list"] is True
+    assert _topics(app, slug)[t11986]["on"] is True                # a re-read keeps it
+    gone = _choose(app, slug, t11986, "filter")
+    assert t11986 not in gone and _rows(app, slug)[t11986]["choice"] == "filter"
+
+
+def test_choosing_moves_only_that_topic_on_a_saved_interest(env):
+    """On a saved interest the stored list is what scans search by: setting
+    one not-wanted topic's choice changes that topic and nothing else --
+    a switch the user made on another stays."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    on = [i for i, t in applied.items() if t["on"]]
+    _commit(app, slug, on)
+    # The user switches a wanted topic off on the edit page.
+    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics",
+                     json={"selected_topic_ids": [i for i in on if i != "https://openalex.org/T10515"]})
+    assert saved.status_code == 200, saved.text
+    before = {t["id"]: t["on"] for t in _stored(env, slug)["topics"]}
+    after = _choose(app, slug, "T10001", "filter")
+    assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
+    assert {i: t["on"] for i, t in after.items() if i != "T10001"} == {i: v for i, v in before.items() if i != "T10001"}
+    back = _choose(app, slug, "T10001", "keep")
+    assert back["T10001"]["on"] is True and back["T10001"]["profile"] is None     # back to its state before the filter
+    assert back["https://openalex.org/T10515"]["on"] is False
+
+
+def test_choices_survive_removing_and_applying_again(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _apply_filtering(app, slug)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).status_code == 200
+    assert _topics(app, slug)["T10001"]["on"] is True
+    assert _rows(app, slug)["https://openalex.org/T10001"]["choice"] == "filter"   # remembered, shown before applying
+    again = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    assert again["T10001"]["on"] is False and again["T10001"]["profile"] == "not_interest"
+
+
+def test_a_list_applied_before_choices_keeps_filtering(env):
+    """An interest the profile was applied to before choices were recorded
+    had every not-wanted topic it listed switched off. Without a record its
+    marks read as "filter": a rebuild must not switch them back on."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _apply_filtering(app, slug)
+    conn = connect(env)
+    try:
+        stored = _stored(env, slug)
+        del stored["not_interest_choices"]
+        conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE slug = ?", (json.dumps(stored), slug))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _rows(app, slug)["https://openalex.org/T10001"]["choice"] == "filter"
+    topics = _topics(app, slug)
+    assert topics["T10001"]["on"] is False and topics["T10001"]["profile"] == "not_interest"
+    assert _stored(env, slug)["not_interest_choices"]["T10001"] == "filter"
+
+
+def test_a_choice_is_refused_where_it_means_nothing(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    url = f"/api/profiles/{slug}/researcher-topics/not-interest"
+    # Before the profile is applied.
+    resp = _request(app, "PUT", url, json={"topic_id": "T10001", "choice": "filter"})
+    assert resp.status_code == 400 and "apply the profile" in resp.json()["detail"]
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    # A topic the profile wants, and one it says nothing about.
+    for tid in ("https://openalex.org/T10222", "T99999"):
+        resp = _request(app, "PUT", url, json={"topic_id": tid, "choice": "filter"})
+        assert resp.status_code == 400 and "does not want" in resp.json()["detail"]
+    assert _request(app, "PUT", url, json={"topic_id": "T10001", "choice": "drop"}).status_code == 422
+    assert _request(app, "PUT", "/api/profiles/no-such/researcher-topics/not-interest",
+                    json={"topic_id": "T10001", "choice": "filter"}).status_code == 404
+    other = {"X-User-Email": "someone-else@example.com"}
+    assert _request(app, "PUT", url, json={"topic_id": "T10001", "choice": "filter"}, headers=other).status_code == 404
