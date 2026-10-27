@@ -21,11 +21,26 @@ from rag_lib.api.settings import Settings
 ROOT = Path(__file__).resolve().parents[1]
 FIELDS = set(Settings.model_fields)
 
-DOCS = [
-    ".env.example", "deploy/env.example", "DEPLOY.md", "README.md",
-    "PLUGINS.md", "deploy/README.md", "deploy/start_backend.sh", "deploy/radar.sh",
-]
-CODE_DIRS = ["rag_lib", "cli", "scripts"]
+DOC_SUFFIXES = {".md", ".sh", ".example", ".toml", ".yml", ".yaml", ".cfg", ".ini"}
+DOC_NAMES = {"Dockerfile", "Caddyfile", "Caddyfile.local", ".dockerignore"}
+CODE_DIRS = ("rag_lib/", "cli/", "scripts/")
+
+
+def _tracked() -> list[str]:
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("not a git checkout")
+    return [f for f in out.splitlines() if (ROOT / f).is_file()]
+
+
+def _docs() -> list[str]:
+    return [
+        f for f in _tracked()
+        if not f.startswith(("tests/", "docs/")) and (Path(f).suffix in DOC_SUFFIXES or Path(f).name in DOC_NAMES)
+    ]
 
 # Read from the process environment, never from .env.
 ENVIRON_ONLY = {"RADAR_SQLITE_JOURNAL_MODE"}
@@ -33,8 +48,6 @@ ENVIRON_ONLY = {"RADAR_SQLITE_JOURNAL_MODE"}
 SCRIPT_ONLY = {"RADAR_ALLOW_EMPTY_DB"}
 
 ANY_KEY = re.compile(r"\bRADAR_[A-Z0-9_]+\b")
-# A quoted name in Python: getattr(settings, "X"), _opt('X', ...), environ["X"].
-QUOTED_KEY = re.compile(r"[\"'](RADAR_[A-Z0-9_]+)[\"']")
 # "# RADAR_X=value" -- a commented-out line documents the default.
 COMMENTED = re.compile(r"^#\s*(RADAR_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
 
@@ -43,25 +56,31 @@ def _text(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("name", DOCS)
-def test_documented_keys_are_settings(name):
-    keys = set(ANY_KEY.findall(_text(name)))
-    assert keys - FIELDS - ENVIRON_ONLY - SCRIPT_ONLY == set()
-
-
-def test_code_reads_only_settings_that_exist():
+def test_documented_keys_are_settings():
     hits = {
-        f"{p.relative_to(ROOT)}: {key}"
-        for d in CODE_DIRS
-        for p in sorted((ROOT / d).rglob("*.py"))
-        for key in QUOTED_KEY.findall(p.read_text(encoding="utf-8"))
-        if key not in FIELDS | ENVIRON_ONLY
+        f"{name}: {key}"
+        for name in _docs()
+        for key in ANY_KEY.findall(_text(name))
+        if key not in FIELDS | ENVIRON_ONLY | SCRIPT_ONLY
     }
     assert hits == set()
 
 
-def test_env_example_documents_every_setting():
-    assert FIELDS - set(ANY_KEY.findall(_text(".env.example"))) == set()
+def test_code_names_only_settings_that_exist():
+    # Any RADAR_ name in code: settings.RADAR_X, getattr(s, "RADAR_X"),
+    # _opt('RADAR_X', ...), environ["RADAR_X"], docstrings.
+    hits = {
+        f"{name}: {key}"
+        for name in _tracked()
+        if name.startswith(CODE_DIRS) and name.endswith(".py")
+        for key in ANY_KEY.findall(_text(name))
+        if key not in FIELDS | ENVIRON_ONLY | SCRIPT_ONLY
+    }
+    assert hits == set()
+
+
+def test_env_example_has_a_line_for_every_setting():
+    assert FIELDS - {key for key, _ in COMMENTED.findall(_text(".env.example"))} == set()
 
 
 def test_env_example_shows_the_code_defaults(monkeypatch):
@@ -108,10 +127,5 @@ def test_deploy_env_example_has_no_comment_after_a_value():
 
 
 def test_env_is_not_tracked():
-    try:
-        out = subprocess.run(
-            ["git", "ls-files", "--", ".env"], cwd=ROOT, capture_output=True, text=True, check=True
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        pytest.skip("not a git checkout")
-    assert out.strip() == "", ".env is tracked; ship deploy/env.example instead"
+    tracked = [f for f in _tracked() if Path(f).name.startswith(".env") and f != ".env.example"]
+    assert tracked == [], "ship deploy/env.example instead"

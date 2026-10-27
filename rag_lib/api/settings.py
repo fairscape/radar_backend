@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     # swap defaults without code changes.
     RADAR_DEFAULT_SELECTOR: str = "centroid"
     # Prosopia instance the seed-corpus importer reads
-    # (``POST /api/profiles/import/prosopia``). Per-request ``base_url``
+    # (``POST /api/import/prosopia``). Per-request ``base_url``
     # overrides it, so this is the default a plain slug resolves against.
     RADAR_PROSOPIA_BASE_URL: str = "https://prosopia.databio.org"
     # Any other Prosopia instance a request's ``base_url`` may name. The
@@ -106,7 +106,8 @@ class Settings(BaseSettings):
     # (trial scan, scan-now, and the daily job alike). None = each caller's
     # own default (1000 for the trial scan, 500 for scans). A CPU-only
     # deployment embeds every candidate in-process, so this is the knob
-    # that bounds a scan's wall time.
+    # that bounds a scan's wall time. A publication-year backfill is not
+    # bounded by it: it takes up to 100 papers per year asked for.
     RADAR_GATHER_MAX_CANDIDATES: int | None = None
 
     # UMLS concept extraction (Phase B+). On by default — it is part of the

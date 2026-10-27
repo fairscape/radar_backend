@@ -72,7 +72,7 @@ goes, who you are, and your hardware:
 RADAR_DB_PATH=data/radar.db            # a local disk, see below
 RADAR_VAULT_DIR=data/vault             # uploaded PDFs
 RADAR_CHROMA_DIR=data/chroma           # Vault chat's vector index
-RADAR_DEFAULT_MAILTO=you@your.org      # OpenAlex contact address
+RADAR_DEFAULT_MAILTO=you@your.org      # OpenAlex contact for users created later
 RADAR_REQUIRE_AUTH=false               # single user, see "Users" below
 RADAR_RERANKER_DEVICE=cuda             # or cpu without an NVIDIA GPU
 ```
@@ -130,12 +130,13 @@ curl http://127.0.0.1:8000/api/health
 
 The backend applies any pending migrations at every start, so upgrading
 is `git pull`, then restart. A clone from before this release tracked a
-`.env`; move yours aside before that pull (`mv .env .env.mine`) and back
-after it, or git refuses the pull or deletes the file. Back the database up before an upgrade
+`.env`; move yours out of the clone before that pull
+(`mv .env ../radar.env`) and back after it, or git refuses the pull or
+deletes the file. Back the database up before an upgrade
 (safe while the backend runs):
 
 ```sh
-python -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).backup(sqlite3.connect(sys.argv[2]))" \
+python -c "import sqlite3, sys; sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True).backup(sqlite3.connect(sys.argv[2]))" \
     data/radar.db data/radar.db.bak-$(date +%Y%m%d)
 ```
 

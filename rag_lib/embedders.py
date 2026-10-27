@@ -201,8 +201,10 @@ def specter2_embed(text: str) -> list[float]:
 def _ollama_embed_factory(model_name: str) -> Embedder:
     """Build an embedder that calls ``POST {ollama_url}/api/embeddings``.
 
-    The base URL is read from ``RADAR_OLLAMA_URL`` at call time (not at
-    factory time) so test injection of settings still works. Raises the
+    The base URL is ``get_settings().RADAR_OLLAMA_URL``, read at call time
+    (not at factory time), so a test changes it by setting the variable and
+    clearing ``get_settings``'s cache; a Settings passed to a route through
+    ``dependency_overrides`` does not reach it. Raises the
     underlying httpx error on failure — callers in the indexer wrap
     this so a missing model / unreachable ollama doesn't break uploads.
     """
