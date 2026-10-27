@@ -65,20 +65,25 @@ abstracts as its query, no nightly scans):
 cp deploy/env.example .env
 ```
 
-and change the four values that belong to the live machine:
+and change the values that belong to the live machine -- where data
+goes, who you are, and your hardware:
 
 ```sh
 RADAR_DB_PATH=data/radar.db            # a local disk, see below
+RADAR_VAULT_DIR=data/vault             # uploaded PDFs
+RADAR_CHROMA_DIR=data/chroma           # Vault chat's vector index
 RADAR_DEFAULT_MAILTO=you@your.org      # OpenAlex contact address
 RADAR_REQUIRE_AUTH=false               # single user, see "Users" below
 RADAR_RERANKER_DEVICE=cuda             # or cpu without an NVIDIA GPU
 ```
 
-The vault and Chroma index go in `vault/` and `chroma/`, logs in `logs/`,
-all beside the backend; the UMLS data and topic index in
-`data/umls_cache/`. Keep the database on a local disk: on NFS RADAR falls
-back to SQLite's slower rollback journal, because WAL is not safe there.
-`.env.example` documents every key.
+Everything RADAR stores is then under `data/` (the UMLS data and topic
+index go in `data/umls_cache/`), and logs in `logs/`. Settle the paths
+before the first upload: the database records each PDF under the vault
+path it was saved with, so moving the vault later loses them. Keep the
+database on a local disk: on NFS RADAR falls back to SQLite's slower
+rollback journal, because WAL is not safe there. `.env.example` documents
+every key.
 
 Models download on first use. To keep them off a small home directory:
 
@@ -124,10 +129,12 @@ curl http://127.0.0.1:8000/api/health
 ```
 
 The backend applies any pending migrations at every start, so upgrading
-is `git pull`, then restart. Back the database up before an upgrade:
+is `git pull`, then restart. Back the database up before an upgrade
+(safe while the backend runs):
 
 ```sh
-sqlite3 data/radar.db ".backup data/radar.db.bak-$(date +%Y%m%d)"
+python -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).backup(sqlite3.connect(sys.argv[2]))" \
+    data/radar.db data/radar.db.bak-$(date +%Y%m%d)
 ```
 
 Keep it running with whatever you use for services (systemd, tmux,
