@@ -783,6 +783,9 @@ class ResearcherTopics(_Model):
     # The labels could not be mapped to topics just now (the mapper is down);
     # ``wanted``/``unwanted`` then hold only the topics the profile asserts outright.
     labels_unmapped: bool = False
+    # The not-wanted labels that map to no topic (none is known while
+    # ``labels_unmapped``).
+    unmatched_labels: list[str] = Field(default_factory=list)
     # ``unwanted`` with each topic's choice on this interest (the interest's
     # researcher-topics view only; empty on the researcher page).
     not_interest: list[NotInterestTopic] = Field(default_factory=list)

@@ -61,9 +61,14 @@ def test_a_topic_the_profile_newly_rejects_stays_on(tmp_path, monkeypatch):
     assert view["applied"] and [t["id"] for t in view["topics"]["unwanted"]] == [T2]
     preview, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)
     by = {t["id"]: t for t in preview["topics"]}
-    assert by[T2]["profile"] == rt.NOT_INTEREST
-    # The box says "the topics it does not want stay off wherever the seeds bring them in".
-    assert by[T2]["on"] is False, by[T2]
+    # A seed lists it too, so it is kept by default: the user decides.
+    assert "profile" not in by[T2] and by[T2]["on"] is True, by[T2]
+    assert [(r["id"], r["overlap"], r["choice"]) for r in view["topics"]["not_interest"]] == [(T2, ["openalex"], rt.KEEP)]
+    # Filtered out, it stays off wherever the seeds bring it in.
+    wizard.set_not_interest_choice(conn, user_id=uid, slug=slug, topic_id=T2, choice=rt.FILTER)
+    preview, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    by = {t["id"]: t for t in preview["topics"]}
+    assert by[T2]["profile"] == rt.NOT_INTEREST and by[T2]["on"] is False, by[T2]
     conn.close()
 
 
@@ -94,14 +99,14 @@ def test_an_apply_does_not_overwrite_a_topics_save_that_landed_meanwhile(tmp_pat
     real = w._researcher_topics_on_stored
     calls = {"n": 0}
 
-    def racing(conn_, profile_id, stored, *, enabled):
+    def racing(conn_, profile_id, stored, *, enabled, **kw):
         calls["n"] += 1
         if calls["n"] == 1:   # another tab saves while this one maps labels
             other = _json.loads(conn_.execute("SELECT topic_filters_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()[0])
             other["marker"] = "saved elsewhere"
             conn_.execute("UPDATE profiles SET topic_filters_json = ? WHERE id = ?", (_json.dumps(other), profile_id))
             conn_.commit()
-        return real(conn_, profile_id, stored, enabled=enabled)
+        return real(conn_, profile_id, stored, enabled=enabled, **kw)
 
     monkeypatch.setattr(w, "_researcher_topics_on_stored", racing)
     w.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)

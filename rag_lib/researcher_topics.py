@@ -173,6 +173,7 @@ def public(view: dict) -> dict:
         "wanted_labels": list(view.get("wanted_labels") or []),
         "unwanted_labels": list(view.get("unwanted_labels") or []),
         "labels_unmapped": bool(view.get("labels_unmapped")),
+        "unmatched_labels": list(view.get("unmatched_labels") or []),
     }
 
 
@@ -215,20 +216,31 @@ def default_choice(overlap: list[str] | set[str]) -> str:
     return KEEP if overlap else FILTER
 
 
-def stored_choices(stored: dict | None) -> dict[str, str]:
-    """The choices recorded on a stored list. A list the profile was applied
-    to before choices were recorded switched every not-wanted topic it had
-    off: those read as ``filter``, so it keeps doing what it did."""
+def is_legacy(stored: dict | None) -> bool:
+    """Applied before choices were recorded: every not-wanted topic was
+    switched off, whichever other source listed it."""
+    stored = stored or {}
+    return is_applied(stored) and not isinstance(stored.get(CHOICES), dict)
+
+
+def stored_choices(stored: dict | None, view: dict | None = None) -> dict[str, str]:
+    """The choices recorded on a stored list. A legacy list (:func:`is_legacy`)
+    reads as ``filter`` for every not-wanted topic -- each in ``view`` when
+    given, else each it marked -- so it keeps doing what it did, for a
+    not-wanted topic a new seed brings in as well."""
     stored = stored or {}
     if isinstance(stored.get(CHOICES), dict):
         return {str(k): str(v) for k, v in stored[CHOICES].items() if v in CHOICE_VALUES}
     if not is_applied(stored):
         return {}
-    return {_code(t["id"]): FILTER for t in stored.get("topics") or []
-            if t.get("id") and t.get("profile") == NOT_INTEREST}
+    out = {_code(t["id"]): FILTER for t in stored.get("topics") or []
+           if t.get("id") and t.get("profile") == NOT_INTEREST}
+    for item in (view or {}).get("unwanted") or []:
+        out[_code(item["id"])] = FILTER
+    return out
 
 
-def apply(topic_filters: dict, view: dict) -> dict:
+def apply(topic_filters: dict, view: dict, *, basis: dict | None = None) -> dict:
     """``topic_filters`` with the profile's topics folded in; a new dict.
 
     Wanted topics the seeds did not bring in are appended with
@@ -240,6 +252,10 @@ def apply(topic_filters: dict, view: dict) -> dict:
     listed topic the profile has an opinion on gets
     ``profile = "interest" | "not_interest"``. On/off is not touched here:
     the caller settles it (see ``wizard._aggregate_topics``).
+
+    A default is counted against ``basis`` when given (the list rebuilt
+    from the seeds, which is what the topic step shows and counts its
+    defaults against), else against ``topic_filters``.
     """
     out = dict(topic_filters or {})
     topics = [dict(t) for t in out.get("topics") or []]
@@ -248,7 +264,7 @@ def apply(topic_filters: dict, view: dict) -> dict:
     by_code = {_code(t.get("id")): t for t in topics if t.get("id")}
     for t in topics:
         t.pop("profile", None)
-    overlap = other_sources(out, view)
+    overlap = other_sources(basis if basis is not None else out, view)
     choices = {str(k): v for k, v in (out.get(CHOICES) or {}).items() if v in CHOICE_VALUES}
 
     def _want(item: dict) -> None:
@@ -288,7 +304,7 @@ def not_interest_rows(view: dict, topic_filters: dict | None, *, basis: dict | N
     stored = topic_filters or {}
     base = basis if basis is not None else stored
     overlap = other_sources(base, view)
-    choices = stored_choices(stored)
+    choices = stored_choices(stored, view)
     listed_in = stored if stored.get("topics") else base
     by_code = {_code(t["id"]): t for t in listed_in.get("topics") or [] if t.get("id")}
     rows = []
@@ -419,6 +435,8 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     alone after a failure): the view is then only part of the profile, and
     an aggregation keeps what its last full read stored of it. With UMLS
     off there is nothing to map against, which is not an outage.
+    ``unmatched_labels`` are the not-wanted labels that map to no topic
+    (all of them with UMLS off; none is known while the mapper is down).
     """
     import time
 
@@ -427,11 +445,12 @@ def with_labels(view: dict, *, settings: Any) -> dict:
     # The topic-name index is part of the UMLS cache: without it there is
     # nothing to map against.
     if settings is None or not getattr(settings, "RADAR_UMLS_ENABLED", False):
-        return {**view, "labels_unmapped": False}
+        return {**view, "labels_unmapped": False, "unmatched_labels": list(view.get("unwanted_labels") or [])}
     if time.monotonic() < _DOWN_UNTIL:
         return {**view, "labels_unmapped": labels}
     out = {k: (list(v) if isinstance(v, list) else v) for k, v in view.items()}
     out["labels_unmapped"] = False
+    out["unmatched_labels"] = []
     on_side = {side: {t["id"] for t in out[side]} for side in ("wanted", "unwanted")}
     for side in ("wanted", "unwanted"):
         for label in out.get(f"{side}_labels") or []:
@@ -444,7 +463,11 @@ def with_labels(view: dict, *, settings: Any) -> dict:
                     "researcher_topics.label_unmapped", label=label, reason=str(exc)[:160],
                     retry_in_s=LABEL_RETRY_SECONDS)
                 return {**view, "labels_unmapped": labels}
-            if hit is None or hit["id"] in on_side[side]:
+            if hit is None:
+                if side == "unwanted":
+                    out["unmatched_labels"].append(label)
+                continue
+            if hit["id"] in on_side[side]:
                 continue
             if side == "wanted" and hit["id"] in on_side["unwanted"]:
                 continue

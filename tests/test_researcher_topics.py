@@ -159,6 +159,7 @@ def test_labels_map_to_their_nearest_topic_on_their_own_side(monkeypatch):
     assert [(t["id"], t["label"]) for t in mapped] == [("https://openalex.org/T10434", "phylogenomics")]
     assert len(view["wanted"]) == 2       # nothing added for a label the topics already cover
     assert view["unwanted_labels"] == ["phylogenomics", "wet-lab-protocol-development"]   # the words stay listed
+    assert view["unmatched_labels"] == ["wet-lab-protocol-development"]                    # only the one too far
 
 
 def test_a_label_mapping_to_both_sides_is_kept_on_both_and_a_dead_embedder_changes_nothing(monkeypatch):
@@ -179,6 +180,7 @@ def test_a_label_mapping_to_both_sides_is_kept_on_both_and_a_dead_embedder_chang
     rows = rt.not_interest_rows(view, {"topics": []})
     assert [(r["id"], r["overlap"], r["choice"]) for r in rows] == [
         ("https://openalex.org/T1", [rt.PROFILE_INTEREST], rt.KEEP)]
+    assert view["unmatched_labels"] == []
     # A not-wanted label on a topic the profile wants outright is kept too.
     view = rt.with_labels(rt.read({**doc, "not_interests": ["genomics data"]}), settings=settings)
     assert [t["id"] for t in view["unwanted"]] == ["https://openalex.org/T2"]
@@ -194,7 +196,8 @@ def test_a_label_mapping_to_both_sides_is_kept_on_both_and_a_dead_embedder_chang
     # The view comes back as read, saying its labels are not mapped; with
     # UMLS off there is nothing to map, which is not an outage.
     assert rt.with_labels(rt.read(DOCUMENT), settings=settings) == {**rt.read(DOCUMENT), "labels_unmapped": True}
-    assert rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False)) == {**rt.read(DOCUMENT), "labels_unmapped": False}
+    off = rt.with_labels(rt.read(DOCUMENT), settings=SimpleNamespace(RADAR_UMLS_ENABLED=False))
+    assert off == {**rt.read(DOCUMENT), "labels_unmapped": False, "unmatched_labels": rt.read(DOCUMENT)["unwanted_labels"]}
 
 
 def test_the_mapper_carries_the_profile_mark():
@@ -409,7 +412,7 @@ def test_a_profile_without_interests_reads_as_unavailable(env):
     rid = _import_prosopia(app)
     assert _request(app, "GET", f"/api/researchers/{rid}").json()["topics"] == {
         "available": False, "wanted": [], "unwanted": [], "wanted_labels": [], "unwanted_labels": [],
-        "labels_unmapped": False, "not_interest": []}
+        "labels_unmapped": False, "unmatched_labels": [], "not_interest": []}
 
 
 def _import_prosopia(app) -> int:
@@ -887,24 +890,24 @@ def test_a_topic_the_profile_stops_rejecting_keeps_the_users_own_switch(env):
 
 
 def test_a_rebuild_overtaken_every_time_is_refused_rather_than_written(env, monkeypatch):
-    """Three rebuilds, each overtaken by an apply or remove: the last one is
-    not written anyway (it could undo one); the client gets a 409."""
+    """Three rebuilds, each overtaken by another write: the last one is not
+    written anyway (it could undo one); the client gets a 409."""
     from rag_lib.api.services import wizard as wizard_service
 
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
     before = _stored(env, slug)
-    real = wizard_service._stored_topic_filters
-    state = {"flag": False}
+    real = wizard_service._raw_topic_filters
+    state = {"n": 0}
 
-    def flipping(conn, profile_id):
-        out = dict(real(conn, profile_id))
+    def changing(conn, profile_id):
+        out = real(conn, profile_id)
         if conn.in_transaction:                 # the read under the write lock
-            state["flag"] = not state["flag"]
-            out["researcher_topics"] = state["flag"]
+            state["n"] += 1
+            return f"{out} {state['n']}"
         return out
 
-    monkeypatch.setattr(wizard_service, "_stored_topic_filters", flipping)
+    monkeypatch.setattr(wizard_service, "_raw_topic_filters", changing)
     resp = _request(app, "GET", f"/api/profiles/draft/{slug}/topics")
     assert resp.status_code == 409 and "try again" in resp.json()["detail"]
     monkeypatch.undo()
@@ -1027,3 +1030,234 @@ def test_a_choice_is_refused_where_it_means_nothing(env):
                     json={"topic_id": "T10001", "choice": "filter"}).status_code == 404
     other = {"X-User-Email": "someone-else@example.com"}
     assert _request(app, "PUT", url, json={"topic_id": "T10001", "choice": "filter"}, headers=other).status_code == 404
+
+
+# --- not-wanted choices: after the first review ------------------------------------
+
+
+def _add_seed_topics(env, slug, topics):
+    """One seed of the interest now also carries these ``(code, name)`` topics."""
+    conn = connect(env)
+    try:
+        oa_id = conn.execute("SELECT openalex_id FROM profile_seeds ps JOIN profiles p ON p.id = ps.profile_id "
+                             "WHERE p.slug = ? AND openalex_id LIKE 'https://openalex.org/W%' LIMIT 1", (slug,)).fetchone()[0]
+        raw = json.loads(conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa_id,)).fetchone()[0])
+        for code, name in topics:
+            raw["topics"].append({"id": f"https://openalex.org/{code}", "display_name": name, "score": 0.5,
+                                  "subfield": None, "field": None, "domain": None})
+        conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (json.dumps(raw), oa_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_stored(env, slug, stored):
+    conn = connect(env)
+    try:
+        conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE slug = ?", (json.dumps(stored), slug))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_list_read_that_overlaps_a_choice_does_not_undo_it(env, monkeypatch):
+    """The step-3 rebuild compared only the applied flag before writing: a
+    choice made while it ran was written over, with the 200 saying it was
+    set. The whole stored list is compared now."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    real = wizard._aggregate_topics
+    hits = []
+
+    def racing(conn, profile_id, **kw):
+        out = real(conn, profile_id, **kw)
+        if not hits:
+            hits.append(1)
+            other = connect(env)
+            try:
+                wizard.set_not_interest_choice(other, user_id=1, slug=slug, topic_id="T10001", choice="filter")
+            finally:
+                other.close()
+        return out
+
+    monkeypatch.setattr(wizard, "_aggregate_topics", racing)
+    topics = _topics(app, slug)
+    assert hits and _stored(env, slug)["not_interest_choices"]["T10001"] == "filter"
+    assert topics["T10001"]["on"] is False and topics["T10001"]["profile"] == "not_interest"
+
+
+def test_a_choice_on_a_saved_interest_is_made_while_the_mapper_is_down(env, monkeypatch):
+    """The stored list used to come back unchanged while the profile's labels
+    could not be mapped -- the choice dropped, with a 200."""
+    from rag_lib.api.services import wizard
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    monkeypatch.setattr(wizard.researcher_topics, "with_labels",
+                        lambda view, *, settings: {**view, "labels_unmapped": True})
+    after = _choose(app, slug, "T10001", "filter")
+    assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
+    assert _stored(env, slug)["not_interest_choices"]["T10001"] == "filter"
+
+
+def test_a_list_applied_before_choices_filters_a_not_wanted_topic_a_seed_brings_later(env):
+    """Such a list switched every not-wanted topic off, whichever source
+    listed it. One that turns up afterwards (a new seed carries it) read as
+    unrecorded and got the default, kept on."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _apply_filtering(app, slug)
+    stored = _stored(env, slug)
+    del stored["not_interest_choices"]
+    _write_stored(env, slug, stored)
+    _add_seed_topics(env, slug, [("T11986", "Scientific Computing")])
+    assert _rows(app, slug)["https://openalex.org/T11986"]["choice"] == "filter"
+    topics = _topics(app, slug)
+    assert topics["https://openalex.org/T11986"]["on"] is False
+    assert topics["https://openalex.org/T11986"]["profile"] == "not_interest"
+
+
+def test_forgetting_the_researcher_forgets_the_choices(env):
+    """Removed before the forget, or applied on a draft: the choices stayed
+    and came back with the next researcher's profile."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    removed = _draft_from(app, rid, name="Removed first")
+    _apply_filtering(app, removed)
+    assert _request(app, "PUT", f"/api/profiles/{removed}/researcher-topics", json={"enabled": False}).status_code == 200
+    applied = _draft_from(app, rid, name="Still applied")
+    _apply_filtering(app, applied)
+    assert "not_interest_choices" in _stored(env, removed) and "not_interest_choices" in _stored(env, applied)
+    assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    for slug in (removed, applied):
+        assert "not_interest_choices" not in _stored(env, slug)
+        _topics(app, slug)                                   # and a rebuild does not bring them back
+        assert "not_interest_choices" not in _stored(env, slug)
+
+
+def test_a_choice_on_a_saved_interest_leaves_marks_a_re_import_changed(env):
+    """Setting one choice re-applied the whole profile to the stored list:
+    a topic the re-imported profile now rejects was switched off too."""
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    profile = _profile_with_document()
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    _commit(app, slug, [t["id"] for t in applied if t["on"]])
+    t10515 = "https://openalex.org/T10515"
+    before = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    assert before[t10515]["on"] is True and before[t10515]["profile"] == "interest"
+    doc = json.loads(json.dumps(DOCUMENT))
+    for entry in doc["research_interests"]:
+        if entry["concept"].get("code") == "T10515":
+            entry["weight"] = -0.2                           # now rejected
+    profile.metadata = doc
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    after = _choose(app, slug, "T10001", "filter")
+    assert after["T10001"]["on"] is False
+    assert after[t10515]["on"] is True and after[t10515]["profile"] == "interest"
+    others = {i: (t["on"], t.get("profile")) for i, t in after.items() if i != "T10001"}
+    assert others == {i: (t["on"], t.get("profile")) for i, t in before.items() if i != "T10001"}
+
+
+def test_a_saved_interest_shows_the_default_a_save_records(env):
+    """A topic the profile newly rejects, which a new seed also lists: the
+    view counted its default against the stored list (not there: filter),
+    the save against the rebuilt one (a seed lists it: keep)."""
+    profile = _profile_with_document()
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    on = [t["id"] for t in applied if t["on"]]
+    _commit(app, slug, on)
+    profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
+                                                           _topic("T12345", "Something New", weight=-0.4, method="declared")]}
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    _add_seed_topics(env, slug, [("T12345", "Something New")])
+    shown = _rows(app, slug)["https://openalex.org/T12345"]
+    assert shown["overlap"] == ["openalex"] and shown["choice"] == "keep"
+    assert _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": on}).status_code == 200
+    assert _stored(env, slug)["not_interest_choices"]["T12345"] == "keep"
+
+
+def test_an_apply_refused_for_leaving_nothing_on_stays_unapplied(env):
+    """A recorded "filter" on the seeds' only topic: applying would switch
+    everything off. Refused, and nothing written -- the flag stays off."""
+    profile = _stub_profile()
+    profile.metadata = {"research_interests": [_topic("T10001", "Test Topic", weight=-0.5, method="declared")]}
+    profile.rid = "0000-0001-5643-4068"
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _topics(app, slug)
+    stored = _stored(env, slug)
+    _write_stored(env, slug, {**stored, "not_interest_choices": {"T10001": "filter"}})
+    before = _stored(env, slug)
+    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True})
+    assert resp.status_code == 409 and "every topic off" in resp.json()["detail"]
+    assert _stored(env, slug) == before and before.get("researcher_topics") is not True
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    assert view["applied"] is False
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_applying_twice_changes_nothing_the_second_time(env, saved):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    first = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
+    _choose(app, slug, "https://openalex.org/T11986", "add")
+    if saved:
+        _commit(app, slug, [t["id"] for t in first if t["on"]] + ["https://openalex.org/T11986"])
+    def states():
+        stored = _stored(env, slug)
+        return ({t["id"]: (t["on"], t.get("profile"), t.get("source")) for t in stored["topics"]},
+                stored["not_interest_choices"], stored["researcher_topics"])
+
+    once = states()
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    assert states() == once
+
+
+def test_the_view_lists_the_not_wanted_labels_that_map_to_nothing(env):
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    topics = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["topics"]
+    # UMLS is off in the suite: there is nothing to map against.
+    assert topics["unmatched_labels"] == ["phylogenomics", "wet-lab-protocol-development"]
+
+
+def test_applying_on_a_saved_interest_records_the_default_shown(env):
+    """Before the apply the view counts a default against the rebuilt list;
+    the apply on a saved interest counted it against the stored one, which
+    a topic a new seed brings is not in yet."""
+    profile = _profile_with_document()
+    profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
+                                                           _topic("T12345", "Something New", weight=-0.4, method="declared")]}
+    app = _app(StubProsopia(profile), _stub_openalex())
+    slug = _draft_from(app, _import_prosopia(app))
+    _commit(app, slug, list(_topics(app, slug)))
+    _add_seed_topics(env, slug, [("T12345", "Something New")])
+    assert _rows(app, slug)["https://openalex.org/T12345"]["choice"] == "keep"
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    assert _stored(env, slug)["not_interest_choices"]["T12345"] == "keep"
+
+
+def test_choices_are_not_carried_once_the_researcher_is_gone(env):
+    """The forget clears them; should that write not have happened (the
+    researcher deleted underneath), a rebuild does not carry them either."""
+    from rag_lib.db.repos import researchers as repo
+    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
+    _apply_filtering(app, slug)
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).status_code == 200
+    assert "not_interest_choices" in _stored(env, slug)
+    conn = connect(env)
+    try:
+        repo.delete(conn, rid)
+    finally:
+        conn.close()
+    _topics(app, slug)
+    assert "not_interest_choices" not in _stored(env, slug)
