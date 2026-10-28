@@ -269,12 +269,14 @@ def test_rebuilding_profiles_keeps_every_child_row(tmp_path):
     uid = int(users_repo.upsert(conn, "a@example.com")["id"])
     pid = _interest(conn, uid, "Alpha")
     papers_repo.upsert(conn, {"openalex_id": "W1", "title": "x", "source": "s"})
-    profiles_repo.attach_seed(conn, pid, "W1")
+    # attach_seed reads paper_versions (0029), not there yet.
+    conn.execute("INSERT INTO profile_seeds (profile_id, openalex_id) VALUES (?, 'W1')", (pid,))
+    conn.commit()
     candidates_repo.insert_dedup(conn, profile_id=pid, openalex_id="W1", score=0.9)
     gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")
     conn.execute("DELETE FROM profiles WHERE id = ?", (_interest(conn, uid, "Gone"),))
     conn.commit()
-    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions"]
+    assert apply_migrations(conn) == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions", "0029_private_upload_versions", "0030_draft_owned"]
     for table in ("profile_seeds", "profile_candidates", "gather_runs"):
         assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1, table
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -296,8 +298,9 @@ def test_imports_no_longer_count_as_uploads(tmp_path):
     papers_repo.upsert(conn, {"openalex_id": "W2", "title": "import", "source": "prosopia",
                               "uploaded_by_user_id": uid})
     apply_migrations(conn)
+    # (0029 then makes the upload the user's own version of W1.)
     assert [tuple(r) for r in conn.execute("SELECT user_id, openalex_id, file_hash FROM paper_uploads")] \
-        == [(uid, "W1", "h")]
+        == [(uid, f"local:upload:{uid}:h", "h")]
     assert conn.execute("SELECT uploaded_by_user_id FROM papers WHERE openalex_id='W2'").fetchone()[0] is None
 
 

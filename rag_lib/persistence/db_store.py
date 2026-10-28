@@ -19,7 +19,9 @@ runtime warning surfaces it.
 
 from __future__ import annotations
 
+import hashlib
 import math
+from pathlib import Path
 
 import structlog
 
@@ -34,6 +36,7 @@ from ..db.repos import (
     profiles as profiles_repo,
     schedules as schedules_repo,
     users as users_repo,
+    versions as versions_repo,
 )
 from ..paper import Paper, paper_keys, title_key
 from ..profile import Profile
@@ -142,6 +145,33 @@ def store_papers(
     return written
 
 
+def _as_private_versions(conn: sqlite3.Connection, user_id: int, papers: list[Paper]) -> list[tuple[Paper, str, str | None]]:
+    """Give each seed read from the user's own PDF (it has body text) its
+    private version id, as an upload gets, and store the public record's
+    metadata without that text. Returns ``(paper, file_hash, canonical)``
+    for those, to register once the papers are stored. The vectors the
+    paper carries were made from its text and go with it.
+    """
+    out = []
+    for paper in papers:
+        if (not paper.openalex_id or versions_repo.is_version(paper.openalex_id)
+                or not (paper.body_text or "").strip()):
+            continue
+        path = Path(paper.local_path) if paper.local_path else None
+        if path is not None and path.is_file():
+            from ..vault import compute_file_hash
+            digest = compute_file_hash(path)
+        else:
+            digest = hashlib.sha256(paper.body_text.encode("utf-8")).hexdigest()
+        canonical = None if paper.openalex_id.startswith("local:") else paper.openalex_id
+        if canonical is not None:
+            papers_repo.upsert(conn, versions_repo.public_fields(_paper_dict_for_repo(paper)))
+        paper.openalex_id = versions_repo.version_id(user_id, digest)
+        paper.source = "user_pdf_version"
+        out.append((paper, digest, canonical))
+    return out
+
+
 def store_profile_from_object(
     conn: sqlite3.Connection,
     *,
@@ -155,7 +185,26 @@ def store_profile_from_object(
     selector_config still goes into ``selector_config_json`` so nothing
     is lost. Coherence diagnostics, when surfaced by the selector,
     populate the dedicated columns for fast read-side queries.
+
+    A seed with body text (``cli.ingest`` of a PDF) is the user's upload:
+    it is stored as their private version, like a vault upload, and the
+    fit and topic lists name it by that id.
     """
+    # Before anything is written: a profile file naming another user's
+    # upload would otherwise overwrite its text, and only the seed
+    # trigger, after the commit, would refuse it. A version id is the
+    # user's only once it is registered as theirs; an unregistered one
+    # would be a version with no owner.
+    foreign = [p.openalex_id for p in profile.papers
+               if versions_repo.is_version(p.openalex_id) and versions_repo.owner(conn, p.openalex_id) != int(user_id)]
+    if foreign:
+        raise ValueError(f"{foreign[0]} is not one of your uploads; it cannot be imported")
+    before = {id(p): p.openalex_id for p in profile.papers}
+    private = _as_private_versions(conn, user_id, profile.papers)
+    renames = {before[id(p)]: p.openalex_id for p, _, _ in private}
+    if renames:
+        profile.selector_config = versions_repo.rename_ids(profile.selector_config, renames)
+        profile.topic_filters = versions_repo.rename_ids(profile.topic_filters, renames)
     sel_cfg = profile.selector_config or {}
 
     centroid_blob: bytes | None = None
@@ -186,6 +235,15 @@ def store_profile_from_object(
     )
 
     store_papers(conn, profile.papers)
+    for paper, digest, canonical in private:
+        conn.execute(
+            "UPDATE papers SET file_hash = ?, uploaded_by_user_id = ? WHERE openalex_id = ?",
+            (digest, user_id, paper.openalex_id),
+        )
+        versions_repo.register(conn, user_id=user_id, paper_id=paper.openalex_id,
+                               canonical_id=canonical, file_hash=digest)
+        papers_repo.record_upload(conn, user_id=user_id, openalex_id=paper.openalex_id, file_hash=digest,
+                                  local_path=paper.local_path, n_pages=None)
     for paper in profile.papers:
         if not paper.openalex_id:
             continue

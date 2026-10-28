@@ -11,7 +11,7 @@ into a reusable class. Used by two callers with different intents:
   - rag_lib.gatherers.openalex.OpenAlexGatherer: search for new candidates
     by topic filter since a given date. This is search_works, which is
     *not* in the original script and stays stubbed until Phase 1B. The
-    cursor pagination, OR-joined topic filters, and polite-pool mailto
+    paged results, OR-joined topic filters, and polite-pool mailto
     pattern are all specified in the build spec; the stub keeps the
     integration surface present while the body is written.
 
@@ -24,11 +24,18 @@ from __future__ import annotations
 import time
 
 import requests
+import structlog
 
+from . import openalex_status
+from .openalex_status import OpenAlexUnavailable
 from .paper import Paper, Topic, TopicNode
 
 
 DEFAULT_BASE_URL = "https://api.openalex.org"
+# OpenAlex serves ``page=`` paging up to this many results of one query.
+MAX_PAGED_RESULTS = 10_000
+
+log = structlog.get_logger("rag_lib.openalex_client")
 
 
 class OpenAlexClient:
@@ -56,16 +63,22 @@ class OpenAlexClient:
     # ------------------------------------------------------------------
 
     def _get(self, path: str, params: dict | None = None) -> dict:
+        # Paused by an earlier 429 or 401: refused without spending a call.
+        openalex_status.check()
         self._api_calls += 1
         p = dict(params or {})
         p["mailto"] = self.mailto
         url = f"{self.base_url}{path}"
-        r = self.session.get(url, params=p, timeout=30)
+        try:
+            r = self.session.get(url, params=p, timeout=30)
+        except requests.RequestException as exc:
+            raise OpenAlexUnavailable("down", detail=f"{type(exc).__name__}: {exc}"[:300]) from exc
+        code = getattr(r, "status_code", 200)
         # Single attempt. Auto-retry on 429 wastes quota and extends the
         # cooldown when many simultaneous requests share an IP. Surface
         # whatever the server told us instead so the caller (or human)
         # decides what to do.
-        if getattr(r, "status_code", 200) == 429:
+        if code == 429:
             headers = getattr(r, "headers", {}) or {}
             remaining = headers.get("X-RateLimit-Remaining", "?")
             reset = headers.get("X-RateLimit-Reset", "?")
@@ -74,15 +87,34 @@ class OpenAlexClient:
                 body = r.text[:200]
             except Exception:
                 pass
-            raise RuntimeError(
-                f"OpenAlex 429: rate-limited. "
-                f"X-RateLimit-Remaining={remaining}, X-RateLimit-Reset={reset}s. "
-                f"Body: {body!r}"
+            if str(remaining).strip() == "0":
+                # The day's quota: paused until OpenAlex says it resets.
+                try:
+                    reset_s = float(reset)
+                except (TypeError, ValueError):
+                    reset_s = None
+            else:
+                reset_s = openalex_status.BURST_PAUSE_SECONDS
+            until = openalex_status.pause("quota", reset_seconds=reset_s)
+            raise OpenAlexUnavailable(
+                "quota", until=until, response=r,
+                detail=(f"OpenAlex 429: rate-limited. "
+                        f"X-RateLimit-Remaining={remaining}, X-RateLimit-Reset={reset}s. "
+                        f"Body: {body!r}"),
             )
+        if code in (401, 403):
+            until = openalex_status.pause("auth")
+            raise OpenAlexUnavailable("auth", until=until, response=r, detail=f"OpenAlex {code}")
+        if isinstance(code, int) and code >= 500:
+            raise OpenAlexUnavailable("down", response=r, detail=f"OpenAlex {code}")
         r.raise_for_status()
         if self.rate_limit_sleep:
             time.sleep(self.rate_limit_sleep)
-        return r.json()
+        try:
+            return r.json()
+        except ValueError as exc:
+            # A 200 that is not JSON (a proxy's error page): no answer either.
+            raise OpenAlexUnavailable("down", response=r, detail=f"not JSON: {exc}"[:300]) from exc
 
     @property
     def api_calls(self) -> int:
@@ -194,9 +226,9 @@ class OpenAlexClient:
         and with ``extras``. ``mailto`` is appended on every request for
         the polite pool.
 
-        Pagination: ``per_page=200`` (OpenAlex max), ``cursor=*`` on the
-        first call, then ``cursor=<meta.next_cursor>`` until the cursor
-        is null. Stops early when ``limit`` is reached.
+        Pagination: ``per_page=200`` (OpenAlex max), ``page=1, 2, ...``
+        until a short page or ``meta.count`` is reached (see
+        ``paginate_filter``). Stops early when ``limit`` is reached.
 
         Fallback: if the full topic_filters returns zero hits, retry with
         progressively wider hierarchy levels (topics → subfields → fields
@@ -219,13 +251,17 @@ class OpenAlexClient:
         per_page: int = 200,
         sort: str | None = None,
     ) -> list[dict]:
+        # ``page=`` paging, not ``cursor=``: since 2026-10 OpenAlex answers
+        # a cursor past the first page with 401 unless the request carries
+        # an API key. ``page=`` needs none but reaches only the first
+        # MAX_PAGED_RESULTS results of a query.
         out: list[dict] = []
-        cursor: str | None = "*"
-        while cursor:
+        page = 1
+        while True:
             params = {
                 "filter": filter_str,
                 "per-page": per_page,
-                "cursor": cursor,
+                "page": page,
             }
             # ``sort`` (e.g. "cited_by_count:desc") decides *which* works a
             # ``limit`` keeps; without it OpenAlex's order is unspecified.
@@ -242,7 +278,13 @@ class OpenAlexClient:
             out.extend(results)
             if limit is not None and len(out) >= limit:
                 break
-            cursor = (j.get("meta") or {}).get("next_cursor")
+            count = (j.get("meta") or {}).get("count")
+            if len(results) < per_page or (count is not None and page * per_page >= count):
+                break
+            if (page + 1) * per_page > MAX_PAGED_RESULTS:
+                log.warning("openalex.page_limit", filter=filter_str[:200], count=count, kept=len(out))
+                break
+            page += 1
         return out
 
     @staticmethod

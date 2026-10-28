@@ -39,6 +39,8 @@ from typing import Any, Iterable
 import structlog
 from researcher_profiles import PaperRecord
 
+from .openalex_status import OpenAlexUnavailable
+
 
 log = structlog.get_logger("rag_lib.prosopia_seeds")
 
@@ -215,6 +217,10 @@ def prefetch_works(
         filter_str = "doi:" + "|".join(chunk)
         try:
             works = client.paginate_filter(filter_str, per_page=batch_size)
+        except OpenAlexUnavailable:
+            # OpenAlex not answering (quota, API key, outage) is not "these
+            # DOIs are unknown": the import stops (FUNCTIONAL_SPEC F2).
+            raise
         except Exception as exc:  # noqa: BLE001 — degrade to per-paper
             log.warning(
                 "prosopia.prefetch_batch_failed",
@@ -276,6 +282,10 @@ def _get_work_retrying(client: Any, oa_id: str) -> tuple[dict | None, bool]:
             if attempt == 1 and _retryable(exc):
                 time.sleep(_ID_RETRY_DELAY)
                 continue
+            if isinstance(exc, OpenAlexUnavailable):
+                # Still not answering: the import stops, nothing is
+                # stored as unresolved (FUNCTIONAL_SPEC F2).
+                raise
             break
     return None, True
 
@@ -290,6 +300,10 @@ def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     """
     try:
         return fn(*args, **kwargs)
+    except OpenAlexUnavailable:
+        # Not a failed rung: OpenAlex did not answer, so nothing can be
+        # concluded from it and the import stops (FUNCTIONAL_SPEC F2).
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "prosopia.lookup_failed",

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 from ..deps import get_settings
 from ..schemas import Health
 from ..settings import Settings
+from ... import openalex_status
 from ...rag import llm as rag_llm
 
 router = APIRouter()
@@ -37,3 +38,10 @@ def health(
         llm_provider=provider,
         llm_model=model,
     )
+
+
+@router.get("/openalex/status")
+def openalex_availability() -> dict:
+    """Whether OpenAlex is paused (quota used up, API key wanted), and until
+    when: the frontend's banner, and its upload buttons, follow this."""
+    return openalex_status.status()

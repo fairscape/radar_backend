@@ -38,10 +38,6 @@ MIN_SIMILARITY = 0.55
 BODY_CHARS = 1500
 
 
-def is_local(openalex_id: str | None) -> bool:
-    return bool(openalex_id) and str(openalex_id).startswith("local:")
-
-
 def topics_from_text(title: str | None, body: str | None, *, settings: Any) -> list[dict]:
     """The nearest OpenAlex topics to ``title`` + the start of ``body``.
 

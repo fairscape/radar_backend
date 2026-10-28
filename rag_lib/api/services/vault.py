@@ -43,14 +43,16 @@ import structlog
 log = structlog.get_logger("rag_lib.api.services.vault")
 
 from ...db.repos import (
+    draft_owned as draft_owned_repo,
     embeddings as embeddings_repo,
     papers as papers_repo,
     profiles as profiles_repo,
     users as users_repo,
     vault as vault_repo,
     gather_runs as gather_runs_repo,
+    versions as versions_repo,
 )
-from ... import content_topics
+from ... import content_topics, openalex_status
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
 from ...openalex_client import OpenAlexClient
@@ -89,8 +91,12 @@ def _row_to_vault_doc(
     *,
     settings: Any | None = None,
     collection: Any | None = None,
+    numbers: dict[str, tuple[int, str]] | None = None,
 ) -> dict:
     """Shape one papers row as the TS ``VaultDoc`` the frontend expects.
+
+    ``numbers``: ``versions.version_numbers`` for the user, when the caller
+    shapes many rows; read here otherwise.
 
     ``chunks`` is the per-paper chunk count from Chroma. We pass either
     a pre-resolved ``collection`` (when the caller is iterating over
@@ -109,12 +115,19 @@ def _row_to_vault_doc(
     )
     return {
         "id": row["openalex_id"],
+        # The public work an uploaded version is a copy of: its OpenAlex
+        # page, and what says it matched. None for a paper not uploaded.
+        "canonicalId": versions_repo.canonical_id(conn, row["openalex_id"]),
         "title": row["title"] or "",
         "authors": authors,
         "venue": row["venue"] or "",
         "tags": vault_repo.tags_for_paper(conn, user_id, row["openalex_id"]),
         "pages": int(row["n_pages"] or 0),
         "chunks": chunk_count,
+        # Which of the user's files of this paper it is (1 = the first
+        # uploaded), when they have more than one; None otherwise.
+        "version": (numbers if numbers is not None else versions_repo.version_numbers(conn, user_id))
+                   .get(row["openalex_id"], (None, None))[0],
         # This user's own time: first_seen_at is whoever uploaded it first.
         "added": (row["added_at"] if "added_at" in row.keys() else vault_repo.added_at(conn, user_id, row["openalex_id"], row["first_seen_at"])) or "",
     }
@@ -130,6 +143,18 @@ class UploadRejected(ValueError):
     def __init__(self, message: str, *, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
+
+
+def _upload_file_intact(conn: sqlite3.Connection, user_id: int, openalex_id: str, file_hash: str) -> bool:
+    """This user's stored file for the upload is there and still these bytes."""
+    row = conn.execute(
+        "SELECT local_path FROM paper_uploads WHERE user_id = ? AND openalex_id = ?", (user_id, openalex_id),
+    ).fetchone()
+    path = Path(row[0]) if row and row[0] else None
+    try:
+        return path is not None and path.is_file() and compute_file_hash(path) == file_hash
+    except OSError:
+        return False
 
 
 def looks_like_pdf(data: bytes) -> bool:
@@ -156,6 +181,11 @@ def upload(
             status_code=415,
         )
 
+    if not profile_slug:
+        # Papers are uploaded into an interest (the wizard's first step, an
+        # interest's Seeds tab); the Vault page has no upload of its own.
+        raise UploadRejected("Upload a PDF from an interest: say which one to add it to.", status_code=400)
+
     file_hash = compute_file_hash(data)
 
     target_id: int | None = None
@@ -175,8 +205,21 @@ def upload(
                 f"'{profile_slug}' is still importing papers; add seeds to it once that finishes.",
                 status_code=409,
             )
+    # OpenAlex paused (its quota used up, or an API key wanted): no upload
+    # until then -- a 503 from the app's OpenAlexUnavailable handler.
+    openalex_status.check()
 
     existing = papers_repo.get_by_user_hash(conn, user_id, file_hash)
+    if existing is not None and not (
+        _upload_file_intact(conn, user_id, existing["openalex_id"], file_hash)
+        and versions_repo.has_own_text(conn, existing["openalex_id"])
+    ):
+        # The same bytes again, for an upload whose file is gone or changed
+        # on disk, or whose text was never read from it (a migrated upload
+        # still waiting, or one whose read failed): this is the repair, so
+        # store it again in full.
+        log.info("vault.upload.repair", openalex_id=existing["openalex_id"])
+        existing = None
     if existing is not None:
         # The rows are written before the paper is embedded, so an upload
         # that failed there (embedder down: a 500) left a paper with no
@@ -216,12 +259,8 @@ def upload(
             "This file could not be read as a PDF. It may be damaged or password-protected.",
             status_code=422,
         ) from exc
-    try:
-        os.replace(part_path, pdf_path)
-    except FileNotFoundError:
-        if not pdf_path.exists():
-            raise
-    if record.title == part_path.stem:
+    title_from_file = record.title == part_path.stem
+    if title_from_file:
         # No title on the page: ingest_pdf fell back to the file's name,
         # which here is the scratch name (".<hash>"), not the user's.
         record.title = Path(filename).stem.strip() or "Untitled PDF"
@@ -229,48 +268,108 @@ def upload(
 
     t2 = _time.monotonic()
     mailto = users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO)
-    openalex_id, paper_dict = _enrich_via_openalex(
-        record, mailto=mailto, filename=filename, file_hash=file_hash,
-    )
+    try:
+        # Only an answer from OpenAlex says whether it has the paper: when it
+        # cannot answer (OpenAlexUnavailable, a 503) nothing is kept, not the
+        # file either. Stored as "not on OpenAlex", it stayed that for good.
+        openalex_id, paper_dict = _enrich_via_openalex(
+            record, mailto=mailto, filename=filename, file_hash=file_hash,
+        )
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
     log.info("vault.upload.openalex", elapsed_ms=round((_time.monotonic() - t2) * 1000, 1))
+    try:
+        os.replace(part_path, pdf_path)
+    except FileNotFoundError:
+        if not pdf_path.exists():
+            raise
 
-    # Another user may have uploaded this paper already. Its stored text and
-    # embedding are what their seeds are scored with, so a second copy of
-    # the PDF does not rewrite them; this user gets their own upload row.
+    # The work is public: what OpenAlex says about it goes on its shared
+    # row. This file -- its text, vectors, concepts, topics -- is the
+    # user's own version (rag_lib.db.repos.versions): another user's copy
+    # of the paper, or this user's revised one, never shares or replaces it.
+    canonical = None if openalex_id.startswith("local:") else openalex_id
+    # Rows this upload adds to the database, not just updates: an upload
+    # into a draft is the draft's until it is saved (draft_owned).
+    new_rows = []
+    if canonical is not None:
+        if papers_repo.get_by_openalex_id(conn, canonical) is None:
+            new_rows.append(canonical)
+        papers_repo.upsert(conn, versions_repo.public_fields(paper_dict))
+    openalex_id = versions_repo.version_id(user_id, file_hash)
     prior = papers_repo.get_by_openalex_id(conn, openalex_id)
-    keep_text = prior is not None and bool((prior["body_text"] or "").strip())
+    if prior is None:
+        new_rows.insert(0, openalex_id)
+    had_text = prior is not None and bool((prior["body_text"] or "").strip())
+    confirmed = versions_repo.canonical_id(conn, openalex_id) if prior is not None else None
+    if canonical is None and confirmed is not None:
+        # The same file again, and OpenAlex no longer matches it (its record
+        # changed): the match it confirmed before stands, and so do the
+        # metadata it gave.
+        canonical = confirmed
+        paper_dict = {k: v for k, v in paper_dict.items()
+                      if k not in ("title", "abstract", "doi", "year", "venue", "topics", "primary_topic")}
+        paper_dict["title"] = ""
     paper_dict.update({
+        "openalex_id": openalex_id,
+        "source": "user_pdf_version",
         "file_hash": file_hash,
         "uploaded_by_user_id": user_id,
         "n_pages": record.n_pages,
         "local_path": str(pdf_path),
-        "body_text": None if keep_text else record.body_text,
+        "body_text": record.body_text,
     })
-    if content_topics.is_local(openalex_id) and not (prior is not None and prior["topics_json"]):
+    # Topics read while the version had no text (from its title alone) are
+    # read again now that it has: parse_pending does the same.
+    keep_topics = prior is not None and prior["topics_json"] and (
+        had_text or not content_topics.ids_from_content(prior["topics_json"]))
+    if canonical is None and not keep_topics:
         # OpenAlex does not have it, so nothing says what it is about: read
         # that from the PDF itself (rag_lib.content_topics).
         found = content_topics.try_topics_json(paper_dict.get("title"), record.body_text, settings=settings)
         if found is not None:
             paper_dict["topics_json"] = found
     papers_repo.upsert(conn, paper_dict)
+    # A repaired upload: its file is where it was written now, and a
+    # version scored on its metadata alone is fitted again from its text.
+    conn.execute("UPDATE papers SET local_path = ? WHERE openalex_id = ?", (str(pdf_path), openalex_id))
+    after = conn.execute("SELECT title, abstract, body_text FROM papers WHERE openalex_id = ?",
+                         (openalex_id,)).fetchone()
+    if prior is not None and (not had_text or tuple(after) != (prior["title"], prior["abstract"], prior["body_text"])):
+        # What its vector was made from changed (its text arrived, or the
+        # title or abstract it is embedded with): a new vector, a new fit.
+        conn.execute("DELETE FROM paper_embeddings WHERE openalex_id = ?", (openalex_id,))
+        versions_repo.forget_fit(conn, openalex_id)
+    versions_repo.register(conn, user_id=user_id, paper_id=openalex_id,
+                           canonical_id=canonical, file_hash=file_hash,
+                           title_from_file=title_from_file)
     papers_repo.record_upload(
         conn, user_id=user_id, openalex_id=openalex_id, file_hash=file_hash,
         local_path=str(pdf_path), n_pages=record.n_pages,
     )
+    # Recorded as soon as they exist: an upload that fails after this (the
+    # embedder down) and is retried comes back as a duplicate, which adds
+    # nothing new, and its rows would otherwise outlive a discarded draft.
+    if target_id is not None:
+        for oa in new_rows:
+            draft_owned_repo.own(conn, target_id, "paper", oa)
+    conn.commit()
 
     t3 = _time.monotonic()
     embedding_model = settings.RADAR_DEFAULT_EMBEDDING_MODEL
+    # Embedded from what is stored, so the vector and the row agree.
     stored = papers_repo.get_by_openalex_id(conn, openalex_id)
     paper = Paper(
-        doi=paper_dict.get("doi"),
+        doi=stored["doi"],
         openalex_id=openalex_id,
-        title=paper_dict.get("title") or record.title,
-        abstract=paper_dict.get("abstract") or "",
-        year=paper_dict.get("year"),
-        venue=paper_dict.get("venue"),
-        body_text=stored["body_text"] if keep_text else record.body_text,
+        title=stored["title"] or record.title,
+        abstract=stored["abstract"] or "",
+        year=stored["year"],
+        venue=stored["venue"],
+        body_text=stored["body_text"],
     )
-    if not (keep_text and embeddings_repo.get(conn, openalex_id, embedding_model) is not None):
+    if embeddings_repo.get(conn, openalex_id, embedding_model) is None:
         text = build_embedding_input(paper)
         embedder = get_embedder(embedding_model)
         embeddings_repo.upsert(conn, openalex_id, embedding_model, embedder(text))
@@ -325,11 +424,16 @@ def list_docs(
     settings: Any | None = None,
 ) -> list[dict]:
     rows = vault_repo.list_for_user(conn, user_id, tag=tag)
+    # A work that is this user's upload is listed once, as the upload, also
+    # where its public record is one of their researcher's papers.
+    copies = set(versions_repo.canonical_ids(conn, [r["openalex_id"] for r in rows]).values())
+    rows = [r for r in rows if r["openalex_id"] not in copies]
     # Resolve the user's Chroma collection once and pass it through so
     # we don't re-open the persistent client per row.
     collection = _try_open_user_collection(settings, user_id) if settings else None
+    numbers = versions_repo.version_numbers(conn, user_id)
     return [
-        _row_to_vault_doc(conn, user_id, r, settings=settings, collection=collection)
+        _row_to_vault_doc(conn, user_id, r, settings=settings, collection=collection, numbers=numbers)
         for r in rows
     ]
 
@@ -493,7 +597,7 @@ def _attach_to_profile(
     if profile is None or (profile_id is not None and int(profile["id"]) != profile_id):
         raise gone
     try:
-        profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id)
+        profiles_repo.attach_seed(conn, int(profile["id"]), openalex_id, source="upload")
     except sqlite3.IntegrityError as exc:
         conn.rollback()
         raise gone from exc
@@ -535,6 +639,24 @@ def _embed_if_missing(conn: sqlite3.Connection, row: sqlite3.Row, settings: Any)
     log.info("vault.upload.embedded_on_retry", openalex_id=oa, model=model)
 
 
+def _refused_is_none(lookup, value):
+    """``lookup(value)``, None when OpenAlex answered but refused the query
+    (a 400 for a DOI or title it cannot parse): that is an answer -- it has
+    nothing under it. Not answering (``OpenAlexUnavailable``) still raises."""
+    import requests
+
+    try:
+        return lookup(value)
+    except openalex_status.OpenAlexUnavailable:
+        raise
+    except requests.HTTPError as exc:
+        code = getattr(exc.response, "status_code", None)
+        if code is None or not 400 <= code < 500:
+            raise
+        log.info("vault.upload.openalex_refused", status=code, query=str(value)[:120])
+        return None
+
+
 def _enrich_via_openalex(
     record,
     *,
@@ -544,53 +666,48 @@ def _enrich_via_openalex(
 ) -> tuple[str, dict]:
     """Try DOI then title. Returns ``(openalex_id, paper_dict)``.
 
-    Failure is non-fatal: we still produce a paper_dict suitable for
-    ``papers.upsert`` with a synthetic ``local:<hash>`` id and
-    ``source='user_pdf'``. Authors land on ``paper_dict['authors']``
-    when OpenAlex resolves the work.
+    OpenAlex not having the paper is not an error: the paper_dict then has
+    a synthetic ``local:<hash>`` id and ``source='user_pdf'``. OpenAlex not
+    answering is: ``OpenAlexUnavailable`` propagates and nothing is stored.
+    Authors land on ``paper_dict['authors']`` when OpenAlex resolves the work.
     """
     paper_dict: dict[str, Any] = {
         "title": record.title or filename,
         "doi": record.doi,
         "source": "user_pdf",
     }
-    try:
-        client = OpenAlexClient(mailto=mailto)
-        work = None
-        if record.doi:
-            work = client.lookup_by_doi(record.doi)
-            # A DOI on the page can be a cited work's; keep it only if the
-            # PDF looks like that work.
-            if work is not None and not _verified_doi_match(record, work):
-                log.info("vault.upload.doi_rejected", doi=record.doi,
-                         work_title=(work.get("title") or "")[:120])
-                work = None
-                # It is some other paper's DOI, so it must not stay on this
-                # one: seeds are matched by DOI, and the local paper then
-                # kept the cited paper (often the most relevant) out of the
-                # feed as if it were a seed itself.
-                paper_dict["doi"] = None
-        if work is None and record.title:
-            work = _verified_title_match(record, client.search_by_title(record.title))
-        if work is None and getattr(record, "doi_from_body", False):
-            paper_dict["doi"] = None     # not vouched for by anything: likely a reference's
-        if work is not None:
-            paper = client.paper_from_work(work, source="user_pdf")
-            paper_dict["openalex_id"] = paper.openalex_id
-            paper_dict["doi"] = paper.doi or paper_dict.get("doi")
-            paper_dict["title"] = paper.title or paper_dict["title"]
-            paper_dict["abstract"] = paper.abstract
-            paper_dict["year"] = paper.year
-            paper_dict["venue"] = paper.venue
-            paper_dict["primary_topic"] = (
-                paper.primary_topic.to_dict() if paper.primary_topic else None
-            )
-            paper_dict["topics"] = [t.to_dict() for t in paper.topics]
-            paper_dict["authors"] = _authors_from_work(work)
-    except Exception:
-        # Network / OpenAlex outage shouldn't kill the upload — fall
-        # through to the synthetic-id branch below.
-        pass
+    client = OpenAlexClient(mailto=mailto)
+    work = None
+    if record.doi:
+        work = _refused_is_none(client.lookup_by_doi, record.doi)
+        # A DOI on the page can be a cited work's; keep it only if the
+        # PDF looks like that work.
+        if work is not None and not _verified_doi_match(record, work):
+            log.info("vault.upload.doi_rejected", doi=record.doi,
+                     work_title=(work.get("title") or "")[:120])
+            work = None
+            # It is some other paper's DOI, so it must not stay on this
+            # one: seeds are matched by DOI, and the local paper then
+            # kept the cited paper (often the most relevant) out of the
+            # feed as if it were a seed itself.
+            paper_dict["doi"] = None
+    if work is None and record.title:
+        work = _verified_title_match(record, _refused_is_none(client.search_by_title, record.title) or [])
+    if work is None and getattr(record, "doi_from_body", False):
+        paper_dict["doi"] = None     # not vouched for by anything: likely a reference's
+    if work is not None:
+        paper = client.paper_from_work(work, source="user_pdf")
+        paper_dict["openalex_id"] = paper.openalex_id
+        paper_dict["doi"] = paper.doi or paper_dict.get("doi")
+        paper_dict["title"] = paper.title or paper_dict["title"]
+        paper_dict["abstract"] = paper.abstract
+        paper_dict["year"] = paper.year
+        paper_dict["venue"] = paper.venue
+        paper_dict["primary_topic"] = (
+            paper.primary_topic.to_dict() if paper.primary_topic else None
+        )
+        paper_dict["topics"] = [t.to_dict() for t in paper.topics]
+        paper_dict["authors"] = _authors_from_work(work)
 
     if "openalex_id" not in paper_dict:
         paper_dict["openalex_id"] = f"local:{file_hash}"

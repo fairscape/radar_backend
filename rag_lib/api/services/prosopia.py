@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import structlog
 
 from ...db.repos import (
+    draft_owned as draft_owned_repo,
     embeddings as embeddings_repo,
     papers as papers_repo,
     profiles as profiles_repo,
@@ -125,6 +126,10 @@ class ImportPlan:
     researcher_id: int | None = None
     records: list[Any] = field(default_factory=list)
     profile: Any = None
+    # Made by the request that planned this import: an import that fails
+    # removes them again (``undo_import``), so nothing half-built stays.
+    new_draft: bool = False
+    new_researcher: bool = False
 
 
 def normalize_ref(raw: str) -> str:
@@ -310,6 +315,26 @@ def open_draft(
     return draft_row
 
 
+def open_draft_owning(
+    conn: sqlite3.Connection, settings: Any, *, researcher_id: int, new_researcher: bool,
+    **kwargs: Any,
+) -> sqlite3.Row:
+    """``open_draft`` for a researcher the wizard imported: the researcher
+    is the draft's, and goes when the draft is discarded or the import
+    fails (FUNCTIONAL_SPEC D). One this request created is removed again
+    when the draft cannot be opened."""
+    try:
+        draft_row = open_draft(conn, settings, researcher_id=researcher_id, **kwargs)
+        draft_owned_repo.own(conn, int(draft_row["id"]), "researcher", researcher_id)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        if new_researcher:
+            researchers_repo.delete(conn, researcher_id)
+        raise
+    return draft_row
+
+
 def _has_seeds(conn: sqlite3.Connection, profile_id: int) -> bool:
     return conn.execute(
         "SELECT 1 FROM profile_seeds WHERE profile_id = ? LIMIT 1", (profile_id,)
@@ -342,6 +367,10 @@ def prepare_import(
     of ``paper_ids`` are on the profile, and ``ProsopiaError`` for any
     other upstream failure; the router maps those to 400 / 404 / 502.
     """
+    # OpenAlex paused: the import could not resolve a paper; nothing is
+    # created (FUNCTIONAL_SPEC F2), a 503.
+    from ... import openalex_status
+    openalex_status.check()
     target = target_draft(conn, user_id, into)
     slug, profile = _resolve_profile(ref, base_url, prosopia_client)
     records = select_records(profile, slug, paper_ids)
@@ -355,21 +384,28 @@ def prepare_import(
         conn, user_id, rid if looks_like_orcid(rid) else None, into,
         researcher_id=int(known["id"]) if known is not None else None,
     )
+    # A person already stored is not imported again from a draft: the
+    # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
+    from . import researchers as researchers_service
+    new_researcher = researchers_service.refuse_if_known(
+        conn, user_id=user_id, source="prosopia", key=slug,
+        orcid=rid if looks_like_orcid(rid) else None,
+        draft_id=int(target["id"]) if target is not None else None,
+    )
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     # The researcher is recorded whichever way the import was started,
     # so the papers this draft is about to embed are reusable for the
-    # next interest without a second import.
-    from . import researchers as researchers_service
+    # next interest without a second import -- once the draft is saved.
     researcher_id = researchers_service.record_prosopia_researcher(
         conn, user_id=user_id, slug=slug, profile=profile,
         base_url=base_url or DEFAULT_BASE_URL,
     )
-    draft_row = open_draft(
+    draft_row = open_draft_owning(
         conn, settings, user_id=user_id, target=target,
         name=(name or profile.name or slug).strip()[:MAX_NAME], embedding_model=model,
-        researcher_id=researcher_id,
+        researcher_id=researcher_id, new_researcher=new_researcher,
     )
 
     return ImportPlan(
@@ -382,6 +418,8 @@ def prepare_import(
         embedding_model=model,
         records=records,
         profile=profile,
+        new_draft=target is None,
+        new_researcher=new_researcher,
     )
 
 
@@ -428,30 +466,38 @@ def run_import(
 ) -> dict:
     """Resolve, embed and attach every work in ``plan``.
 
-    Everything past the batched prefetch is best-effort per paper — one
-    paper that will not resolve is a row on the ``none`` rung, not a
+    In two halves, so an import that fails leaves nothing behind
+    (FUNCTIONAL_SPEC D, F2): every work is first resolved through OpenAlex
+    and every missing vector computed, with nothing written; only then is
+    it all stored. OpenAlex not answering (``OpenAlexUnavailable``) stops
+    the import in the first half -- it is not "this work is unknown" --
+    and so does an embedder that fails.
+
+    One paper that will not resolve is a row on the ``none`` rung, not a
     failed import. ``reporter`` is the scheduler's ``_ProgressReporter``
     (or any duck with ``step`` / ``tick``); pass ``None`` to run silent.
     ``run_id`` is recorded on the researcher as its last import.
+
+    A paper this import adds to the database, not just links, is the
+    draft's (``draft_owned``) when the import fills one: discarding the
+    draft removes it again unless something else uses it by then.
     """
     records = plan.records
     embedder = get_embedder(plan.embedding_model)
     oa = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, plan.user_id, settings.RADAR_DEFAULT_MAILTO))
 
     # Batched identifier resolution up front: one request per 50 DOIs
-    # rather than one per paper. A failure here is *not* fatal — the
-    # ladder degrades to per-paper lookups, which is slower but correct.
+    # rather than one per paper. A batch OpenAlex refuses (not one it
+    # cannot answer) degrades to per-paper lookups, slower but correct.
     _step(reporter, "fetching", total=len(records),
           message=f"Resolving {len(records)} works through OpenAlex")
     cache = prefetch_works(records, oa)
 
     resolved_by = {rung: 0 for rung in RUNGS}
     unresolved: list[str] = []
-    drafted = 0
 
-    _step(reporter, "embedding", total=len(records),
-          message=f"Embedding {len(records)} seeds")
-    for record in records:
+    resolved = []
+    for i, record in enumerate(records, start=1):
         resolution = resolve_seed(record, oa, slug=plan.slug, cache=cache)
         if not resolution.resolved:
             # Only now is the summary artifact worth a round trip: it is
@@ -462,9 +508,28 @@ def run_import(
                 plan.profile, record, resolution.paper_id,
             )
             unresolved.append(resolution.paper_id)
-
         resolved_by[resolution.rung] += 1
+        resolved.append((record, resolution))
+        if reporter is not None and (i % _TICK_EVERY == 0 or i == len(records)):
+            _tick(reporter, i, f"Resolved {i} / {len(records)} works")
 
+    # A paper already embedded under this model (by an earlier import, or
+    # a PDF upload) is not embedded again: that is what makes building a
+    # second interest from a researcher free.
+    _step(reporter, "embedding", total=len(resolved),
+          message=f"Embedding {len(resolved)} seeds")
+    vectors: dict[str, Any] = {}
+    for i, (_record, resolution) in enumerate(resolved, start=1):
+        oa_id = resolution.openalex_id
+        if oa_id not in vectors and not embeddings_repo.has(conn, oa_id, plan.embedding_model):
+            vectors[oa_id] = embedder(build_embedding_input(_as_paper(dict(resolution.paper))))
+        if reporter is not None and (i % _TICK_EVERY == 0 or i == len(resolved)):
+            _tick(reporter, i, f"Embedded {i} / {len(resolved)} seeds")
+
+    _step(reporter, "persisting", total=len(resolved), message=f"Saving {len(resolved)} seeds")
+    drafted = 0
+    for record, resolution in resolved:
+        oa_id = resolution.openalex_id
         # No uploaded_by_user_id: an import does not upload anything. The
         # papers row is shared by every user, and upsert keeps the newest
         # non-null owner, so stamping the importer here moved another
@@ -472,31 +537,24 @@ def run_import(
         # of their vault and into the importer's. The importer's claim is
         # the researcher_papers link written below, which the vault list
         # and the seed ownership check both already read.
-        row = dict(resolution.paper)
+        is_new = papers_repo.get_by_openalex_id(conn, oa_id) is None
         store_resolved_paper(conn, resolution)
-
-        # A paper already embedded under this model (by an earlier
-        # import, or a PDF upload) is not embedded again: that is what
-        # makes building a second interest from a researcher free.
-        if not embeddings_repo.has(conn, resolution.openalex_id, plan.embedding_model):
-            vector = embedder(build_embedding_input(_as_paper(row)))
-            embeddings_repo.upsert(
-                conn, resolution.openalex_id, plan.embedding_model, vector,
-            )
+        if is_new and plan.profile_id is not None:
+            draft_owned_repo.own(conn, plan.profile_id, "paper", oa_id)
+            conn.commit()
+        if oa_id in vectors:
+            embeddings_repo.upsert(conn, oa_id, plan.embedding_model, vectors.pop(oa_id))
         if plan.researcher_id is not None:
             researchers_repo.attach_paper(
-                conn, plan.researcher_id, resolution.openalex_id,
+                conn, plan.researcher_id, oa_id,
                 paper_id=resolution.paper_id,
                 resolved_by=resolution.rung,
                 summary=(getattr(record, "summary", None) or None),
             )
         if plan.profile_id is not None:
-            profiles_repo.attach_seed(conn, plan.profile_id, resolution.openalex_id)
+            profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source="researcher",
+                                      researcher_id=plan.researcher_id)
         drafted += 1
-        if reporter is not None and (
-            drafted % _TICK_EVERY == 0 or drafted == len(records)
-        ):
-            _tick(reporter, drafted, f"Imported {drafted} / {len(records)} seeds")
 
     if plan.researcher_id is not None:
         researchers_repo.mark_imported(conn, plan.researcher_id, run_id=run_id)
@@ -518,6 +576,53 @@ def run_import(
         "resolved_by": resolved_by,
         "unresolved": unresolved,
     }
+
+
+def import_error(exc: BaseException) -> str:
+    """What a failed import's run row says. OpenAlex not answering is said
+    in words (with "Nothing was changed."), not as an exception name."""
+    from ...openalex_status import OpenAlexUnavailable
+    from ...redact import public_error
+
+    if isinstance(exc, OpenAlexUnavailable):
+        return str(exc)
+    return f"{type(exc).__name__}: {public_error(exc)}"
+
+
+def undo_import(conn: sqlite3.Connection, plan: ImportPlan, *, run_id: int | None = None) -> None:
+    """An import that failed: remove what the request that planned it made.
+
+    A draft it opened goes with everything it brought in (``draft_owned``);
+    a researcher it created goes too, unless something else has come to
+    use it. What existed before -- a draft added to, a stored researcher
+    -- stays as it was. The run row stays, detached from what is deleted,
+    so its poll still reports the error.
+    """
+    rid = plan.researcher_id if plan.new_researcher else None
+    if run_id is not None:
+        if plan.new_draft:
+            conn.execute("UPDATE gather_runs SET profile_id = NULL WHERE id = ?", (run_id,))
+        if rid is not None:
+            conn.execute("UPDATE gather_runs SET researcher_id = NULL WHERE id = ?", (run_id,))
+        conn.commit()
+    if plan.new_draft and plan.profile_id is not None:
+        row = profiles_repo.get(conn, int(plan.profile_id))
+        if row is not None and row["is_draft"]:
+            draft_owned_repo.discard(conn, int(plan.profile_id))
+    if rid is None or researchers_repo.get(conn, int(rid)) is None:
+        return
+    if plan.profile_id is not None:
+        # The draft added to was linked to the new researcher by open_draft.
+        conn.execute("UPDATE profiles SET researcher_id = NULL WHERE id = ? AND researcher_id = ?",
+                     (int(plan.profile_id), int(rid)))
+    draft_owned_repo.disown(conn, "researcher", rid)
+    used = conn.execute("SELECT 1 FROM profiles WHERE researcher_id = ?", (int(rid),)).fetchone()
+    if used is None:
+        researchers_repo.delete(conn, int(rid))
+    else:
+        conn.commit()
+    log.info("prosopia.import.undone", run_id=run_id, profile_id=plan.profile_id,
+             researcher_id=rid, new_draft=plan.new_draft)
 
 
 def _step(reporter: Any | None, name: str, **kwargs: Any) -> None:

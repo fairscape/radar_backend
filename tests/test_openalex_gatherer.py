@@ -216,17 +216,21 @@ def _quota_profile(*topic_specs) -> Profile:
     )
 
 
-def test_per_topic_quota_queries_each_enabled_topic_once():
+def test_each_enabled_topic_asks_once_for_its_most_cited():
+    """FUNCTIONAL_SPEC S.1: one query per topic, its PER_TOPIC most cited
+    papers in the window -- one page, no total cap."""
     client = FakeOpenAlexClient(tier_results=[
         [canned_openalex_work(doi="10.x/1", openalex_id="WA1", title="A1")],
         [canned_openalex_work(doi="10.x/2", openalex_id="WB1", title="B1")],
     ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
     papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
 
     assert len(client.paginate_calls) == 2
     assert "topics.id:T1" in client.paginate_calls[0]["filter_str"]
     assert "topics.id:T2" in client.paginate_calls[1]["filter_str"]
+    for call in client.paginate_calls:
+        assert (call["limit"], call["per_page"], call["sort"]) == (40, 40, "cited_by_count:desc")
     assert g.last_tier_used == "per-topic-quota"
     assert {p.openalex_id for p in papers} == {"WA1", "WB1"}
 
@@ -257,25 +261,11 @@ def test_all_topics_disabled_gathers_nothing():
     assert g.last_tier_used == "no-enabled-topics"
 
 
-def test_quota_caps_each_topic_contribution():
-    """A prolific topic can't spend more than its quota.
-
-    ``limit`` is what the caller is asking for; both real callers (the
-    scheduler and the wizard dry-run) always pass one. It is spelled out
-    here because the per-topic share is derived from it — with 2 topics
-    and a target of 6, each topic's share is 3, so the quota binds and a
-    20-paper pool still only contributes 3.
-    """
-    client = FakeOpenAlexClient(tier_results=[
-        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
-         for i in range(20)],
-        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
-         for i in range(20)],
-    ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=3)
-    papers = g.fetch(
-        _quota_profile(("T1", True), ("T2", True)), since="2026-01-01", limit=6,
-    )
+def test_per_topic_caps_each_topic_contribution():
+    """A prolific topic can't bring more than its share."""
+    client = FakeOpenAlexClient(tier_results=[[canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}") for i in range(20)], [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}") for i in range(20)]])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic=3)
+    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
 
     ids = [p.openalex_id for p in papers]
     assert len(ids) == 6
@@ -289,7 +279,7 @@ def test_shared_papers_do_not_starve_later_topics():
     Both topics return the same first two papers. Draining T1 fully
     first would let it bank both and leave T2 with only its unique
     third paper. Round-robin deals them out alternately, so each topic
-    still lands its quota.
+    still lands two.
     """
     shared = [
         canned_openalex_work(doi="10.s/1", openalex_id="WS1", title="S1"),
@@ -299,7 +289,7 @@ def test_shared_papers_do_not_starve_later_topics():
         shared + [canned_openalex_work(doi="10.a/9", openalex_id="WA9", title="A9")],
         shared + [canned_openalex_work(doi="10.b/9", openalex_id="WB9", title="B9")],
     ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=2)
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic=3)
     papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
 
     ids = [p.openalex_id for p in papers]
@@ -336,7 +326,7 @@ def test_limit_truncation_keeps_attribution_consistent():
         [canned_openalex_work(doi=f"10.c/{i}", openalex_id=f"WC{i}", title=f"C{i}")
          for i in range(10)],
     ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic=10)
     papers = g.fetch(
         _quota_profile(("T1", True), ("T2", True), ("T3", True)),
         since="2026-01-01", limit=5,
@@ -346,54 +336,32 @@ def test_limit_truncation_keeps_attribution_consistent():
     assert set(g.last_source_topics) == {p.openalex_id for p in papers}
 
 
-def test_quota_scales_so_the_caller_can_reach_its_limit():
-    """The quota is a floor, not a ceiling.
-
-    This is the wizard dry-run's case: it asks for a large sample over 30
-    days so the threshold sweep has a distribution to fit against. A
-    fixed ``quota x n_topics`` ceiling capped it at 20 papers here no
-    matter how much OpenAlex had, and the user then calibrated a
-    threshold on that truncated sample.
-    """
-    client = FakeOpenAlexClient(tier_results=[
-        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
-         for i in range(60)],
-        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
-         for i in range(60)],
-    ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+def test_no_total_cap_without_a_limit():
+    """Without RADAR_GATHER_MAX_CANDIDATES there is no total cap: every
+    topic brings its PER_TOPIC (the old 500 / 1000 caps cut a 13-topic
+    interest short)."""
+    client = FakeOpenAlexClient(tier_results=[[canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}") for i in range(60)], [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}") for i in range(60)], [canned_openalex_work(doi=f"10.c/{i}", openalex_id=f"WC{i}", title=f"C{i}") for i in range(60)]])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client)
     papers = g.fetch(
-        _quota_profile(("T1", True), ("T2", True)), since="2026-01-01", limit=100,
+        _quota_profile(("T1", True), ("T2", True), ("T3", True)), since="2026-01-01",
     )
 
     ids = [p.openalex_id for p in papers]
-    assert len(ids) == 100
-    # Shares stay equal — scaling the quota must not cost the fairness
-    # property the round-robin exists for.
-    assert sum(1 for i in ids if i.startswith("WA")) == 50
-    assert sum(1 for i in ids if i.startswith("WB")) == 50
+    assert len(ids) == 120
+    assert {pre: sum(1 for i in ids if i.startswith(pre)) for pre in ("WA", "WB", "WC")} == {"WA": 40, "WB": 40, "WC": 40}
 
 
-def test_quota_floor_holds_when_the_derived_share_is_smaller():
-    """With many topics and a small target the derived share rounds down
-    below ``per_topic_quota``; the constant then takes over so a topic
-    whose peers are dry can still fill the request on its own."""
-    client = FakeOpenAlexClient(tier_results=[
-        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
-         for i in range(5)],
-        [],  # T2 has nothing in the window
-        [],  # T3 has nothing in the window
-    ])
-    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic_quota=10)
+def test_a_dry_topic_does_not_hand_its_share_to_others():
+    """Each topic takes its own most cited; one with nothing in the window
+    adds nothing, and the others don't fetch more to make up for it."""
+    client = FakeOpenAlexClient(tier_results=[[canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}") for i in range(5)], [], []])
+    g = OpenAlexGatherer(mailto="t@example.com", client=client, per_topic=3)
     papers = g.fetch(
-        _quota_profile(("T1", True), ("T2", True), ("T3", True)),
-        since="2026-01-01", limit=3,
+        _quota_profile(("T1", True), ("T2", True), ("T3", True)), since="2026-01-01",
     )
 
-    # Derived share is ceil(3/3) = 1; the floor of 10 is what lets T1
-    # supply all three. Without it this returns a single paper.
-    assert len(papers) == 3
-    assert all(p.openalex_id.startswith("WA") for p in papers)
+    assert [p.openalex_id for p in papers] == ["WA0", "WA1", "WA2"]
+    assert [c["limit"] for c in client.paginate_calls] == [3, 3, 3]
 
 
 LONG_TITLE = "Basal Glucose Control in Type 1 Diabetes Using Deep Reinforcement Learning"
@@ -492,19 +460,21 @@ def test_tier_walk_deduplicates_by_title_as_well():
     assert len(papers) == 1
 
 
-def test_min_results_is_the_target_when_no_limit_is_given():
-    """``min_results`` used to be dead on this path — only the tier walk
-    consulted it, so a caller that passed no ``limit`` got the bare
-    quota regardless of how few papers that came to."""
-    client = FakeOpenAlexClient(tier_results=[
-        [canned_openalex_work(doi=f"10.a/{i}", openalex_id=f"WA{i}", title=f"A{i}")
-         for i in range(30)],
-        [canned_openalex_work(doi=f"10.b/{i}", openalex_id=f"WB{i}", title=f"B{i}")
-         for i in range(30)],
-    ])
-    g = OpenAlexGatherer(
-        mailto="t@example.com", client=client, per_topic_quota=10, min_results=50,
+def test_tier_walk_takes_one_page_of_most_cited():
+    """An interest that never had topics walks the tiers: each tier asks
+    for its TIER_LIMIT most cited (one page)."""
+    from rag_lib.gatherers.openalex import TIER_LIMIT
+    client = FakeOpenAlexClient(search_results=[])
+    seed = {"abstract": "x", "primary_topic": {"id": "T11", "display_name": "core"}}
+    profile = Profile(
+        name="p",
+        papers=[Paper.from_dict({"doi": f"10.1/{i}", "openalex_id": f"W{i}", "title": str(i), **seed})
+                for i in range(2)],
+        topic_filters={"topics": [], "subfields": [], "fields": [], "domains": []},
     )
-    papers = g.fetch(_quota_profile(("T1", True), ("T2", True)), since="2026-01-01")
+    g = OpenAlexGatherer(mailto="test@example.com", client=client)
+    g.fetch(profile, since="2026-01-01")
 
-    assert len(papers) == 50
+    assert client.paginate_calls and g.last_tier_used != "per-topic-quota"
+    for call in client.paginate_calls:
+        assert (call["limit"], call["sort"]) == (TIER_LIMIT, "cited_by_count:desc") == (200, "cited_by_count:desc")

@@ -39,7 +39,7 @@ from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, fetch_claimed
 from ...paper import normalize_title, surname, title_key
 from ...prosopia_seeds import normalize_doi
-from .prosopia import ImportPlan, open_draft, target_draft
+from .prosopia import ImportPlan, open_draft_owning, target_draft
 
 
 log = structlog.get_logger("rag_lib.api.services.orcid")
@@ -483,6 +483,14 @@ def prepare_import(
     # drafts behind. Checked here rather than in the router so the CLI and
     # the test path get it too.
     refuse_if_importing(conn, user_id, oid, into)
+    # A person already stored is not imported again from a draft: the
+    # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
+    from . import researchers as researchers_service
+    into_row = target_draft(conn, user_id, into)
+    new_researcher = researchers_service.refuse_if_known(
+        conn, user_id=user_id, source="orcid", key=oid, orcid=oid,
+        draft_id=int(into_row["id"]) if into_row is not None else None,
+    )
 
     client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
     # check_registry=False: records_for reads only id/title/doi/year/venue,
@@ -499,15 +507,15 @@ def prepare_import(
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     # Record the researcher too: the works embedded for this draft are
-    # then on hand for the next interest built from the same person.
-    from . import researchers as researchers_service
+    # then on hand for the next interest built from the same person, once
+    # the draft is saved.
     researcher_id = researchers_service.record_orcid_researcher(
         conn, user_id=user_id, orcid=oid, name=listing["name"],
     )
-    draft_row = open_draft(
+    draft_row = open_draft_owning(
         conn, settings, user_id=user_id, target=target,
         name=(name or listing["name"] or f"ORCID {oid}").strip()[:MAX_NAME], embedding_model=model,
-        researcher_id=researcher_id,
+        researcher_id=researcher_id, new_researcher=new_researcher,
     )
     draft = {"slug": draft_row["slug"], "name": draft_row["name"]}
 
@@ -526,6 +534,8 @@ def prepare_import(
         embedding_model=model,
         records=records,
         profile=None,
+        new_draft=target is None,
+        new_researcher=new_researcher,
     )
 
 

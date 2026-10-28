@@ -105,8 +105,12 @@ def test_0021_to_head_keeps_every_row_and_adds_the_new_rules(db_at_0020):
         profiles_before = [tuple(r) for r in conn.execute("SELECT * FROM profiles ORDER BY id")]
 
         applied = apply_migrations(conn)
-        assert applied == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions"]
+        assert applied == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions", "0029_private_upload_versions", "0030_draft_owned"]
 
+        # 0029: user 2's upload of W1 became their own paper. W1's row had
+        # no record of whose file its text was, so its vector (made from
+        # that text) is dropped and the copy waits for user 2's file.
+        before.update(papers=before["papers"] + 1, paper_embeddings=before["paper_embeddings"] - 1)
         assert _counts(conn) == before
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

@@ -708,7 +708,7 @@ def test_a_backfill_stores_papers_from_the_years_asked_for(monkeypatch, db_path,
         run = conn.execute("SELECT tier_used, since_date, error FROM gather_runs WHERE id = ?", (run_id,)).fetchone()
     finally:
         conn.close()
-    assert asked == {"span": (2018, 2020), "per_year": 100}
+    assert asked == {"span": (2018, 2020), "per_year": 40}   # FUNCTIONAL_SPEC S.1
     assert stored == {"W800", "W801", "W802"}
     assert run[2] is None and run[0] == "backfill-years" and run[1] == "2018-01-01"
 
@@ -972,3 +972,33 @@ def test_nightly_gathers_can_be_paused_for_the_whole_server(monkeypatch):
         assert added == ["gather:7"]
     finally:
         get_settings.cache_clear()
+
+
+# FUNCTIONAL_SPEC S.1: a scan takes each topic's most cited, with no total
+# cap; only RADAR_GATHER_MAX_CANDIDATES caps the total.
+
+@pytest.mark.parametrize("cap, passed, expected", [
+    (None, None, None),     # the default scan: no cap at all
+    (None, 300, 300),       # an explicit ?limit= still caps
+    (250, None, 250),       # the deployment ceiling applies on its own
+    (250, 300, 250),
+])
+def test_a_scan_has_no_total_cap_unless_one_is_set(monkeypatch, db_path, settings, profile_id, cap, passed, expected):
+    asked = []
+
+    class LimitStub(_StubGatherer):
+        def fetch(self, profile, since, *, limit=None):
+            asked.append(limit)
+            return []
+
+    monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: LimitStub([]))
+    settings.RADAR_GATHER_MAX_CANDIDATES = cap
+    kw = {} if passed is None else {"limit": passed}
+    scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7, **kw)
+    assert asked == [expected]
+
+
+def test_the_year_rules_take_forty_a_year():
+    from rag_lib import years
+    assert years.BACKFILL_PER_YEAR == 40
+    assert [years.trial_per_year(n) for n in (1, 3, years.MAX_BACKFILL_YEARS)] == [40, 40, 40]

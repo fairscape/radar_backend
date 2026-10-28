@@ -23,6 +23,7 @@ from rag_lib.vault import PdfIngestRecord
 from tests.fixture_gatherer import FixtureGatherer
 from tests.test_api_profiles import _seed_db
 from tests.test_review_round12_journeys import InlineScheduler
+from tests.upload_inbox import inbox
 
 A = {"X-User-Email": "demo@example.com"}
 B = {"X-User-Email": "other@example.com"}
@@ -104,7 +105,7 @@ def _ok(resp, code=200):
 
 def _upload(app, content: bytes, filename: str, slug: str | None = None, headers=None):
     files = {"file": (filename, io.BytesIO(b"%PDF-1.4\n" + content), "application/pdf")}
-    data = {"profile_slug": slug} if slug else {}
+    data = {"profile_slug": slug or inbox(_request, app, headers or A)}
     return _request(app, "POST", "/api/vault/upload", files=files, data=data, headers=headers or A)
 
 

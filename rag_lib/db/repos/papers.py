@@ -38,8 +38,13 @@ def get_by_openalex_id(
 
 
 def get_by_doi(conn: sqlite3.Connection, doi: str) -> sqlite3.Row | None:
+    """The public paper with this DOI. A user's uploaded version carries
+    its work's DOI too and is never what a DOI resolves to."""
     return conn.execute(
-        "SELECT * FROM papers WHERE doi = ?", (doi,)
+        "SELECT * FROM papers p WHERE p.doi = ?"
+        " AND NOT EXISTS (SELECT 1 FROM paper_versions v WHERE v.version_id = p.openalex_id)"
+        " ORDER BY p.openalex_id LIMIT 1",
+        (doi,),
     ).fetchone()
 
 
@@ -122,6 +127,9 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
     if before is not None and before[3] is not None:     # extracted before
         _forget_umls_if_text_changed(
             conn, paper, dict(zip(("title", "abstract", "body_text"), before[:3])))
+    from .versions import follow_public
+
+    follow_public(conn, paper["openalex_id"])
     conn.commit()
     return paper["openalex_id"]
 

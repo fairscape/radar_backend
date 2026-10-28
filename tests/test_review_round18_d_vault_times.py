@@ -9,6 +9,7 @@ import io
 from rag_lib.db import connect
 from tests.test_review_round12_isolation import A, B, _request, world  # noqa: F401 -- fixture
 from tests.test_researchers import env  # noqa: F401 -- fixture
+from tests.upload_inbox import inbox
 
 
 def test_second_uploader_sees_own_time(world):
@@ -22,13 +23,16 @@ def test_second_uploader_sees_own_time(world):
     finally:
         conn.close()
     files = {"file": ("same.pdf", io.BytesIO(b"%PDF-1.4\nalice-bytes"), "application/pdf")}
-    r = _request(app, "POST", "/api/vault/upload", files=files, headers=B)
+    r = _request(app, "POST", "/api/vault/upload", files=files, headers=B,
+                 data={"profile_slug": inbox(_request, app, B)})
     assert r.status_code == 200, r.text
-    assert r.json()["id"] == world["upload"]
+    # B's copy is B's own paper now (0029), so it never had A's time.
+    b_upload = r.json()["id"]
+    assert b_upload != world["upload"]
     assert not r.json()["added"].startswith("2001"), r.json()
     docs = _request(app, "GET", "/api/vault/docs", headers=B).json()
     docs = docs.get("docs", docs) if isinstance(docs, dict) else docs
-    mine = [d for d in docs if d["id"] == world["upload"]]
+    mine = [d for d in docs if d["id"] == b_upload]
     assert mine and not mine[0]["added"].startswith("2001"), mine
     stats = _request(app, "GET", "/api/vault/stats", headers=B).json()
     assert not str(stats.get("lastIngest")).startswith("2001"), stats

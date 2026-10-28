@@ -32,7 +32,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ...openalex_status import OpenAlexUnavailable
 from ...redact import public_error
+from ..services.researchers import ResearcherExists
 
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
@@ -118,6 +120,9 @@ def import_researcher(
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except (OpenAlexUnavailable, ResearcherExists):
+            # A 503 with the pause, a 409 with the researcher (app handlers).
+            raise
         except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -222,6 +227,9 @@ def researcher_works(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except OverflowError as exc:   # an id SQLite cannot hold: no such researcher, not a source failure
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"researcher {researcher_id} not found") from exc
+    except (OpenAlexUnavailable, ResearcherExists):
+        # A 503 with the pause, a 409 with the researcher (app handlers).
+        raise
     except Exception as exc:  # noqa: BLE001 — the source could not be read
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

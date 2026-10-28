@@ -3,7 +3,8 @@
 One place for the rules, used by the trial scan, the commit, the PATCH
 route and the backfill: years between ``MIN_YEAR`` and this year,
 ``year_from <= year_to``, and a backfill spans at most ``MAX_BACKFILL_YEARS``
-(one OpenAlex query per year, ``BACKFILL_PER_YEAR`` papers each).
+(one OpenAlex query per year, the ``BACKFILL_PER_YEAR`` most cited papers
+each; FUNCTIONAL_SPEC S.1).
 """
 
 from __future__ import annotations
@@ -12,8 +13,8 @@ from datetime import datetime, timezone
 
 MIN_YEAR = 1900
 MAX_BACKFILL_YEARS = 15
-BACKFILL_PER_YEAR = 100
-TRIAL_PER_YEAR = 60
+BACKFILL_PER_YEAR = 40
+TRIAL_PER_YEAR = 40
 TRIAL_TOTAL = 600
 
 

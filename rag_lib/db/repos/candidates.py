@@ -44,9 +44,12 @@ IN_YEARS = (
 # themselves; either way the seed topped its own feed. Needs ``pc``. Same
 # rule as ``scoring.pool`` (``seed_keys``) and the gathers' ``without_seeds``.
 NOT_SEED = (
+    # A seed that is the user's uploaded version of the candidate counts too.
     "NOT EXISTS (SELECT 1 FROM profile_seeds ps"
     " LEFT JOIN papers sp ON sp.openalex_id = ps.openalex_id"
+    " LEFT JOIN paper_versions sv ON sv.version_id = ps.openalex_id"
     " WHERE ps.profile_id = pc.profile_id AND (ps.openalex_id = pc.openalex_id"
+    " OR sv.canonical_openalex_id = pc.openalex_id"
     " OR (sp.doi IS NOT NULL AND lower(sp.doi) ="
     " (SELECT lower(cp.doi) FROM papers cp WHERE cp.openalex_id = pc.openalex_id))))"
 )

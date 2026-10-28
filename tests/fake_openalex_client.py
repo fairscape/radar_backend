@@ -93,7 +93,7 @@ class FakeOpenAlexClient:
         falls back to ``search_results``. Records the call so tests can
         assert on the rendered filter string."""
         self.api_calls += 1
-        self.paginate_calls.append({"filter_str": filter_str, "limit": limit})
+        self.paginate_calls.append({"filter_str": filter_str, "limit": limit, "per_page": per_page, "sort": sort})
         if self._tier_results is not None:
             batch = self._tier_results.pop(0) if self._tier_results else []
             out = list(batch)

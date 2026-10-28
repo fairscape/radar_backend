@@ -24,6 +24,7 @@ from rag_lib.db.repos import (
     candidates as candidates_repo,
     feedback as feedback_repo,
     profiles as profiles_repo,
+    versions as versions_repo,
 )
 from rag_lib.feedback.log import format_event_line
 
@@ -125,15 +126,21 @@ def get_profile_detail(
     # the odd ones out.
     seed_oa_ids = profiles_repo.list_seed_openalex_ids(conn, profile_id)
     loo = _seed_loo_cosines(conn, profile_id, row["embedding_model"])
+    numbers = versions_repo.version_numbers(conn, user_id)
     seed_rows = []
     for idx, oa_id in enumerate(seed_oa_ids, start=1):
         paper_row = conn.execute(
-            "SELECT openalex_id, title, year FROM papers WHERE openalex_id = ?",
-            (oa_id,),
+            "SELECT p.openalex_id, p.title, p.year, v.canonical_openalex_id,"
+            " s.source, s.source_researcher_id, r.name AS source_researcher_name FROM papers p"
+            " JOIN profile_seeds s ON s.openalex_id = p.openalex_id AND s.profile_id = ?"
+            " LEFT JOIN researchers r ON r.id = s.source_researcher_id"
+            " LEFT JOIN paper_versions v ON v.version_id = p.openalex_id WHERE p.openalex_id = ?",
+            (profile_id, oa_id),
         ).fetchone()
         if paper_row is None:
             continue
-        seed_rows.append(seed_row_to_seed(paper_row, idx=idx, coh_to_centroid=loo.get(oa_id)))
+        seed_rows.append(seed_row_to_seed(paper_row, idx=idx, coh_to_centroid=loo.get(oa_id),
+                                          version=numbers.get(oa_id)))
 
     # Topics from profile_filters; coherence histogram from seed embeddings.
     topic_filters = profiles_repo.topic_filters(conn, profile_id)

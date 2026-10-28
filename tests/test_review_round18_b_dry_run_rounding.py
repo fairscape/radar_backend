@@ -74,3 +74,35 @@ def test_trial_distribution_counts_a_paper_the_feed_will_not_show(tmp_path, monk
     assert slider_n == feed_n, f"slider says {slider_n} pass at {thr}, the feed shows {feed_n} (scores={res.scores})"
     assert list_n == feed_n, f"paper list marks {list_n} as passing, the feed shows {feed_n}"
     conn.close()
+
+
+def test_the_trial_takes_what_a_scan_takes(tmp_path, monkeypatch):
+    """FUNCTIONAL_SPEC S.1: no 1000-paper cap on the trial -- each topic's
+    most cited, as a scan -- unless RADAR_GATHER_MAX_CANDIDATES sets one."""
+    conn = connect(tmp_path / "radar.db")
+    apply_migrations(conn)
+    uid = int(users_repo.upsert(conn, "u@example.com")["id"])
+    conn.execute(
+        "INSERT INTO profiles (user_id, name, slug, embedding_model, topic_filters_json, n_seed, is_draft, threshold)"
+        " VALUES (?, 'D', 'd', 'placeholder-v1', '{}', 0, 1, 0.7)", (uid,))
+    conn.commit()
+    row = conn.execute("SELECT * FROM profiles WHERE slug = 'd'").fetchone()
+    fake_profile = types.SimpleNamespace(
+        papers=[object()], topic_filters={}, embedding_model="placeholder-v1",
+        seed_embeddings=lambda model: [],
+    )
+    monkeypatch.setattr(wizard, "_load_profile", lambda conn, row: fake_profile)
+    monkeypatch.setattr(wizard, "_new_selector_for_draft", lambda row, profile, **k: _Selector())
+    asked = []
+
+    class Recording(_Gatherer):
+        def fetch(self, profile, since, limit=None):
+            asked.append(limit)
+            return super().fetch(profile, since, limit=limit)
+
+    for cap in (None, 150):
+        settings = types.SimpleNamespace(RADAR_GATHER_MAX_CANDIDATES=cap, RADAR_DEFAULT_MAILTO="x@example.com")
+        wizard.compute_dry_run_for_profile(
+            conn, settings, profile_row=row, slug="d", gatherer=Recording(), thresholds=[0.9])
+    assert asked == [None, 150]
+    conn.close()

@@ -404,7 +404,7 @@ def test_a_trial_over_a_year_range_samples_each_year(app, tmp_path):
     resp = _request(app, "POST", f"/api/profiles/draft/{slug}/dry-run",
                     json={"days": 7, "year_from": 2019, "year_to": 2021})
     assert resp.status_code == 200, resp.text
-    assert YearGatherer.asked == [(2019, 2021, 60)]
+    assert YearGatherer.asked == [(2019, 2021, 40)]   # FUNCTIONAL_SPEC S.1: 40 a year
     result = _request(app, "GET", f"/api/profiles/draft/{slug}/dry-run/{resp.json()['run_id']}").json()["result"]
     assert len(result["papers"]) == 12
 

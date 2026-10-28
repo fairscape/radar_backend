@@ -38,6 +38,7 @@ from ..schemas import (
     GatherRun,
     Profile,
     ProfileDetail,
+    SavedDraft,
     ProfileThresholdUpdate,
     RerankerCandidate,
     RerankerComparisonResponse,
@@ -63,6 +64,7 @@ from ..services import wizard as wizard_service
 from ..settings import Settings
 
 log = structlog.get_logger("rag_lib.api.routers.profiles")
+from ... import openalex_status
 from ...redact import public_error
 
 router = APIRouter()
@@ -389,6 +391,7 @@ def draft_dry_run(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
     profile_id = int(profile_row["id"])
+    openalex_status.check()   # paused: a 503, no run started (FUNCTIONAL_SPEC F2)
     if gather_runs_repo.has_unfinished_import(db, profile_id):
         # The trial would score against part of the seeds.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
@@ -573,6 +576,11 @@ def delete_draft(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"an import is still filling draft '{exc.slug}'; delete it once that finishes",
         ) from exc
+    except wizard_service.SavingInProgress as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"'{exc.slug}' is being saved: its first scan is running. Delete it once that finishes.",
+        ) from exc
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -627,6 +635,7 @@ def add_draft_seeds(
     try:
         attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=slug, openalex_ids=body.openalex_ids,
+            source=body.source, researcher_id=body.researcher_id,
         )
     except wizard_service.ImportInProgress as exc:
         raise HTTPException(
@@ -658,6 +667,7 @@ def add_seeds(
     try:
         attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=key, openalex_ids=body.openalex_ids,
+            source=body.source, researcher_id=body.researcher_id,
         )
     except wizard_service.ImportInProgress as exc:
         raise HTTPException(
@@ -707,24 +717,31 @@ def remove_seed(
     return {"ok": True}
 
 
-@router.post("", response_model=Profile)
+@router.post("", response_model=SavedDraft)
 def commit_draft(
     body: CommitDraftRequest,
     request: Request,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-) -> Profile:
-    """Commit a wizard draft → live profile.
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SavedDraft:
+    """Save a wizard draft: fit it, run its first scan, and only when that
+    succeeds make it a live interest (FUNCTIONAL_SPEC D.2-5, F2.3 Q1).
 
-    Flips ``is_draft=0``, fits the CentroidSelector, stores a schedule and
-    registers its job with the running scheduler. The schedule defaults to
-    daily 04:00 UTC; override via ``cron`` / ``tz``.
-
-    The job used to be left for "the next scheduler boot": the schedule row
-    was written but nothing was registered, so a new interest got no
-    nightly scan until the backend happened to restart.
+    The answer comes before the scan has run: the interest, still a draft,
+    and ``saveRunId``, the first scan's run to follow (the last 7 days, or
+    ``years`` as a backfill). It goes live, with its schedule (default
+    daily 04:00 UTC; ``cron`` / ``tz``) and nightly job, in that run's
+    successful close. A scan that fails -- OpenAlex unavailable among
+    others -- leaves it a draft with nothing from the scan; the run says
+    why, and saving again starts over. A save already running is answered
+    with its run. Without a scheduler (tests, the CLI) the scan runs here,
+    and a failure is the answer: 503 when OpenAlex did not answer, else 502.
     """
     from rag_lib import years as years_rules
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.db.repos import profiles as profiles_repo
+    from rag_lib.scheduler import jobs
     from rag_lib.scheduler.runner import valid_cron
 
     if body.years is not None:
@@ -732,9 +749,8 @@ def commit_draft(
             years_rules.check_range(body.years.year_from, body.years.year_to)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    # Before anything is written: the commit flips the draft live, so a cron
-    # that failed afterwards answered 500 to a commit that had happened, and
-    # the wizard's retry then got 404.
+    # Before anything is written: a cron that failed once the interest was
+    # live answered 500 to a save that had happened.
     if body.cron is not None or body.tz is not None:
         from rag_lib.db.repos.schedules import DEFAULT_CRON, DEFAULT_TZ
 
@@ -746,54 +762,87 @@ def commit_draft(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"invalid schedule (cron={body.cron!r}, tz={body.tz!r}): {problem}",
             )
+    uid = int(user["id"])
+    # OpenAlex paused: nothing is fitted or started (FUNCTIONAL_SPEC F2), a 503.
+    openalex_status.check()
+
+    def answer(run_id: int | None) -> SavedDraft:
+        profile = profiles_service.get_profile(db, uid, body.slug)
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"draft '{body.slug}' not found")
+        return SavedDraft(**profile.model_dump(), saveRunId=run_id)
+
+    row = profiles_repo.get_by_slug(db, uid, body.slug)
+    if row is None or not row["is_draft"]:
+        # A live interest is not a draft to save (the wizard then reads it
+        # and says it was saved in another tab).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"draft '{body.slug}' not found")
+    profile_id = int(row["id"])
+    running = gather_runs_repo.running_scan(db, profile_id)
+    if running is not None:
+        return answer(int(running["id"]))            # a save of it is running: follow that one
     try:
-        wizard_service.commit_draft(
-            db,
-            user_id=int(user["id"]),
-            slug=body.slug,
-            threshold=body.threshold,
+        done = wizard_service.commit_draft(
+            db, user_id=uid, slug=body.slug, threshold=body.threshold,
             selected_topic_ids=body.selected_topic_ids,
-            cron=body.cron,
-            tz=body.tz,
         )
-        if body.years is not None:
-            from rag_lib.db.repos import profiles as _profiles_repo
-            _row = _profiles_repo.get_by_slug(db, int(user["id"]), body.slug)
-            if _row is not None:
-                _profiles_repo.update_year_range(db, int(_row["id"]), body.years.year_from, body.years.year_to)
     except wizard_service.ImportInProgress as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"an import is still filling draft '{exc.slug}'; save once it has finished",
         ) from exc
     except LookupError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:   # no topic left on
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if done.get("already_live"):
+        return answer(None)
+    years = (body.years.year_from, body.years.year_to) if body.years is not None else None
+    profiles_repo.update_year_range(db, profile_id, *(years or (None, None)))
+    since = None
+    if years is not None:
+        since = f"{years_rules.fetch_span(*years)[0]}-01-01"
+    run_id = _open_scan_run(db, body.slug, profile_id=profile_id, user_id=uid, since_date=since,
+                            tier_used="backfill" if years else "first_scan")
+
     # Not Depends(get_scheduler): that 503s when the scheduler is off, and a
-    # commit must succeed either way -- the row is there for the next boot.
+    # save works either way (below, without one).
     scheduler = getattr(request.app.state, "scheduler", None)
-    if scheduler is not None:
+
+    def register() -> None:
+        from rag_lib.db import connect
         from rag_lib.db.repos import schedules as schedules_repo
         from rag_lib.scheduler import runner
 
-        profile_id = _resolve_profile_id(db, int(user["id"]), body.slug)
-        sched = schedules_repo.get(db, profile_id)
+        conn = connect(settings.RADAR_DB_PATH)
+        try:
+            sched = schedules_repo.get(conn, profile_id)
+        finally:
+            conn.close()
         if sched is not None and sched["enabled"]:
-            runner.register_gather_job(
-                scheduler, user_id=int(user["id"]), profile_id=profile_id,
-                cron=sched["cron"], tz=sched["tz"], slug=body.slug,
+            runner.register_gather_job(scheduler, user_id=uid, profile_id=profile_id,
+                                       cron=sched["cron"], tz=sched["tz"], slug=body.slug)
+
+    kwargs = {"run_id": run_id, "days": 7, "years": years, "cron": body.cron, "tz": body.tz,
+              "register": register if scheduler is not None else None}
+    if scheduler is None:
+        jobs.save_draft(uid, profile_id, settings=settings, **kwargs)
+        now = profiles_repo.get(db, profile_id)
+        if now is not None and now["is_draft"]:
+            run = gather_runs_repo.get(db, run_id)
+            error = (run["error"] if run is not None else None) or "The first scan failed."
+            # OpenAlex not answering is said in words that end so (run_error).
+            unavailable = "Nothing was changed." in error
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE if unavailable else status.HTTP_502_BAD_GATEWAY,
+                detail=f"The first scan failed, so the interest was not saved; it is still a draft. {error}",
             )
-    profile = profiles_service.get_profile(db, int(user["id"]), body.slug)
-    if profile is None:
-        # Should be unreachable — commit just flipped the row to live.
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="profile vanished mid-commit",
-        )
-    return profile
+        return answer(run_id)
+    _schedule_run(
+        scheduler, db, run_id, "backfill" if years else "first_scan",
+        jobs.save_draft, args=[uid, profile_id], kwargs=kwargs, id=f"save:{profile_id}:{run_id}",
+    )
+    return answer(run_id)
 
 
 @router.get("", response_model=list[Profile])
@@ -1369,14 +1418,15 @@ def gather_now(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     scheduler: Annotated[object, Depends(get_scheduler)],
     days: int = Query(default=1, ge=1, le=365),
-    limit: int = Query(default=500, ge=1, le=5000),
+    limit: int | None = Query(default=None, ge=1, le=5000),
 ) -> GatherNowResponse:
     """Enqueue an immediate one-shot gather for the profile.
 
     Opens a ``gather_runs`` row eagerly so the response can echo a real
     ``run_id`` (and the audit trail captures the trigger even if the
     background thread later errors). ``days`` controls how far back to
-    look for new candidates, ``limit`` caps the per-run fetch size.
+    look for new candidates; ``limit``, when given, caps the total the scan
+    keeps (each topic otherwise brings its most cited, FUNCTIONAL_SPEC S.1).
     """
     from rag_lib.db.repos import gather_runs as gather_runs_repo
     from rag_lib.scheduler.jobs import gather_for_profile
@@ -1390,6 +1440,7 @@ def gather_now(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
     profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
+    openalex_status.check()   # paused: a 503, no run started (FUNCTIONAL_SPEC F2)
     # Open the audit row eagerly so we can echo a real run_id; the
     # background job reuses it via the ``run_id`` kwarg.
     run_id = _open_scan_run(
@@ -1441,6 +1492,7 @@ def backfill(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
     profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
+    openalex_status.check()   # paused: a 503, no run started (FUNCTIONAL_SPEC F2)
     start, _end = years_rules.fetch_span(body.year_from, body.year_to)
     run_id = _open_scan_run(
         db, key, profile_id=profile_id, user_id=int(user["id"]),

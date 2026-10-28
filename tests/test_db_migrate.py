@@ -23,6 +23,8 @@ EXPECTED_TABLES = {
     "chat_turns",
     "researchers",
     "researcher_papers",
+    "paper_versions",
+    "draft_owned",
 }
 
 
@@ -55,6 +57,8 @@ EXPECTED_VERSIONS = [
     "0026_merge_duplicate_candidates",
     "0027_implausible_years",
     "0028_merge_zenodo_versions",
+    "0029_private_upload_versions",
+    "0030_draft_owned",
 ]
 
 

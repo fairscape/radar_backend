@@ -37,9 +37,9 @@ MAILTO = "radar-tool@example.com"
 
 
 def fetch_all_topics(mailto: str) -> list[dict]:
-    """Fetch all OpenAlex topics via cursor pagination."""
+    """Fetch all OpenAlex topics, ``page=`` by ``page=`` (a ``cursor=``
+    past the first page needs an API key since 2026-10)."""
     topics: list[dict] = []
-    cursor = "*"
     page = 0
 
     with httpx.Client(timeout=60.0) as client:
@@ -47,7 +47,7 @@ def fetch_all_topics(mailto: str) -> list[dict]:
             page += 1
             params = {
                 "per_page": PER_PAGE,
-                "cursor": cursor,
+                "page": page,
                 "mailto": mailto,
             }
             resp = client.get(OPENALEX_TOPICS_URL, params=params)
@@ -69,11 +69,9 @@ def fetch_all_topics(mailto: str) -> list[dict]:
 
             print(f"  Page {page}: fetched {len(results)} topics (total: {len(topics)})")
 
-            meta = data.get("meta", {})
-            next_cursor = meta.get("next_cursor")
-            if not next_cursor or next_cursor == cursor:
+            count = (data.get("meta") or {}).get("count")
+            if len(results) < PER_PAGE or (count is not None and page * PER_PAGE >= count):
                 break
-            cursor = next_cursor
 
             # Polite delay
             time.sleep(0.1)

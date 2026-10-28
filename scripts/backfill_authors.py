@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rag_lib.openalex_client import OpenAlexClient  # noqa: E402
+from rag_lib.db.repos import versions as versions_repo  # noqa: E402
 
 BATCH = 50
 
@@ -67,6 +68,7 @@ def main() -> int:
                 "UPDATE papers SET publication_date = ? WHERE openalex_id = ? AND publication_date IS NULL",
                 (date, w["id"]))
             n_date += cur.rowcount if date else 0
+            versions_repo.follow_public(conn, w["id"])     # and the users' uploads of it
         conn.commit()
         print(f"  {min(start + BATCH, len(ids))}/{len(ids)}  ({len(works)} found in this batch)")
     print(f"{'would fill' if args.dry_run else 'filled'}: authors {n_auth}, dates {n_date}")

@@ -222,8 +222,11 @@ def commit_draft(
     fit_seeds: list[str],
     band: dict | None,
     topic_filters_was: str | None,
+    go_live: bool = True,
 ) -> int:
-    """Flip a draft to a real profile and persist its calibrated fields.
+    """Flip a draft to a real profile and persist its calibrated fields;
+    with ``go_live`` False the fields only, and it stays a draft until its
+    first scan succeeds (``go_live``, the function).
 
     Written only while the draft's seeds are still ``fit_seeds`` (see
     ``_write_fit``); raises ``SeedsChanged`` otherwise. And only while its
@@ -243,7 +246,7 @@ def commit_draft(
     # 0: no longer a draft (discarded, or committed by another tab).
     return _write_fit(
         conn, profile_id, fit_seeds, band,
-        "is_draft = 0, threshold = ?, topic_filters_json = ?, centroid = ?,"
+        ("is_draft = 0, " if go_live else "") + "threshold = ?, topic_filters_json = ?, centroid = ?,"
         " selector_config_json = ?, coherence_median = ?, coherence_iqr = ?,"
         " coherence_bimodal = ?",
         (bar(threshold), tf_json, centroid, sel_json,
@@ -251,6 +254,13 @@ def commit_draft(
         "AND is_draft = 1 AND topic_filters_json IS ?",
         (topic_filters_was,),
     )
+
+
+def go_live(conn: sqlite3.Connection, profile_id: int) -> int:
+    """Make the draft a live interest. Rows changed: 0 when it is no longer
+    a draft (deleted, or live already). Not committed."""
+    return conn.execute("UPDATE profiles SET is_draft = 0, updated_at = datetime('now') "
+                        "WHERE id = ? AND is_draft = 1", (int(profile_id),)).rowcount
 
 
 class SeedsChanged(RuntimeError):
@@ -425,17 +435,44 @@ def upsert(
     return int(existing["id"])
 
 
+SEED_SOURCES = ("upload", "researcher", "vault", "feed")
+
+
 def attach_seed(
-    conn: sqlite3.Connection, profile_id: int, openalex_id: str
+    conn: sqlite3.Connection, profile_id: int, openalex_id: str, *,
+    source: str | None = None, researcher_id: int | None = None,
 ) -> int:
-    """Idempotent. Returns 1 if a new seed row was created, 0 if already present."""
+    """Idempotent. Returns 1 if the seeds changed, 0 if already present.
+
+    ``source`` (``SEED_SOURCES``) and, for ``researcher``, ``researcher_id``
+    say where the seed came from; a seed added again keeps its first.
+
+    Every uploaded file is a seed of its own: a revised file of a paper
+    whose earlier file (or public record) is a seed is added beside it, and
+    the user removes either if they want one (FUNCTIONAL_SPEC 1.7). The
+    public record of a work one of whose files is a seed is not added: a
+    search or an import naming the paper again is the same seed.
+    """
+    from .versions import is_version, same_work_seeds
+
+    # Read the work's seeds under the write lock: two requests, one adding
+    # the public record and one a file of it, each saw no other.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    if not is_version(openalex_id) and same_work_seeds(conn, profile_id, openalex_id):
+        conn.commit()
+        return 0
+    if source is not None and source not in SEED_SOURCES:
+        conn.rollback()
+        raise ValueError(f"unknown seed source {source!r}")
     cur = conn.execute(
         """
-        INSERT OR IGNORE INTO profile_seeds (profile_id, openalex_id)
-        VALUES (?, ?)
+        INSERT OR IGNORE INTO profile_seeds (profile_id, openalex_id, source, source_researcher_id)
+        VALUES (?, ?, ?, ?)
         """,
-        (profile_id, openalex_id),
+        (profile_id, openalex_id, source, researcher_id if source == "researcher" else None),
     )
+    changed = 1 if cur.rowcount else 0
     # Keep the denormalised count honest for drafts too, so a list of
     # interests shows how many seeds a draft has before its coherence
     # has ever been computed.
@@ -449,7 +486,7 @@ def attach_seed(
         (profile_id, profile_id),
     )
     conn.commit()
-    return cur.rowcount
+    return changed
 
 
 def detach_seed(
@@ -501,17 +538,19 @@ def seed_keys(conn: sqlite3.Connection, profile_id: int) -> tuple[set[str], set[
 
     For keeping the seeds themselves out of what is scanned for it: a
     search for an interest's topics finds its own papers, which then
-    topped its feed and the trial's score distribution.
+    topped its feed and the trial's score distribution. An uploaded
+    version's public work is one of them.
     """
     rows = conn.execute(
         """
-        SELECT ps.openalex_id, p.doi
+        SELECT ps.openalex_id, p.doi, v.canonical_openalex_id
         FROM profile_seeds ps LEFT JOIN papers p ON p.openalex_id = ps.openalex_id
+        LEFT JOIN paper_versions v ON v.version_id = ps.openalex_id
         WHERE ps.profile_id = ?
         """,
         (profile_id,),
     ).fetchall()
-    return {r[0] for r in rows}, {r[1].lower() for r in rows if r[1]}
+    return {i for r in rows for i in (r[0], r[2]) if i}, {r[1].lower() for r in rows if r[1]}
 
 
 def without_seeds(papers: list, keys: tuple[set[str], set[str]]) -> list:

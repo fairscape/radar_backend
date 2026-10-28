@@ -187,6 +187,7 @@ def test_commit_and_refit_record_the_fitted_seeds(db_path, profile_id):
         ids = [t["id"] for t in (profiles_repo.topic_filters(conn, profile_id) or {}).get("topics") or []]
         wizard.commit_draft(conn, user_id=1, slug=row["slug"], threshold=0.5, selected_topic_ids=ids)
         assert wizard.fit_seed_ids(profiles_repo.get(conn, profile_id)) == ["W1"]
+        wizard.go_live(conn, profile_id)          # its first scan succeeded
         papers_repo.upsert(conn, {"openalex_id": "W2", "title": "Seed W2", "abstract": "words " * 20, "source": "openalex"})
         embeddings_repo.upsert(conn, "W2", "specter2", [0.2] * 8)
         profiles_repo.attach_seed(conn, profile_id, "W2")

@@ -1,5 +1,5 @@
 """OpenAlexClient.search_works tests. Uses a fake HTTP session to
-verify filter-string construction and cursor pagination without
+verify filter-string construction and page= pagination without
 network."""
 
 from __future__ import annotations
@@ -164,50 +164,68 @@ def test_mailto_always_attached():
 
 
 # ----------------------------------------------------------------------
-# Cursor pagination
+# Pagination: page=1, 2, ... (cursor= past page 1 needs an API key)
 # ----------------------------------------------------------------------
 
 
-def test_paginates_until_next_cursor_null():
-    pages = [
-        {"results": [{"id": "W1"}, {"id": "W2"}], "meta": {"next_cursor": "c2"}},
-        {"results": [{"id": "W3"}], "meta": {"next_cursor": "c3"}},
-        {"results": [{"id": "W4"}], "meta": {"next_cursor": None}},
-    ]
-    c = _client(pages)
-    out = c.search_works({"topics": ["T1"]}, since="2026-03-01")
+def _page(*ids, count=None):
+    meta = {"count": count} if count is not None else {}
+    return {"results": [{"id": i} for i in ids], "meta": meta}
+
+
+def test_paginates_by_page_number_until_a_short_page():
+    c = _client([_page("W1", "W2"), _page("W3", "W4"), _page("W5")])
+    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", per_page=2)
+    assert [w["id"] for w in out] == ["W1", "W2", "W3", "W4", "W5"]
+    assert [call["params"]["page"] for call in c._fake_session.calls] == [1, 2, 3]
+    assert all("cursor" not in call["params"] for call in c._fake_session.calls)
+
+
+def test_stops_when_count_is_reached():
+    # A full last page: meta.count saves the extra, empty request.
+    c = _client([_page("W1", "W2", count=4), _page("W3", "W4", count=4), _page("W9", count=4)])
+    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", per_page=2)
     assert [w["id"] for w in out] == ["W1", "W2", "W3", "W4"]
-    assert len(c._fake_session.calls) == 3
-    # First call uses cursor=*, subsequent use the returned cursors.
-    assert c._fake_session.calls[0]["params"]["cursor"] == "*"
-    assert c._fake_session.calls[1]["params"]["cursor"] == "c2"
-    assert c._fake_session.calls[2]["params"]["cursor"] == "c3"
-
-
-def test_limit_stops_pagination_early():
-    pages = [
-        {"results": [{"id": "W1"}, {"id": "W2"}], "meta": {"next_cursor": "c2"}},
-        {"results": [{"id": "W3"}, {"id": "W4"}], "meta": {"next_cursor": "c3"}},
-    ]
-    c = _client(pages)
-    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", limit=3)
-    assert len(out) == 3
-    # Should have hit at most 2 pages.
     assert len(c._fake_session.calls) == 2
 
 
+def test_stops_on_an_empty_page_without_count():
+    c = _client([_page("W1", "W2"), _page()])
+    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", per_page=2)
+    assert [w["id"] for w in out] == ["W1", "W2"]
+    assert len(c._fake_session.calls) == 2
+
+
+def test_stops_at_openalex_page_limit(monkeypatch):
+    import rag_lib.openalex_client as oc
+    monkeypatch.setattr(oc, "MAX_PAGED_RESULTS", 4)
+    c = _client([_page("W1", "W2", count=99), _page("W3", "W4", count=99), _page("W5", "W6", count=99)])
+    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", per_page=2)
+    assert [w["id"] for w in out] == ["W1", "W2", "W3", "W4"]
+    assert len(c._fake_session.calls) == 2
+
+
+def test_limit_stops_pagination_early():
+    c = _client([_page("W1", "W2"), _page("W3", "W4"), _page("W5", "W6")])
+    out = c.search_works({"topics": ["T1"]}, since="2026-03-01", limit=3, per_page=2)
+    assert [w["id"] for w in out] == ["W1", "W2", "W3"]
+    assert len(c._fake_session.calls) == 2
+
+
+def test_sort_sent_on_every_page():
+    c = _client([_page("W1", "W2"), _page("W3")])
+    c.paginate_filter("topics.id:T1", per_page=2, sort="cited_by_count:desc")
+    assert [call["params"]["sort"] for call in c._fake_session.calls] == ["cited_by_count:desc"] * 2
+
+
 def test_per_page_param_plumbed_through():
-    c = _client([{"results": [], "meta": {"next_cursor": None}}])
+    c = _client([_page()])
     c.search_works({}, since="2026-03-01", per_page=50)
     assert c._fake_session.calls[0]["params"]["per-page"] == 50
 
 
 def test_api_calls_counter_increments():
-    pages = [
-        {"results": [], "meta": {"next_cursor": "c2"}},
-        {"results": [], "meta": {"next_cursor": None}},
-    ]
-    c = _client(pages)
+    c = _client([_page("W1"), _page()])
     assert c.api_calls == 0
-    c.search_works({}, since="2026-03-01")
+    c.search_works({}, since="2026-03-01", per_page=1)
     assert c.api_calls == 2

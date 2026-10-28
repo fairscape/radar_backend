@@ -33,6 +33,7 @@ from typing import Any
 import structlog
 
 from ...db.repos import (
+    draft_owned as draft_owned_repo,
     gather_runs as gather_runs_repo,
     papers as papers_repo,
     profiles as profiles_repo,
@@ -103,6 +104,44 @@ def _json_or_none(value: Any) -> str | None:
     except Exception as exc:  # noqa: BLE001
         log.warning("researchers.json_skipped", reason=str(exc)[:160])
         return None
+
+
+class ResearcherExists(RuntimeError):
+    """The wizard's import names a person already stored as a researcher.
+
+    A draft never changes a stored researcher (FUNCTIONAL_SPEC D, plan A):
+    the interest is built from the papers the researcher already has, and
+    newer papers are added on the Profiles page first. The router answers
+    409 with the researcher, so the wizard can link to it.
+    """
+
+    def __init__(self, researcher_id: int, name: str):
+        super().__init__(
+            f"{name} is already one of your researcher profiles. Build the interest from that "
+            "profile's papers, or update the profile on the Profiles page first. Nothing was changed.")
+        self.researcher_id = int(researcher_id)
+        self.name = name
+
+
+def refuse_if_known(
+    conn: sqlite3.Connection, *, user_id: int, source: str, key: str, orcid: str | None,
+    draft_id: int | None = None,
+) -> bool:
+    """Raise ``ResearcherExists`` when the wizard would import a stored person.
+
+    Not for a person draft ``draft_id`` itself imported (more of their
+    papers added to the draft being built): that researcher is still the
+    draft's, part of its sandbox. Returns whether the person is new.
+    """
+    row = researchers_repo.find_person(conn, user_id, source, key, orcid)
+    if row is None:
+        return True
+    if draft_id is not None and conn.execute(
+        "SELECT 1 FROM draft_owned WHERE profile_id = ? AND kind = 'researcher' AND item = ?",
+        (int(draft_id), str(row["id"])),
+    ).fetchone() is not None:
+        return False
+    raise ResearcherExists(int(row["id"]), row["name"] or key)
 
 
 def record_prosopia_researcher(
@@ -188,6 +227,13 @@ def _refuse_if_importing(
         raise ResearcherImportRunning(int(row["researcher_id"]), int(row["run_id"]))
 
 
+def _wanted_for_itself(conn: sqlite3.Connection, researcher_id: int) -> None:
+    """Imported from the Profiles page: no longer a draft's researcher, so
+    discarding the draft that first imported it does not remove it."""
+    draft_owned_repo.disown(conn, "researcher", researcher_id)
+    conn.commit()
+
+
 def prepare_researcher_import(
     conn: sqlite3.Connection,
     settings: Any,
@@ -216,7 +262,10 @@ def prepare_researcher_import(
     way.
     """
     from . import orcid as orcid_service
+    from ... import openalex_status
 
+    # OpenAlex paused: nothing is created (FUNCTIONAL_SPEC F2), a 503.
+    openalex_status.check()
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     if source == "prosopia":
         slug, profile = _resolve_profile(ref, base_url, prosopia_client)
@@ -232,9 +281,11 @@ def prepare_researcher_import(
             conn, user_id=user_id, slug=slug, profile=profile,
             base_url=base_url or DEFAULT_BASE_URL,
         )
+        _wanted_for_itself(conn, researcher_id)
         return ImportPlan(
             slug=slug, user_id=user_id, embedding_model=model,
             researcher_id=researcher_id, records=records, profile=profile,
+            new_researcher=existing is None,
         )
     if source == "orcid":
         oid = orcid_service.normalize_orcid(ref)
@@ -255,12 +306,15 @@ def prepare_researcher_import(
             raise orcid_service.WorksNotFound(
                 f"none of the selected works are by ORCID {oid}"
             )
+        existing = researchers_repo.get_by_key(conn, user_id, "orcid", oid)
         researcher_id = record_orcid_researcher(
             conn, user_id=user_id, orcid=oid, name=listing["name"],
         )
+        _wanted_for_itself(conn, researcher_id)
         return ImportPlan(
             slug=oid, user_id=user_id, embedding_model=model,
             researcher_id=researcher_id, records=records, profile=None,
+            new_researcher=existing is None,
         )
     raise ValueError(f"source must be one of {', '.join(SOURCES)}")
 
@@ -560,7 +614,8 @@ def create_interest(
     try:
         researchers_repo.set_profile_researcher(conn, profile_id, researcher_id)
         for openalex_id in chosen:
-            n += profiles_repo.attach_seed(conn, profile_id, openalex_id)
+            n += profiles_repo.attach_seed(conn, profile_id, openalex_id, source="researcher",
+                                           researcher_id=researcher_id)
     except sqlite3.IntegrityError:
         # Forgotten in another tab while the papers were embedded: the
         # link (or their papers) are gone. No empty draft left behind.
@@ -582,8 +637,14 @@ def attach_seeds(
     user_id: int,
     slug: str,
     openalex_ids: list[str],
+    source: str = "vault",
+    researcher_id: int | None = None,
 ) -> tuple[int, list[str], int | None]:
     """Add already-stored papers to a draft or a live profile as seeds.
+
+    ``source`` and ``researcher_id`` are recorded as where they came from
+    (``profiles_repo.SEED_SOURCES``). A ``researcher_id`` that is not one of
+    the user's is a ``LookupError``.
 
     Returns ``(attached, rejected, rescored)``: ``rescored`` is how many
     stored candidates a live interest's refit re-scored, None for a draft.
@@ -608,6 +669,11 @@ def attach_seeds(
     wanted = [i.strip() for i in openalex_ids if (i or "").strip()]
     if not wanted:
         raise ValueError("select at least one paper")
+    if source == "researcher":
+        if researcher_id is None or researchers_repo.get_for_user(conn, user_id, int(researcher_id)) is None:
+            raise LookupError(f"researcher {researcher_id} not found")
+    else:
+        researcher_id = None
     owned = researchers_repo.user_owns_papers(conn, user_id, wanted)
     attached = 0
     rejected: list[str] = []
@@ -615,7 +681,8 @@ def attach_seeds(
     try:
         for openalex_id in wanted:
             if openalex_id in owned:
-                attached += profiles_repo.attach_seed(conn, int(row["id"]), openalex_id)
+                attached += profiles_repo.attach_seed(conn, int(row["id"]), openalex_id,
+                                                      source=source, researcher_id=researcher_id)
                 accepted.append(openalex_id)
             else:
                 rejected.append(openalex_id)

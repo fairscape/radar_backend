@@ -112,9 +112,22 @@ def list_for_user(
                 AND pr.slug = ?
                 AND pc.saved_at IS NOT NULL
             )
+           -- The user's upload of a work tagged by its public record: the
+           -- work is the upload here too (list_docs drops the record).
+           OR EXISTS (
+              SELECT 1
+              FROM paper_versions v
+              JOIN profiles pr ON pr.user_id = v.user_id AND pr.slug = ?
+              WHERE v.version_id = p.openalex_id AND v.user_id = ?
+                AND (EXISTS (SELECT 1 FROM profile_seeds ps
+                             WHERE ps.profile_id = pr.id AND ps.openalex_id = v.canonical_openalex_id)
+                  OR EXISTS (SELECT 1 FROM profile_candidates pc
+                             WHERE pc.profile_id = pr.id AND pc.openalex_id = v.canonical_openalex_id
+                               AND pc.saved_at IS NOT NULL))
+            )
         ORDER BY added_at DESC, p.openalex_id
         """,
-        (user_id, user_id, tag, user_id, tag),
+        (user_id, user_id, tag, user_id, tag, tag, user_id),
     ).fetchall()
 
 
@@ -160,7 +173,14 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           SELECT openalex_id,
                  MAX(n_pages)                            AS n_pages,
                  MAX(COALESCE(event_at, first_seen_at))  AS last_event
-          FROM vault_papers
+          FROM vault_papers vp
+          -- A public work the user has an upload of is that upload, as
+          -- the list shows it once.
+          WHERE NOT EXISTS (
+            SELECT 1 FROM vault_papers mine
+            JOIN paper_versions v ON v.version_id = mine.openalex_id
+            WHERE v.canonical_openalex_id = vp.openalex_id
+          )
           GROUP BY openalex_id
         )
         SELECT
@@ -189,7 +209,7 @@ def tag_counts_for_user(
     """
     rows = conn.execute(
         """
-        WITH vault_in_profile AS (
+        WITH direct AS (
           SELECT pr.slug AS slug, ps.openalex_id AS openalex_id
           FROM profile_seeds ps
           JOIN profiles pr ON pr.id = ps.profile_id
@@ -201,12 +221,27 @@ def tag_counts_for_user(
           JOIN profiles pr ON pr.id = pc.profile_id
           WHERE pr.user_id = ?
             AND pc.saved_at IS NOT NULL
+        ),
+        -- With the user's uploads of the works there, as tags_for_paper.
+        tagged AS (
+          SELECT slug, openalex_id FROM direct
+          UNION
+          SELECT d.slug, v.version_id
+          FROM direct d
+          JOIN paper_versions v ON v.canonical_openalex_id = d.openalex_id AND v.user_id = ?
         )
         SELECT slug, count(*) AS n
-        FROM vault_in_profile
+        FROM tagged vp
+        -- Counted as the slug's list shows it: a public work listed there
+        -- with the user's upload of it is the upload, once.
+        WHERE NOT EXISTS (
+          SELECT 1 FROM tagged mine
+          JOIN paper_versions v ON v.version_id = mine.openalex_id
+          WHERE mine.slug = vp.slug AND v.canonical_openalex_id = vp.openalex_id
+        )
         GROUP BY slug
         """,
-        (user_id, user_id),
+        (user_id, user_id, user_id),
     ).fetchall()
     return {r["slug"]: int(r["n"]) for r in rows}
 
@@ -214,7 +249,19 @@ def tag_counts_for_user(
 def tags_for_paper(
     conn: sqlite3.Connection, user_id: int, openalex_id: str
 ) -> list[str]:
-    """Profile slugs this paper is attached to (seeds ∪ saved candidates)."""
+    """Profile slugs this paper is attached to (seeds ∪ saved candidates).
+
+    For the user's upload of a work, also its public record's: the vault
+    lists the work once, as the upload."""
+    from .versions import canonical_id
+
+    canonical = canonical_id(conn, openalex_id)
+    if canonical is not None:
+        return sorted(set(_tags(conn, user_id, openalex_id)) | set(_tags(conn, user_id, canonical)))
+    return _tags(conn, user_id, openalex_id)
+
+
+def _tags(conn: sqlite3.Connection, user_id: int, openalex_id: str) -> list[str]:
     rows = conn.execute(
         """
         SELECT slug FROM (

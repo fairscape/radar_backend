@@ -140,6 +140,18 @@ python -c "import sqlite3, sys; sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', u
     data/radar.db data/radar.db.bak-$(date +%Y%m%d)
 ```
 
+Upgrading a database from before migration 0029 turns every uploaded
+PDF into its uploader's own copy of the paper (`local:upload:...`).
+An upload whose text the database holds keeps its text, vectors, topics
+and the interests built on it unchanged. Any other upload of the same
+paper by another user, or a different file of it, is read again from
+that user's own file by the backend's 15-minute background sweep (on
+unless `RADAR_SCHEDULER_ENABLED=false`; 20 papers per sweep). Its
+interests are refitted at their next scan. If that file is missing or
+cannot be read, the paper is scored on its OpenAlex metadata until the
+user uploads the PDF again. Interest terms and topics that another user's
+interest generated from an uploader's text before the upgrade are kept.
+
 Keep it running with whatever you use for services (systemd, tmux,
 supervisord). `deploy/start_backend.sh` and `deploy/radar.sh` are the
 live site's versions, with its paths.

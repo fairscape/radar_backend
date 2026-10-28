@@ -131,7 +131,7 @@ def create_app() -> FastAPI:
     )
 
     app = FastAPI(
-        title="RADAR API",
+        title="BioXplorer API",
         version=_service_version(),
         lifespan=lifespan,
     )
@@ -199,6 +199,27 @@ def create_app() -> FastAPI:
         # row; none was written (each would undo a change). Try again.
         return JSONResponse(status_code=409, content={
             "detail": "the interest's seeds changed while it was being fitted; try again"})
+
+    from .services.researchers import ResearcherExists
+
+    @app.exception_handler(ResearcherExists)
+    async def _researcher_exists(request: Request, exc: ResearcherExists):
+        # The wizard's import of a person already stored: the draft does not
+        # change the stored researcher (FUNCTIONAL_SPEC D). ``researcher``
+        # lets the wizard link to that profile.
+        return JSONResponse(status_code=409, content={
+            "detail": str(exc), "researcher": {"id": exc.researcher_id, "name": exc.name}})
+
+    from ..openalex_status import OpenAlexUnavailable
+
+    @app.exception_handler(OpenAlexUnavailable)
+    async def _openalex_unavailable(request: Request, exc: OpenAlexUnavailable):
+        # OpenAlex did not answer (quota, API key, outage): whatever the
+        # request was doing stops, nothing is stored as if it had answered.
+        # ``openalex`` lets the frontend show the pause banner at once.
+        from .. import openalex_status
+        return JSONResponse(status_code=503, content={
+            "detail": exc.user_message, "openalex": openalex_status.status()})
 
     @app.exception_handler(OverflowError)
     async def _overflow(request: Request, exc: OverflowError):

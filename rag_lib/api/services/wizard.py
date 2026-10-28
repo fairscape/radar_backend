@@ -40,6 +40,7 @@ from ... import calibration
 from ...coherence import coherence as coherence_compute
 from ...db import encode_vector
 from ...db.repos import (
+    draft_owned as draft_owned_repo,
     embeddings as embeddings_repo,
     gather_runs as gather_runs_repo,
     papers as papers_repo,
@@ -72,19 +73,19 @@ log = structlog.get_logger("rag_lib.api.services.wizard")
 DEFAULT_THRESHOLDS = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 PREVIEW_CARDS = 10
 MAX_DRY_RUN_DAYS = 30
-# OpenAlex regularly returns 5–10k+ candidates for a multi-topic 30-day
-# query. The dry-run is a calibration UX, not a complete sweep; cap the
-# fetch so the wizard returns in seconds. Production gathers (post-
-# commit) still fetch unbounded.
-DRY_RUN_FETCH_LIMIT = 1000
+# The trial takes what a scan takes (each topic's most cited in the
+# window, FUNCTIONAL_SPEC S.1), so the threshold is set on what the feed
+# will see. No total cap beyond RADAR_GATHER_MAX_CANDIDATES.
+DRY_RUN_FETCH_LIMIT: int | None = None
 
 
-def capped_fetch_limit(settings: Any, requested: int) -> int:
-    """``requested`` bounded by ``RADAR_GATHER_MAX_CANDIDATES`` when set."""
+def capped_fetch_limit(settings: Any, requested: int | None) -> int | None:
+    """``requested`` bounded by ``RADAR_GATHER_MAX_CANDIDATES`` when set
+    (None = no cap)."""
     cap = getattr(settings, "RADAR_GATHER_MAX_CANDIDATES", None)
     if cap is None or int(cap) <= 0:
         return requested
-    return min(int(requested), int(cap))
+    return int(cap) if requested is None else min(int(requested), int(cap))
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +199,15 @@ def _suffixed(name: str, n: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+class SavingInProgress(RuntimeError):
+    """The draft is being saved: its first scan is running, and it goes
+    live when that succeeds. It cannot be discarded meanwhile."""
+
+    def __init__(self, slug: str):
+        super().__init__(f"draft '{slug}' is being saved; its first scan is running")
+        self.slug = slug
+
+
 class ImportInProgress(RuntimeError):
     """The draft's seeds are still being imported.
 
@@ -259,11 +269,15 @@ def compute_draft_coherence(
     pair = calibration.least_similar_pair(vecs) if n >= 2 else None
     if pair is not None:
         i, j, cos = pair
+        from ...db.repos import versions as versions_repo
+
         titles = _titles_for(conn, [ids[i], ids[j]])
         least = LeastSimilarPair(
             a_id=ids[i], a_title=titles.get(ids[i], ""),
             b_id=ids[j], b_title=titles.get(ids[j], ""),
             cosine=round(cos, 4),
+            a_canonical_id=versions_repo.canonical_id(conn, ids[i]),
+            b_canonical_id=versions_repo.canonical_id(conn, ids[j]),
         )
     # Persist now so the profile row reflects what we just showed
     # instead of waiting for commit_draft. Lets the profile detail page
@@ -966,6 +980,7 @@ def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict
     paper row; there are only ever a few, so this stays cheap.
     """
     from ... import content_topics
+    from ...db.repos import versions as versions_repo
     from ..settings import get_settings
 
     rows = []
@@ -974,7 +989,7 @@ def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict
         if prow is None:
             continue
         raw = prow["topics_json"]
-        if content_topics.is_local(oa_id) and not raw:
+        if versions_repo.is_unmatched(conn, oa_id) and not raw:
             raw = content_topics.try_topics_json(prow["title"], prow["body_text"], settings=get_settings())
             if raw is not None:
                 conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (raw, oa_id))
@@ -1372,7 +1387,12 @@ def commit_draft(
     cron: str | None = None,
     tz: str | None = None,
 ) -> dict:
-    """Flip the draft to a live profile.
+    """Get the draft ready to go live: fitted, its threshold and topics set.
+
+    It stays a draft. It goes live (``go_live``) only when its first scan
+    has succeeded (FUNCTIONAL_SPEC D.2-5, F2.3 Q1): ``POST /api/profiles``
+    runs that scan next, and a scan that fails leaves the draft a draft.
+    ``already_live`` in the result: it went live in another tab meanwhile.
 
     1. Prune ``topic_filters_json`` to the user's chosen topic ids
        (other levels — subfields/fields/domains — are preserved as
@@ -1382,8 +1402,8 @@ def commit_draft(
        ``profiles.centroid`` for fast read-side access; the full
        selector state still goes into ``selector_config_json``.
     3. Update n_seed from the actual ``profile_seeds`` count.
-    4. ``schedules_repo.upsert`` so the scheduler picks the profile up
-       on the next boot at the chosen cron (default: daily 04:00 UTC).
+
+    ``cron`` / ``tz`` are written by ``go_live``.
     """
     row = _require_draft(conn, user_id, slug)
     profile_id = int(row["id"])
@@ -1430,6 +1450,7 @@ def commit_draft(
                 fit_seeds=sel_cfg[FIT_SEEDS],
                 band=band,
                 topic_filters_was=raw,
+                go_live=False,
             )
         try:
             flipped, _profile = _fit_and_write(
@@ -1445,19 +1466,28 @@ def commit_draft(
         if now is None or int(now["id"]) != profile_id:
             raise LookupError(f"draft '{slug}' not found")   # discarded in another tab while fitting
         if not now["is_draft"]:
-            return {"slug": slug, "id": profile_id}           # committed there first
+            return {"slug": slug, "id": profile_id, "already_live": True}   # saved there first
         log.info("wizard.commit_after_topics_change", profile_id=profile_id)
     else:
         raise TopicsChanging(profile_id)
+    return {"slug": slug, "id": profile_id, "already_live": False}
+
+
+def go_live(conn: sqlite3.Connection, profile_id: int, *, cron: str | None = None, tz: str | None = None) -> None:
+    """The draft's first scan succeeded: it is a live interest now, with its
+    schedule, and what it brought in (``draft_owned``) is no longer the
+    draft's. One transaction. ``LookupError`` when it is no longer a draft
+    (deleted while the scan ran, or live already)."""
     try:
-        schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)
-    except sqlite3.IntegrityError:
-        # Deleted in another tab since the flip.
-        conn.rollback()
-        if profiles_repo.get_by_slug(conn, user_id, slug) is not None:
-            raise
-        raise LookupError(f"interest '{slug}' not found") from None
-    return {"slug": slug, "id": profile_id}
+        if not profiles_repo.go_live(conn, profile_id):
+            conn.rollback()
+            raise LookupError(f"profile {profile_id} is no longer a draft")
+        draft_owned_repo.clear(conn, profile_id)
+        schedules_repo.upsert(conn, profile_id=profile_id, cron=cron, tz=tz)   # commits
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1475,7 +1505,12 @@ def delete_draft(
     # next seed and the researcher kept a partial paper list.
     if gather_runs_repo.has_unfinished_import(conn, int(row["id"])):
         raise ImportInProgress(slug)
-    profiles_repo.delete(conn, int(row["id"]))
+    # Being saved: its first scan is running, and goes live when it succeeds.
+    if gather_runs_repo.running_scan(conn, int(row["id"])) is not None:
+        raise SavingInProgress(slug)
+    # With what the draft brought in and nothing else uses: its uploads,
+    # the researcher its import created and that import's papers (spec D).
+    draft_owned_repo.discard(conn, int(row["id"]))
     return True
 
 

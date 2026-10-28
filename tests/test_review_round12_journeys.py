@@ -28,6 +28,7 @@ from tests.fixture_gatherer import FixtureGatherer
 from tests.test_orcid_import import ORCID, WORKS, StubOrcidOpenAlex
 from tests.test_prosopia_import import StubProsopia, _stub_openalex, _stub_profile
 from tests.test_researcher_topics import DOCUMENT
+from tests.upload_inbox import inbox
 
 
 B = {"X-User-Email": "b@example.com"}       # a second user; no header = demo user (id 1)
@@ -147,7 +148,7 @@ def _ok(resp: httpx.Response, code: int = 200):
 
 def _upload(app, content: bytes, filename: str, slug: str | None = None, headers=None):
     files = {"file": (filename, io.BytesIO(b"%PDF-1.4\n" + content), "application/pdf")}
-    data = {"profile_slug": slug} if slug else {}
+    data = {"profile_slug": slug or inbox(_request, app, headers)}
     return _request(app, "POST", "/api/vault/upload", files=files, data=data, headers=headers or {})
 
 
@@ -735,18 +736,19 @@ def test_j4_two_users_do_not_see_each_other(app, env):
     rej = _ok(_request(app, "POST", "/api/profiles/shared/seeds", json={"openalex_ids": [local_a]}, headers=B))
     assert rej == {"attached": 0, "rejected": [local_a], "rescored": None}
 
-    # The same PDF uploaded by both: one paper row, each user lists it, each
-    # user's seeds are their own.
+    # The same PDF uploaded by both: each user's own paper, each lists only
+    # theirs, each user's seeds are their own.
     da = _ok(_upload(app, b"the-same-pdf", "same.pdf", "shared"))
     db_ = _ok(_upload(app, b"the-same-pdf", "same.pdf", "shared", headers=B))
-    assert da["id"] == db_["id"] and da["duplicate"] is not True and db_["duplicate"] is not True
-    assert da["id"] in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}))}
-    assert da["id"] in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}, headers=B))}
-    assert _q(env, "SELECT user_id FROM paper_uploads WHERE openalex_id = ?", da["id"]).__len__() == 2
-    # A removes it from A's seeds; B keeps it.
+    assert da["id"] != db_["id"] and da["duplicate"] is not True and db_["duplicate"] is not True
+    mine = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}))}
+    theirs = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}, headers=B))}
+    assert da["id"] in mine and db_["id"] not in mine and db_["id"] in theirs and da["id"] not in theirs
+    assert _q(env, "SELECT user_id FROM paper_uploads WHERE openalex_id = ?", da["id"]).__len__() == 1
+    # A removes it from A's seeds; B keeps theirs.
     _ok(_request(app, "DELETE", "/api/profiles/shared/seeds", params={"openalex_id": da["id"]}))
     assert da["id"] not in {s["id"] for s in _ok(_request(app, "GET", "/api/profiles/shared/detail"))["seeds"]}
-    assert da["id"] in {s["id"] for s in _ok(_request(app, "GET", "/api/profiles/shared/detail", headers=B))["seeds"]}
+    assert db_["id"] in {s["id"] for s in _ok(_request(app, "GET", "/api/profiles/shared/detail", headers=B))["seeds"]}
     assert da["id"] in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs"))}, "A's upload is still A's"
     # Runs are per user: B cannot read A's run, and the other way round.
     run_a = _ok(_request(app, "GET", "/api/profiles/shared/runs"))[0]["id"]
@@ -922,9 +924,10 @@ def test_j5_delete_draft_journeys(app, env):
     r = _ok(_request(app, "GET", f"/api/researchers/{rid}"))
     assert r["researcher"]["n_interests"] == 0 and r["researcher"]["n_papers"] == 5 and r["researcher"]["importing"] is False
     assert _request(app, "GET", f"/api/profiles/draft/{slug}/dry-run/{kicked['run_id']}").status_code == 404
-    # The uploaded PDF is still in the vault, untagged.
+    # The PDF uploaded into the draft went with it (FUNCTIONAL_SPEC D); the
+    # researcher's papers, which it only used, stay.
     docs = _ok(_request(app, "GET", "/api/vault/docs"))
-    assert any(d["title"].startswith("Uploaded") and d["tags"] == [] for d in docs)
+    assert not any(d["title"].startswith("Uploaded") for d in docs)
     # The name is free again.
     assert _ok(_request(app, "POST", f"/api/researchers/{rid}/interests", json={"name": "Throwaway"}))["draft"]["slug"] == "throwaway"
 

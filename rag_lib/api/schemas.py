@@ -84,6 +84,14 @@ class Profile(_Model):
     yearTo: int | None = None
 
 
+class SavedDraft(Profile):
+    """``POST /api/profiles``: the interest being saved, still a draft until
+    its first scan (``saveRunId``) succeeds; ``saveRunId`` None when it was
+    live already (saved in another tab)."""
+
+    saveRunId: int | None = None
+
+
 class Card(_Model):
     id: str
     title: str
@@ -117,6 +125,9 @@ class Card(_Model):
 
 class VaultDoc(_Model):
     id: str
+    # The public work an uploaded version (``id`` ``local:upload:...``) is
+    # a copy of; None when OpenAlex has no record of it.
+    canonicalId: str | None = None
     title: str
     authors: list[str]
     venue: str
@@ -124,16 +135,29 @@ class VaultDoc(_Model):
     pages: int
     chunks: int
     added: str
+    # This user's files of one paper are numbered in upload order (1 = the
+    # first) when there are two or more; None for a paper with one.
+    version: int | None = None
     # Upload response only: this user had already uploaded these bytes.
     duplicate: bool | None = None
 
 
 class Seed(_Model):
     id: str
+    # As VaultDoc.canonicalId: the public work an uploaded seed copies.
+    canonicalId: str | None = None
     idx: int
     title: str
     year: int
     coh: float
+    # As VaultDoc.version, with the time that file was uploaded.
+    version: int | None = None
+    uploaded: str | None = None
+    # Where the seed came from (profiles_repo.SEED_SOURCES; None before this
+    # was recorded), and for "researcher" whose papers.
+    source: str | None = None
+    sourceResearcherId: int | None = None
+    sourceResearcherName: str | None = None
 
 
 class SeedUmlsStatus(_Model):
@@ -986,6 +1010,10 @@ class DraftSeedsRequest(_Model):
     already has (uploaded, or imported with a researcher) to attach as seeds."""
 
     openalex_ids: list[str]
+    # Where they were picked from, recorded with each seed: the vault
+    # (default), the feed, or a researcher's papers (``researcher_id``).
+    source: Literal["vault", "feed", "researcher"] = "vault"
+    researcher_id: int | None = None
 
 
 class DraftSeedsResponse(_Model):
@@ -1003,6 +1031,9 @@ class LeastSimilarPair(_Model):
     b_id: str
     b_title: str
     cosine: float
+    # The public work of an uploaded seed, as Seed.canonicalId.
+    a_canonical_id: str | None = None
+    b_canonical_id: str | None = None
 
 
 class DraftCoherence(_Model):

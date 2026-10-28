@@ -41,6 +41,20 @@ def get_by_key(
     ).fetchone()
 
 
+def find_person(
+    conn: sqlite3.Connection, user_id: int, source: str, key: str, orcid: str | None = None,
+) -> sqlite3.Row | None:
+    """The user's stored researcher for this person: the same source and
+    key, or the same ORCID under either source."""
+    row = get_by_key(conn, user_id, source, key)
+    if row is None and orcid:
+        row = conn.execute(
+            "SELECT * FROM researchers WHERE user_id = ? AND UPPER(orcid) = UPPER(?) ORDER BY id LIMIT 1",
+            (user_id, orcid),
+        ).fetchone()
+    return row
+
+
 MARKS = ("self", "followed")
 
 # The user's arrangement first (``position``), then the researchers never

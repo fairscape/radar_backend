@@ -107,7 +107,7 @@ def describe_coherence(label: CoherenceLabel, n: int, agreement: int | None) -> 
         return "No seed papers yet."
     if label == "single":
         return (
-            "One seed paper. Radar will look for papers like it; agreement "
+            "One seed paper. BioXplorer will look for papers like it; agreement "
             "between seeds can't be measured until there are two."
         )
     a = f"{agreement}/100" if agreement is not None else "—"

@@ -286,9 +286,16 @@ def seed_row_to_seed(
     *,
     idx: int,
     coh_to_centroid: float | None = None,
+    version: tuple[int, str] | None = None,
 ) -> Seed:
     return Seed(
+        version=version[0] if version else None,
+        uploaded=version[1] if version else None,
+        source=_col(row, "source"),
+        sourceResearcherId=_col(row, "source_researcher_id"),
+        sourceResearcherName=_col(row, "source_researcher_name"),
         id=row["openalex_id"],
+        canonicalId=_col(row, "canonical_openalex_id"),
         idx=idx,
         title=row["title"] or "",
         year=int(row["year"]) if row["year"] is not None else 0,

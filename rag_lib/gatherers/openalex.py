@@ -93,14 +93,14 @@ class _Deduper:
         return True
 
 
-# Per-topic quota gathering. Each enabled topic gets its own OpenAlex
-# query and contributes at most this many papers, so a single prolific
-# topic can no longer fill the whole batch and starve the rest.
-DEFAULT_PER_TOPIC_QUOTA = 10
-# Topics overlap, so a topic's first N hits are often already claimed by
-# an earlier topic. Over-fetch this multiple of the quota to leave the
-# round-robin enough unclaimed material to reach the quota.
-DEFAULT_PER_TOPIC_OVERSAMPLE = 3
+# How much one scan asks OpenAlex for (FUNCTIONAL_SPEC S.1). Each enabled
+# topic gets its own query for its PER_TOPIC most cited papers in the
+# window -- one page, so a scan costs one call per topic -- and a prolific
+# topic can't fill the batch and starve the rest.
+PER_TOPIC = 40
+MOST_CITED = "cited_by_count:desc"
+# Interests that never had topics walk the tiers instead; one page each.
+TIER_LIMIT = 200
 
 
 class OpenAlexGatherer:
@@ -117,8 +117,7 @@ class OpenAlexGatherer:
         top_topics_n: int = DEFAULT_TOP_TOPICS_N,
         top_subfields_n: int = DEFAULT_TOP_SUBFIELDS_N,
         min_results: int = DEFAULT_MIN_RESULTS,
-        per_topic_quota: int = DEFAULT_PER_TOPIC_QUOTA,
-        per_topic_oversample: int = DEFAULT_PER_TOPIC_OVERSAMPLE,
+        per_topic: int = PER_TOPIC,
     ):
         # mailto is required for the polite pool at fetch time. We accept
         # None at construction so the non-invoking compliance tests can
@@ -131,8 +130,7 @@ class OpenAlexGatherer:
         self.top_topics_n = top_topics_n
         self.top_subfields_n = top_subfields_n
         self.min_results = min_results
-        self.per_topic_quota = per_topic_quota
-        self.per_topic_oversample = per_topic_oversample
+        self.per_topic = per_topic
         self._last_cost: dict = {"wall_seconds": 0.0, "api_calls": 0}
         # Populated by fetch() so the scheduler can persist tier_used and
         # the wizard can show "filter that actually ran".
@@ -277,7 +275,7 @@ class OpenAlexGatherer:
                     if self.last_filter_str is None:
                         self.last_filter_str = filter_str
                     works = client.paginate_filter(
-                        filter_str, limit=per_year, per_page=per_page, sort="cited_by_count:desc",
+                        filter_str, limit=per_year, per_page=per_page, sort=MOST_CITED,
                     )
                     n_new = 0
                     for w in works:
@@ -316,33 +314,18 @@ class OpenAlexGatherer:
     ) -> list[Paper]:
         """One query per enabled topic, then a fair round-robin merge.
 
-        Papers routinely carry several OpenAlex topics, so the per-topic
-        result sets overlap heavily. Draining them in order would let
+        Each topic asks for its ``per_topic`` most cited papers in the
+        window. Papers routinely carry several OpenAlex topics, so the
+        per-topic result sets overlap. Draining them in order would let
         whichever topic runs first bank all the shared papers and leave
-        later topics with nothing — the allocation would encode list
-        order rather than relevance. Instead each topic is over-fetched,
-        then we deal papers out one topic at a time until every topic has
-        filled its quota or run dry, which makes each topic's
-        contribution independent of where it sits in the list.
-
-        The quota is a *floor*, not a ceiling. ``per_topic_quota`` says
-        what share a topic is guaranteed no matter how many topics
-        compete; it must not also decide how much the gather returns in
-        total, or the caller's ``limit`` becomes unreachable. A profile
-        with two enabled topics would cap at 20 papers however much
-        OpenAlex has, and the wizard's dry-run — which asks for
-        ``DRY_RUN_FETCH_LIMIT`` papers over 30 days precisely so the
-        threshold sweep has a distribution to work with — would calibrate
-        on ``10 x n_topics`` instead. So the share scales with what the
-        caller asked for, and the constant only takes over when that
-        share would fall below it. Equal shares, hence the fairness
-        property, are preserved either way.
+        later topics with nothing -- the attribution would encode list
+        order rather than relevance. Instead papers are dealt out one
+        topic at a time, so each topic's contribution is independent of
+        where it sits in the list. A paper two topics found counts once,
+        so the total is at most ``per_topic`` x topics; ``limit``, when
+        given (RADAR_GATHER_MAX_CANDIDATES), caps it further.
         """
-        target = limit if limit is not None else self.min_results
-        per_topic = max(
-            self.per_topic_quota,
-            -(-target // len(topic_ids)),  # ceil division
-        )
+        per_topic = self.per_topic
         pools: dict[str, list[Paper]] = {}
         filters: list[str] = []
 
@@ -351,7 +334,7 @@ class OpenAlexGatherer:
             filter_str = build_filter_string(parts, since, extras=self.extras)
             filters.append(filter_str)
             works = client.paginate_filter(
-                filter_str, limit=per_topic * self.per_topic_oversample,
+                filter_str, limit=per_topic, per_page=per_topic, sort=MOST_CITED,
             )
             pools[tid] = [
                 client.paper_from_work(w, source="openalex_gatherer")
@@ -455,7 +438,9 @@ class OpenAlexGatherer:
                 "openalex_gatherer.tier_attempt",
                 profile=profile.name, tier=name, filter=filter_str, since=since,
             )
-            works = client.paginate_filter(filter_str, limit=limit)
+            works = client.paginate_filter(
+                filter_str, limit=limit if limit is not None else TIER_LIMIT, sort=MOST_CITED,
+            )
             papers = [
                 client.paper_from_work(w, source="openalex_gatherer")
                 for w in works

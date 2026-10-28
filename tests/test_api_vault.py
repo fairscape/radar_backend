@@ -114,13 +114,27 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(_run())
 
 
+_INBOXES: dict = {}
+
+
+def _inbox(app, headers=None) -> str:
+    """A draft interest to upload into: every upload names one now
+    (FUNCTIONAL_SPEC 1.1); one per app and user."""
+    key = (id(app), (headers or {}).get("X-User-Email"))
+    if key not in _INBOXES:
+        r = _request(app, "POST", "/api/profiles/draft", json={"name": "Inbox"}, headers=headers or {})
+        assert r.status_code == 200, r.text
+        _INBOXES[key] = r.json()["slug"]
+    return _INBOXES[key]
+
+
 def _upload(app, content: bytes, filename: str = "paper.pdf",
             profile_slug: str | None = None) -> httpx.Response:
     # Uploads must carry a PDF header now; the fake ingest ignores the rest.
     if content and not content.startswith(b"%PDF-"):
         content = b"%PDF-1.4\n" + content
     files = {"file": (filename, io.BytesIO(content), "application/pdf")}
-    data = {"profile_slug": profile_slug} if profile_slug else {}
+    data = {"profile_slug": profile_slug or _inbox(app)}
     return _request(app, "POST", "/api/vault/upload", files=files, data=data)
 
 
@@ -136,7 +150,18 @@ def test_upload_creates_vault_doc(app):
     assert body["title"]
     assert body["pages"] == 3
     assert body["chunks"] == 0
-    assert body["tags"] == []  # no profile_slug supplied
+    assert body["tags"] == [_inbox(app)]
+    assert body["version"] is None
+
+
+def test_an_upload_names_an_interest(app, tmp_path):
+    """No upload outside an interest (the Vault page has none): refused,
+    nothing stored. FUNCTIONAL_SPEC U13."""
+    files = {"file": ("a.pdf", io.BytesIO(b"%PDF-1.4\nloose"), "application/pdf")}
+    resp = _request(app, "POST", "/api/vault/upload", files=files)
+    assert resp.status_code == 400, resp.text
+    assert not [p for p in (tmp_path / "vault").rglob("*") if p.is_file()]
+    assert _request(app, "GET", "/api/vault/docs").json() == []
 
 
 def test_upload_is_idempotent_for_same_bytes(app):
@@ -208,11 +233,12 @@ def test_meta_contains_paths_and_chunk_policy(app):
 
 def test_tags_endpoint_includes_all_total(app):
     _upload(app, b"u1", profile_slug="neonatal-vitals")
-    _upload(app, b"u2")  # untagged
+    _upload(app, b"u2")  # into the inbox draft
     counts = _request(app, "GET", "/api/vault/tags").json()
     # multi-tagged docs would only count once under "all"
     assert counts["all"] == 2
     assert counts.get("neonatal-vitals") == 1
+    assert counts.get(_inbox(app)) == 1
 
 
 # -----------------------------------------------------------------------------
@@ -222,7 +248,8 @@ def test_tags_endpoint_includes_all_total(app):
 
 def _raw_upload(app, content: bytes, filename: str = "paper.pdf", headers=None):
     files = {"file": (filename, io.BytesIO(content), "application/pdf")}
-    return _request(app, "POST", "/api/vault/upload", files=files, headers=headers or {})
+    return _request(app, "POST", "/api/vault/upload", files=files, headers=headers or {},
+                    data={"profile_slug": _inbox(app, headers)})
 
 
 def test_non_pdf_upload_is_rejected_and_not_kept(app, tmp_path):
@@ -324,18 +351,18 @@ def test_two_users_uploading_one_paper_both_keep_it(app, monkeypatch):
     b = _raw_upload(app, b"%PDF-1.4\ncopy-two", headers=b_hdr)
     assert b.status_code == 200, b.text
 
-    mine = [d["id"] for d in _request(app, "GET", "/api/vault/docs").json()]
-    theirs = [d["id"] for d in _request(app, "GET", "/api/vault/docs", headers=b_hdr).json()]
-    assert "https://openalex.org/W42" in mine
-    assert "https://openalex.org/W42" in theirs
-    # The shared text is the first upload's; the second did not rewrite it.
+    mine = {d["id"]: d for d in _request(app, "GET", "/api/vault/docs").json()}
+    theirs = {d["id"]: d for d in _request(app, "GET", "/api/vault/docs", headers=b_hdr).json()}
+    # Each user keeps their own copy of the work, with their own text.
+    assert a.json()["id"] in mine and b.json()["id"] in theirs and a.json()["id"] != b.json()["id"]
+    assert mine[a.json()["id"]]["canonicalId"] == theirs[b.json()["id"]]["canonicalId"] == "https://openalex.org/W42"
     import os
     conn = connect(os.environ["RADAR_DB_PATH"])
-    body = conn.execute("SELECT body_text FROM papers WHERE openalex_id='https://openalex.org/W42'").fetchone()[0]
-    n = conn.execute("SELECT count(*) FROM paper_uploads WHERE openalex_id='https://openalex.org/W42'").fetchone()[0]
+    body = lambda oid: conn.execute("SELECT body_text FROM papers WHERE openalex_id = ?", (oid,)).fetchone()[0]
+    assert body(a.json()["id"]).startswith("first user's") and body(b.json()["id"]).startswith("second user's")
+    assert body("https://openalex.org/W42") is None
+    assert conn.execute("SELECT count(*) FROM paper_uploads").fetchone()[0] == 2
     conn.close()
-    assert body.startswith("first user's")
-    assert n == 2
 
 
 def _rec(title, body, doi=None):

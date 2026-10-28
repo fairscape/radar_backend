@@ -121,9 +121,12 @@ def test_slug_reuse_after_delete_starts_clean(app, env):
     assert slug2 == slug
     new_pid = _one(env, "SELECT id FROM profiles WHERE slug = ?", slug)["id"]
     assert new_pid != old_pid
-    assert [r for r in _ok(_request(app, "GET", f"/api/profiles/{slug}/runs")) if r["tier_used"] != "dry_run"] == []
+    # Only its own first scan, which saving it ran (FUNCTIONAL_SPEC D.2-5).
+    runs = [r for r in _ok(_request(app, "GET", f"/api/profiles/{slug}/runs")) if r["tier_used"] != "dry_run"]
+    assert [r["profile_id"] for r in runs] == [new_pid]
     assert _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback")) == []
-    assert _feed(app, slug)["cards"] == []
+    # Its feed is its own first scan's: nothing the old interest saved.
+    assert not any(c.get("state") for c in _feed(app, slug)["cards"])
     tags = _ok(_request(app, "GET", "/api/vault/tags"))
     print("tags", tags)
 
@@ -162,7 +165,7 @@ def test_second_user_cannot_touch_first_users_interest(app, env):
     after = _one(env, "SELECT threshold, year_from, year_to FROM profiles WHERE id = ?", pid)
     assert dict(after) == dict(before)
     n_runs = _one(env, "SELECT COUNT(*) AS n FROM gather_runs WHERE profile_id = ? AND tier_used != 'dry_run'", pid)["n"]
-    assert n_runs == 1, n_runs
+    assert n_runs == 2, n_runs        # the save's first scan and A's scan; none of B's
     assert not leaks, leaks
     # B's upload to A's slug is refused.
     assert _upload(app, b"b-file", "b.pdf", slug, headers=B).status_code == 404

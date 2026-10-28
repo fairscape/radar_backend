@@ -33,7 +33,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from ...openalex_status import OpenAlexUnavailable
 from ...redact import public_error
+from ..services.researchers import ResearcherExists
 
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
@@ -200,6 +202,7 @@ def launch_import(
         # The draft or the researcher was deleted in another tab while the
         # source was read: the run's foreign key fails (it was a 500).
         db.rollback()
+        prosopia_service.undo_import(db, plan)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="the draft or researcher to import into no longer exists",
@@ -222,8 +225,9 @@ def launch_import(
         except Exception as exc:  # noqa: BLE001 — mirror the job's audit write
             gather_runs_repo.finish(
                 db, run_id, n_fetched=0, n_new=0, n_redup=0,
-                tier_used=tier, error=f"{type(exc).__name__}: {public_error(exc)}",
+                tier_used=tier, error=prosopia_service.import_error(exc),
             )
+            prosopia_service.undo_import(db, plan, run_id=run_id)
             raise
         gather_runs_repo.finish(
             db, run_id,
@@ -241,6 +245,7 @@ def launch_import(
             db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
             error="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
         )
+        prosopia_service.undo_import(db, plan, run_id=run_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
@@ -261,6 +266,7 @@ def launch_import(
             db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
             error=f"could not schedule: {type(exc).__name__}: {exc}",
         )
+        prosopia_service.undo_import(db, plan, run_id=run_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="the background scheduler refused the job; try again in a moment",
@@ -299,6 +305,9 @@ def orcid_works(
     client = openalex_client or OpenAlexClient(mailto=_users_repo.mailto_from_row(user, settings.RADAR_DEFAULT_MAILTO))
     try:
         listing = orcid_service.list_works(oid, client)
+    except (OpenAlexUnavailable, ResearcherExists):
+        # A 503 with the pause, a 409 with the researcher (app handlers).
+        raise
     except Exception as exc:  # noqa: BLE001 — upstream trouble is a 502
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -374,6 +383,9 @@ def import_orcid(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
             ) from exc
+        except (OpenAlexUnavailable, ResearcherExists):
+            # A 503 with the pause, a 409 with the researcher (app handlers).
+            raise
         except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

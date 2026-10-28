@@ -24,6 +24,7 @@ from rag_lib.db.repos import (
 from tests.test_prosopia_import import StubProsopia, _stub_profile
 from tests.test_researcher_marks import _both_stubs
 from tests.test_researchers import _app, _request, env  # noqa: F401 -- fixture
+from tests.upload_inbox import inbox
 
 A = {"X-User-Email": "alice@example.com"}
 B = {"X-User-Email": "bob@example.com"}
@@ -215,14 +216,15 @@ def test_two_users_share_a_person(app, env):
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
-    # Same bytes uploaded by both: two upload rows, one paper.
+    # Same bytes uploaded by both: two upload rows, each user's own paper.
     for h in (A, B):
         files = {"file": ("p.pdf", io.BytesIO(b"%PDF-1.4\nshared"), "application/pdf")}
-        _ok(_request(app, "POST", "/api/vault/upload", files=files, headers=h))
+        _ok(_request(app, "POST", "/api/vault/upload", files=files, headers=h,
+                     data={"profile_slug": inbox(_request, app, h)}))
     conn = connect(env)
     try:
         assert conn.execute("SELECT COUNT(*) FROM paper_uploads").fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM papers WHERE openalex_id LIKE 'local:%'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM papers WHERE openalex_id LIKE 'local:upload:%'").fetchone()[0] == 2
     finally:
         conn.close()
     assert _ok(_request(app, "GET", "/api/vault/stats", headers=B)).json()["docs"] == 6

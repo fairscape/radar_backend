@@ -52,6 +52,17 @@ def _no_ambient_env_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _openalex_not_paused():
+    """A 429 one test provokes pauses OpenAlex for the process
+    (``rag_lib.openalex_status``); it must not refuse the next test's calls."""
+    from rag_lib import openalex_status
+
+    openalex_status.reset()
+    yield
+    openalex_status.reset()
+
+
+@pytest.fixture(autouse=True)
 def _no_orcid_registry(request, monkeypatch):
     """Make ``fetch_claimed`` return None unless a test opts out.
 
@@ -99,3 +110,52 @@ def _no_chroma(request, monkeypatch):
 def live_chroma():
     """Opt out of ``_no_chroma``: the test opens a real collection."""
     return True
+
+
+class _NoPapersGatherer:
+    """OpenAlex found nothing: a scan that succeeds and stores no paper."""
+
+    name = "no-papers"
+    last_tier_used = None
+
+    def __init__(self, **_):
+        pass
+
+    def fetch(self, profile, since, *, limit=None):
+        return []
+
+    def fetch_years(self, profile, year_from, year_to, *, per_year):
+        return []
+
+    def cost(self):
+        return {"api_calls": 0, "wall_seconds": 0.0}
+
+
+@pytest.fixture(autouse=True)
+def _offline_scans(monkeypatch):
+    """Scans in tests never reach OpenAlex: by default every one finds
+    nothing. Saving an interest runs its first scan (FUNCTIONAL_SPEC D.2-5),
+    so every test that saves one scans. A test that wants papers sets its
+    own ``scheduler_jobs.OpenAlexGatherer``, which replaces this one."""
+    from rag_lib.scheduler import jobs as scheduler_jobs
+
+    monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", _NoPapersGatherer)
+
+
+@pytest.fixture(autouse=True)
+def _saves_run_at_once(monkeypatch):
+    """Saving an interest hands its first scan to the scheduler and answers
+    at once (``jobs.save_draft``). In tests that job runs inside the
+    request instead, as the scheduler would run it, so what a test reads
+    next is the saved interest. Every other job is scheduled as usual."""
+    from rag_lib.api.routers import profiles as profiles_router
+    from rag_lib.scheduler import jobs as scheduler_jobs
+
+    schedule = profiles_router._schedule_run
+
+    def run(scheduler, db, run_id, tier, func, *, args, kwargs, id):
+        if func is scheduler_jobs.save_draft:
+            return func(*args, **kwargs)
+        return schedule(scheduler, db, run_id, tier, func, args=args, kwargs=kwargs, id=id)
+
+    monkeypatch.setattr(profiles_router, "_schedule_run", run)

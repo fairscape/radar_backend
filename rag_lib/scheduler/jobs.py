@@ -43,7 +43,9 @@ log = structlog.get_logger("rag_lib.scheduler.jobs")
 
 
 GATHER_DAYS_DEFAULT = 1
-GATHER_LIMIT_DEFAULT = 500
+# No total cap: a scan takes each topic's most cited (gatherers.openalex.
+# PER_TOPIC); RADAR_GATHER_MAX_CANDIDATES, when set, still caps the total.
+GATHER_LIMIT_DEFAULT: int | None = None
 
 # How often the embedding-loop tick writes to gather_runs. Each write is
 # a tiny SQLite UPDATE so the cost is small, but with hundreds of
@@ -484,12 +486,18 @@ def gather_for_profile(
     *,
     settings: Any | None = None,
     days: int = GATHER_DAYS_DEFAULT,
-    limit: int = GATHER_LIMIT_DEFAULT,
+    limit: int | None = GATHER_LIMIT_DEFAULT,
     run_id: int | None = None,
     tier: str = "scheduled",
     years: tuple[int, int | None] | None = None,
+    on_success: Any | None = None,
 ) -> int | None:
     """Run one OpenAlex gather + score + persist cycle for a profile.
+
+    ``on_success(conn)`` runs once the scan has succeeded, just before its
+    run row is closed as done: a draft's first scan makes it live there
+    (``save_draft``), so the run reads done only once it is. If it raises,
+    the run is closed as failed with that error.
 
     ``years`` (``(year_from, year_to)``, ``year_to`` None = this year) makes
     it a backfill: papers from those years (``fetch_years``, most cited
@@ -532,7 +540,7 @@ def gather_for_profile(
     try:
         return _gather_for_profile_locked(
             user_id, profile_id, settings=settings, days=days, limit=limit,
-            run_id=run_id, tier=tier, years=years,
+            run_id=run_id, tier=tier, years=years, on_success=on_success,
         )
     except Exception as exc:
         # Died before its own try (the database could not be opened, the
@@ -559,11 +567,21 @@ def _close_run_after_failure(settings, run_id: int | None, exc: BaseException) -
         row = gather_runs_repo.get(conn, run_id)
         if row is not None and row["finished_at"] is None:
             gather_runs_repo.finish(conn, run_id, n_fetched=0, n_new=0, n_redup=0,
-                                    error=f"{type(exc).__name__}: {exc}")
+                                    error=run_error(exc))
     except Exception:  # noqa: BLE001
         log.exception("scheduler.run_close_failed", run_id=run_id)
     finally:
         conn.close()
+
+
+def run_error(exc: BaseException) -> str:
+    """What a failed scan's run row says: OpenAlex not answering in words
+    (it ends "Nothing was changed."), anything else as the exception."""
+    from ..openalex_status import OpenAlexUnavailable
+
+    if isinstance(exc, OpenAlexUnavailable):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 SCAN_BUSY = "Skipped: another scan of this interest was running."
@@ -586,7 +604,7 @@ def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseEx
         try:
             gather_runs_repo.finish(
                 conn, run_id, n_fetched=0, n_new=0, n_redup=0,
-                error=f"{type(exc).__name__}: {exc}",
+                error=run_error(exc),
             )
             break
         except sqlite3.OperationalError:
@@ -659,10 +677,11 @@ def _gather_for_profile_locked(
     *,
     settings: Any,
     days: int,
-    limit: int,
+    limit: int | None,
     run_id: int | None,
     tier: str,
     years: tuple[int, int | None] | None,
+    on_success: Any | None = None,
 ) -> int | None:
     conn = connect(settings.RADAR_DB_PATH)
     try:
@@ -714,6 +733,8 @@ def _gather_for_profile_locked(
                     f"enable at least one to gather."
                 )
                 reporter.step("done", message=msg)
+                if on_success is not None:
+                    on_success(conn)
                 gather_runs_repo.finish(
                     conn, run_id,
                     n_fetched=0, n_new=0, n_redup=0, api_calls=0,
@@ -884,6 +905,8 @@ def _gather_for_profile_locked(
                 alpha=float(getattr(reranker, "alpha", 0.4)), beta=float(getattr(reranker, "beta", 0.6)),
             )
             api_calls = gatherer.cost().get("api_calls", 0)
+            if on_success is not None:
+                on_success(conn)
             gather_runs_repo.finish(
                 conn,
                 run_id,
@@ -909,6 +932,59 @@ def _gather_for_profile_locked(
             return run_id
     finally:
         conn.close()
+
+
+def save_draft(
+    user_id: int,
+    profile_id: int,
+    *,
+    run_id: int,
+    settings: Any | None = None,
+    days: int = 7,
+    limit: int | None = GATHER_LIMIT_DEFAULT,
+    years: tuple[int, int | None] | None = None,
+    cron: str | None = None,
+    tz: str | None = None,
+    register: Any | None = None,
+) -> int | None:
+    """``POST /api/profiles``' job: the draft's first scan, and the draft
+    goes live only when it succeeds (FUNCTIONAL_SPEC D.2-5, F2.3 Q1).
+
+    The scan is the usual one (the last ``days``, or ``years`` as a
+    backfill). Its success makes the draft live inside the scan's own
+    close, so its run reads done only once the interest is live. A scan
+    that fails -- OpenAlex unavailable among others -- leaves a draft with
+    nothing from the scan in it: the feed rows it stored are removed, the
+    run keeps the error, and saving again starts over. ``register()`` then
+    registers the nightly job (the route's scheduler).
+    """
+    if settings is None:
+        from ..api.settings import get_settings  # avoid circular import
+        settings = get_settings()
+    from ..api.services import wizard as wizard_service
+
+    def live(conn) -> None:
+        wizard_service.go_live(conn, profile_id, cron=cron, tz=tz)
+
+    run_id = gather_for_profile(
+        user_id, profile_id, settings=settings, days=days, limit=limit,
+        run_id=run_id, tier="backfill" if years else "first_scan", years=years, on_success=live,
+    )
+    conn = connect(settings.RADAR_DB_PATH)
+    try:
+        row = profiles_repo.get(conn, profile_id)
+        if row is not None and row["is_draft"]:
+            conn.execute("DELETE FROM profile_candidates WHERE profile_id = ?", (profile_id,))
+            conn.commit()
+            log.info("save_draft.failed", profile_id=profile_id, run_id=run_id)
+        elif row is not None and register is not None:
+            try:
+                register()
+            except Exception:  # noqa: BLE001 -- live; the next boot registers it
+                log.exception("save_draft.register_failed", profile_id=profile_id)
+    finally:
+        conn.close()
+    return run_id
 
 
 def dry_run_for_draft(
@@ -999,7 +1075,7 @@ def dry_run_for_draft(
                 conn, run_id,
                 n_fetched=0, n_new=0, n_redup=0,
                 tier_used="dry_run",
-                error=f"{type(exc).__name__}: {exc}",
+                error=run_error(exc),
             )
             log.exception(
                 "dry_run.failed",
@@ -1080,15 +1156,23 @@ def import_prosopia_profile(
             _backfill_import_umls(conn, settings, plan)
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
+            from ..api.services.prosopia import import_error, undo_import
+
             gather_runs_repo.finish(
                 conn, run_id,
                 n_fetched=0, n_new=0, n_redup=0,
                 tier_used=tier,
-                error=f"{type(exc).__name__}: {exc}",
+                error=import_error(exc),
             )
             log.exception(
                 "prosopia_import.failed", run_id=run_id, slug=plan.slug,
             )
+            # Nothing half-built stays: the draft and researcher this
+            # import's request made, and what it stored (FUNCTIONAL_SPEC D).
+            try:
+                undo_import(conn, plan, run_id=run_id)
+            except Exception:  # noqa: BLE001 -- the run already says it failed
+                log.exception("prosopia_import.undo_failed", run_id=run_id)
             return run_id
     finally:
         conn.close()
@@ -1186,14 +1270,26 @@ def backfill_seed_umls_job(settings: Any | None = None) -> int:
     whose thread died, a paper added from the vault or the feed, an
     upload whose extraction failed, step 3 running out of budget. Before
     it existed nothing ever came back for them. Bounded per run.
+
+    It first reads the files of uploads migrated without their own text
+    (``versions.parse_pending``), so their concepts come from that text,
+    and embeds the public papers 0029 left without a vector
+    (``versions.embed_queued``).
     """
     if settings is None:
         from ..api.settings import get_settings  # avoid circular import
         settings = get_settings()
     from ..api.services.vault import backfill_seed_umls
 
+    from ..db.repos.versions import embed_queued, parse_pending
+
     conn = connect(settings.RADAR_DB_PATH)
     try:
+        try:
+            parse_pending(conn)
+            embed_queued(conn, default_model=settings.RADAR_DEFAULT_EMBEDDING_MODEL)
+        except Exception:  # noqa: BLE001 -- the UMLS pass still runs
+            log.exception("scheduler.parse_pending_failed")
         return backfill_seed_umls(conn, settings, limit=40)
     except Exception:  # noqa: BLE001 -- next run tries again
         log.exception("scheduler.umls_backfill_failed")
