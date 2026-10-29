@@ -139,7 +139,7 @@ def _load_specter2():
 
 def _load_specter2_unlocked():
     try:
-        from adapters import AutoAdapterModel  # type: ignore
+        from adapters import AdapterSetup, AutoAdapterModel  # type: ignore
         from transformers import AutoTokenizer  # type: ignore
     except ImportError as e:
         raise ImportError(
@@ -155,8 +155,11 @@ def _load_specter2_unlocked():
     model = AutoAdapterModel.from_pretrained(
         SPECTER2_MODEL_ID, low_cpu_mem_usage=False,
     )
-    model.load_adapter(SPECTER2_ADAPTER, source="hf", load_as="proximity",
-                       set_active=True)
+    # Loading inside AdapterSetup avoids a false "none are activated"
+    # warning from adapters 1.3.0 (adapter-hub/adapters#815).
+    with AdapterSetup("proximity"):
+        model.load_adapter(SPECTER2_ADAPTER, source="hf", load_as="proximity",
+                           set_active=True)
     model.eval()
     model.to(device)
     return (tokenizer, model, device)
