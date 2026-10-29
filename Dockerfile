@@ -3,9 +3,12 @@
 # Multi-stage build for the RADAR FastAPI service — lean profile.
 #
 # What this image carries: the API, SPECTER2 (pre-downloaded so a fresh
-# pod does not fetch ~450 MB before it can embed) and the OpenAlex
-# gatherer. UMLS extraction, the MedCPT reranker and the Ollama chat
-# path are still in the code but off by configuration
+# pod does not fetch ~450 MB before it can embed), the OpenAlex
+# gatherer, and the Anthropic/OpenAI chat clients (pydantic-ai-slim,
+# the `llm-providers` extra). No API key is baked in: chat is keyed
+# only by env (RADAR_ANTHROPIC_API_KEY / RADAR_OPENAI_API_KEY). UMLS
+# extraction, the MedCPT reranker and the Ollama chat path are still in
+# the code but off by configuration
 # (RADAR_UMLS_ENABLED / RADAR_RERANKER_ENABLED / RADAR_LLM_PROVIDER);
 # scispacy and its sci-lg model are NOT installed here. To bring UMLS
 # back, install the `umls` extra (needs Python <3.13) and bake
@@ -49,7 +52,7 @@ RUN pip install --prefix=/install --index-url https://download.pytorch.org/whl/c
 # tree is COPY'd separately in the runtime stage because pyproject.toml's
 # `packages.find` excludes cli/ and ships no package-data for the SQL
 # migrations.
-RUN pip install --prefix=/install ".[dev,phase1b]"
+RUN pip install --prefix=/install ".[dev,phase1b,llm-providers]"
 
 # ---------- runtime base ----------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime-base

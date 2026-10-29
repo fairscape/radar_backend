@@ -1,9 +1,11 @@
 """Users routes — Phase 12.
 
-Two endpoints:
+Three endpoints:
 
-  GET   /api/users/me   → ``User`` for the authenticated email.
-  PATCH /api/users/me   → ``User`` (after applying ``mailto`` change).
+  GET   /api/users/me            → ``User`` for the authenticated email.
+  PATCH /api/users/me            → ``User`` (after applying ``mailto`` change).
+  GET   /api/users/me/prosopia   → ``MyProsopia``: the person's self
+                                   profile on Prosopia, if public.
 
 The acting user is always resolved by ``get_current_user`` from the
 ``X-User-Email`` header; this router never accepts a user id in the
@@ -14,12 +16,21 @@ is intentionally minimal.
 from __future__ import annotations
 
 import sqlite3
-from typing import Annotated
+from typing import Annotated, Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+import structlog
+from fastapi import APIRouter, Cookie, Depends, HTTPException, status
 
+from rag_lib.db.repos import researchers as researchers_repo
+
+from .. import oidc
 from ..deps import get_current_user, get_db
-from ..schemas import User, UserUpdateRequest
+from ..schemas import MyProsopia, MyProsopiaProfile, User, UserUpdateRequest
+from ..settings import Settings, get_settings
+
+log = structlog.get_logger("rag_lib.api.routers.users")
 
 router = APIRouter()
 
@@ -66,3 +77,61 @@ def update_me(
 
     updated = users_repo.upsert(db, user["email"], mailto=new_mailto)
     return _row_to_user(updated)
+
+
+def _lookup_profile(base_url: str, rid: str) -> dict[str, Any] | None:
+    """The public record of profile ``rid``, or None (404, error, outage).
+
+    This feeds an optional card, so a Prosopia outage must look like "no
+    profile", never like a broken page.
+    """
+    try:
+        resp = httpx.get(
+            f"{base_url}/api/v1/profiles/{quote(rid, safe='')}",
+            # Cloudflare in front of prosopia.databio.org 403s default
+            # Python user agents.
+            headers={"User-Agent": "bioxplorer-backend"},
+            timeout=10,
+        )
+        return resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("my_prosopia.lookup_failed", rid=rid, error=str(exc))
+        return None
+
+
+@router.get("/me/prosopia", response_model=MyProsopia)
+def get_my_prosopia(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    bioxplorer_session: Annotated[str | None, Cookie()] = None,
+) -> MyProsopia:
+    """The person's self profile on Prosopia, if it is public.
+
+    Keyed on the ``self_rid`` claim from sign-in (scope ``profiles:own``):
+    the rid of the profile the Prosopia account says is about itself. No
+    session, no ``self_rid``, or no public profile all answer 200 with
+    nulls; the frontend then simply shows no card.
+    """
+    session = oidc.read_session(settings, bioxplorer_session) if oidc.providers(settings) else None
+    if not session or not session.get("self_rid"):
+        return MyProsopia()
+    base = settings.RADAR_PROSOPIA_BASE_URL.rstrip("/")
+    record = _lookup_profile(base, session["self_rid"])
+    if not record or not record.get("slug"):
+        return MyProsopia()
+    slug = record["slug"]
+    fields = record.get("fields") or {}
+    profile = MyProsopiaProfile(
+        slug=slug,
+        name=fields.get("name") or slug,
+        affiliation=fields.get("affiliation"),
+        paper_count=fields.get("paper_count"),
+        url=f"{base}/{slug}",
+    )
+    row = researchers_repo.get_by_key(db, int(user["id"]), "prosopia", slug)
+    return MyProsopia(
+        profile=profile,
+        researcher_id=int(row["id"]) if row else None,
+        imported_at=row["imported_at"] if row else None,
+    )

@@ -14,7 +14,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -102,6 +102,22 @@ class Settings(BaseSettings):
     # fall back to the demo user (id=1). Production ``.env`` flips this on
     # so the API rejects unauthenticated traffic with 401.
     RADAR_REQUIRE_AUTH: bool = False
+    # Sign-in through OpenID Connect. Each provider is on when its client
+    # secret is set; with any on, identity comes from the session cookie
+    # the /auth routes set and there is no demo-user fallback. Prosopia's
+    # issuer is RADAR_PROSOPIA_BASE_URL; Google's is accounts.google.com.
+    BIOXPLORER_PROSOPIA_CLIENT_ID: str = "bioxplorer"
+    BIOXPLORER_PROSOPIA_CLIENT_SECRET: str | None = None
+    BIOXPLORER_GOOGLE_CLIENT_ID: str | None = None
+    BIOXPLORER_GOOGLE_CLIENT_SECRET: str | None = None
+    # The one callback every provider returns to; register it with each
+    # (https://<host>/auth/login/callback).
+    BIOXPLORER_OIDC_REDIRECT_URI: str | None = None
+    # HMAC key for the session cookie. Required when any provider is on.
+    BIOXPLORER_SESSION_SECRET: str | None = None
+    BIOXPLORER_SESSION_DAYS: int = 14
+    # True behind https; False lets the cookie ride plain-http dev.
+    BIOXPLORER_COOKIE_SECURE: bool = False
     # Ceiling on how many candidates one gather may pull from OpenAlex
     # (trial scan, scan-now, and the daily job alike). None = each caller's
     # own default (1000 for the trial scan, 500 for scans). A CPU-only
@@ -163,7 +179,9 @@ class Settings(BaseSettings):
 
     @field_validator(
         "RADAR_ANTHROPIC_API_KEY", "RADAR_OPENAI_API_KEY", "RADAR_LOG_FILE",
-        "RADAR_GATHER_MAX_CANDIDATES", mode="before",
+        "RADAR_GATHER_MAX_CANDIDATES", "BIOXPLORER_PROSOPIA_CLIENT_SECRET",
+        "BIOXPLORER_GOOGLE_CLIENT_ID", "BIOXPLORER_GOOGLE_CLIENT_SECRET",
+        "BIOXPLORER_OIDC_REDIRECT_URI", "BIOXPLORER_SESSION_SECRET", mode="before",
     )
     @classmethod
     def _empty_is_unset(cls, value: object) -> object:
@@ -185,6 +203,19 @@ class Settings(BaseSettings):
                 f"{sorted(_SUPPORTED_LLM_PROVIDERS)}, got {value!r}"
             )
         return name
+
+    @model_validator(mode="after")
+    def _oidc_complete(self) -> "Settings":
+        if bool(self.BIOXPLORER_GOOGLE_CLIENT_ID) != bool(self.BIOXPLORER_GOOGLE_CLIENT_SECRET):
+            raise ValueError("set both BIOXPLORER_GOOGLE_CLIENT_ID and BIOXPLORER_GOOGLE_CLIENT_SECRET, or neither")
+        if self.BIOXPLORER_PROSOPIA_CLIENT_SECRET or self.BIOXPLORER_GOOGLE_CLIENT_SECRET:
+            missing = [
+                name for name in ("BIOXPLORER_OIDC_REDIRECT_URI", "BIOXPLORER_SESSION_SECRET")
+                if not getattr(self, name)
+            ]
+            if missing:
+                raise ValueError(f"sign-in is on but {', '.join(missing)} is not set")
+        return self
 
 
 @lru_cache(maxsize=1)
