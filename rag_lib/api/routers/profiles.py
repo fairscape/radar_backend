@@ -26,6 +26,9 @@ from ..schemas import (
     DraftCoherence,
     DraftCreateRequest,
     DraftSummary,
+    EditCopy,
+    EditCopyState,
+    EditTab,
     DraftDryRun,
     DraftDryRunRequest,
     DraftDryRunStart,
@@ -39,6 +42,7 @@ from ..schemas import (
     Profile,
     ProfileDetail,
     SavedDraft,
+    ScanTopics,
     ProfileThresholdUpdate,
     RerankerCandidate,
     RerankerComparisonResponse,
@@ -59,6 +63,8 @@ from ..schemas import (
     WizardOption,
     WizardOptions,
 )
+from ..mappers import topic_filters_to_topics
+from ..services import edit_copy as edit_copy_service
 from ..services import profiles as profiles_service
 from ..services import wizard as wizard_service
 from ..settings import Settings
@@ -190,6 +196,99 @@ def list_drafts(
     ]
 
 
+@router.post("/drafts/discard-edits")
+def discard_left_edits(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    body: EditTab | None = None,
+) -> dict:
+    """Discard the user's Edit interest copies left behind unsaved: this
+    tab's own (closed or reloaded without leaving) and any not heard from
+    for 2 minutes. The site calls this when it opens anywhere but an edit
+    page; another tab's edit still going stays (FUNCTIONAL_SPEC E.7 R5)."""
+    tab = body.tab if body else ""
+    return {"discarded": len(edit_copy_service.discard_leftovers(db, int(user["id"]), tab))}
+
+
+@router.post("/draft/{slug}/edit-alive")
+def edit_alive(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    body: EditTab | None = None,
+) -> dict:
+    """The edit page of copy ``slug`` is still open (every 30 s): it keeps
+    the interest for this tab. 404 when the copy is gone, 409 when it is
+    another tab's."""
+    try:
+        edit_copy_service.alive(db, user_id=int(user["id"]), slug=slug, tab=body.tab if body else "")
+    except edit_copy_service.BeingEdited as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.post("/draft/{slug}/discard-edit")
+def discard_edit_on_close(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    """``DELETE /draft/{slug}`` for a copy, as a POST: what the edit page
+    sends as its tab closes (``navigator.sendBeacon`` only posts), so the
+    interest is free at once rather than in 2 minutes."""
+    try:
+        edit_copy_service.discard_copy(db, user_id=int(user["id"]), slug=slug)
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="an import is still adding seeds; leave once it has finished") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.get("/draft/{slug}/edit-state", response_model=EditCopyState)
+def edit_state(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> EditCopyState:
+    """Whether the copy ``slug`` differs from the interest it copies."""
+    try:
+        return EditCopyState(changed=edit_copy_service.changed(db, user_id=int(user["id"]), slug=slug))
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.post("/draft/{slug}/save-edit", response_model=Profile)
+def save_edit(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> Profile:
+    """Save changes: the copy ``slug`` is written onto the interest it
+    copies and deleted. No scan, no rescore (FUNCTIONAL_SPEC E.4 Q5).
+    409 while an import fills the copy, a scan of the interest runs, or no
+    topic would be on; 400 with no seed that can be placed."""
+    uid = int(user["id"])
+    try:
+        key = edit_copy_service.save_copy(db, user_id=uid, slug=slug)
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="an import is still adding seeds; save once it has finished") from exc
+    except (wizard_service.ScanRunning, wizard_service.NoTopicOn) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    saved = profiles_service.get_profile(db, uid, key)
+    if saved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"profile '{key}' not found")
+    return saved
+
+
 @router.post("/draft", response_model=Draft)
 def create_draft(
     body: DraftCreateRequest,
@@ -291,6 +390,12 @@ def start_seed_umls(
     from rag_lib.scheduler.jobs import SEED_UMLS_RUNNING, extract_seed_umls_job
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
+    # A seed mapped by the earlier topic rules is read again, and is
+    # pending until it is: what step 3 waits for before building the list.
+    if profile_id not in SEED_UMLS_RUNNING:
+        from rag_lib.db.repos import profiles as profiles_repo
+
+        wizard_service.forget_stale_umls_mappings(db, profiles_repo.list_seed_openalex_ids(db, profile_id))
     st = _seed_umls_status(db, settings, profile_id)
     if st.pending == 0 or profile_id in SEED_UMLS_RUNNING:
         return st
@@ -335,22 +440,7 @@ def draft_topics(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
-    out: list[Topic] = []
-    for entry in (topic_filters.get("topics") or []):
-        tid = entry.get("id") or ""
-        if not tid:
-            continue
-        out.append(Topic(
-            id=tid,
-            name=entry.get("display_name") or "",
-            count=int(entry.get("count") or 0),
-            papers=int(entry["papers"]) if entry.get("papers") is not None else None,
-            on=bool(entry.get("on", True)),
-            source=entry.get("source"),
-            llm_label=entry.get("llm_label"),
-            profile=entry.get("profile"),
-        ))
-    return out
+    return topic_filters_to_topics(topic_filters)
 
 
 @router.post("/draft/{slug}/dry-run", response_model=DraftDryRunStart)
@@ -633,6 +723,9 @@ def add_draft_seeds(
     from ..services import researchers as researchers_service
 
     try:
+        # A new interest's draft only, as the wizard's other routes; a saved
+        # interest or an Edit interest copy is a 404 here (spec E).
+        wizard_service._require_draft(db, int(user["id"]), slug)
         attached, rejected, rescored = researchers_service.attach_seeds(
             db, user_id=int(user["id"]), slug=slug, openalex_ids=body.openalex_ids,
             source=body.source, researcher_id=body.researcher_id,
@@ -649,6 +742,34 @@ def add_draft_seeds(
     return DraftSeedsResponse(attached=attached, rejected=rejected, rescored=rescored)
 
 
+@router.post("/{key}/edit", response_model=EditCopy)
+def open_edit(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    body: EditTab | None = None,
+) -> EditCopy:
+    """Open Edit interest on saved interest ``key`` in tab ``body.tab``: a
+    copy every step changes, saved with ``POST /draft/{slug}/save-edit``
+    or discarded with ``DELETE /draft/{slug}`` (FUNCTIONAL_SPEC E). Copies
+    left behind go first. 404 for no saved interest ``key``; 409 while
+    another tab edits it (first come first served, E.7 R5) or an import
+    still fills a copy of it."""
+    try:
+        copy = edit_copy_service.open_copy(db, user_id=int(user["id"]), slug=key, tab=body.tab if body else "")
+    except edit_copy_service.BeingEdited as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:       # the copy kept being taken meanwhile: a moment later works
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"{exc}; try again") from exc
+    except wizard_service.ImportInProgress as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="an import into an earlier edit of this interest is still running; "
+                                   "open it again once that finishes") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return EditCopy(slug=copy["slug"], editOf=key)
+
+
 @router.post("/{key}/seeds", response_model=DraftSeedsResponse)
 def add_seeds(
     key: str,
@@ -662,6 +783,7 @@ def add_seeds(
     interests. Papers without a vector are embedded; a live interest is
     re-fitted so its next scan scores against these seeds.
     """
+    _editable(db, int(user["id"]), key)
     from ..services import researchers as researchers_service
 
     try:
@@ -688,12 +810,14 @@ def remove_seed(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     openalex_id: str = Query(..., min_length=1),
 ) -> dict:
-    """Remove one seed from a draft or a live interest.
+    """Remove one seed from a draft: a new interest's, or the copy Edit
+    interest changes (a saved interest's own seeds are refused, 409).
 
     The id is a query parameter, not a path segment: seed ids contain
-    slashes. 404 when it is not a seed, 409 when it is a live interest's
-    last one. A live interest is re-fitted on the seeds that remain.
+    slashes. 404 when it is not a seed, 409 when it is a copy's last one.
+    Nothing is refitted and no topic is switched (E.8); the next scan refits.
     """
+    _editable(db, int(user["id"]), key)
     try:
         removed = wizard_service.remove_seed(
             db, user_id=int(user["id"]), slug=key, openalex_id=openalex_id,
@@ -773,9 +897,10 @@ def commit_draft(
         return SavedDraft(**profile.model_dump(), saveRunId=run_id)
 
     row = profiles_repo.get_by_slug(db, uid, body.slug)
-    if row is None or not row["is_draft"]:
+    if row is None or not wizard_service.is_new_draft(row):
         # A live interest is not a draft to save (the wizard then reads it
-        # and says it was saved in another tab).
+        # and says it was saved in another tab); an Edit interest copy is
+        # saved with save-edit (spec E).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"draft '{body.slug}' not found")
     profile_id = int(row["id"])
     running = gather_runs_repo.running_scan(db, profile_id)
@@ -884,6 +1009,7 @@ def update_profile(
     detail page; the dry-run histogram lets the user see how the
     chosen θ affects candidate volume before saving.
     """
+    _editable(db, int(user["id"]), key)
     from rag_lib import years as years_rules
     from rag_lib.db.repos import profiles as profiles_repo
 
@@ -951,6 +1077,7 @@ def recompute_coherence(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> DraftCoherence:
+    _editable(db, int(user["id"]), key)
     try:
         return wizard_service.compute_draft_coherence(
             db, user_id=int(user["id"]), slug=key,
@@ -964,26 +1091,6 @@ def recompute_coherence(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
         ) from exc
-
-
-def _topics_out(topic_filters: dict, new: set[str] | None = None) -> list[Topic]:
-    out: list[Topic] = []
-    for entry in (topic_filters.get("topics") or []):
-        tid = entry.get("id") or ""
-        if not tid:
-            continue
-        out.append(Topic(
-            id=tid,
-            name=entry.get("display_name") or "",
-            count=int(entry.get("count") or 0),
-            papers=int(entry["papers"]) if entry.get("papers") is not None else None,
-            on=bool(entry.get("on", True)),
-            source=entry.get("source"),
-            llm_label=entry.get("llm_label"),
-            new=(tid in new) if new is not None else None,
-            profile=entry.get("profile"),
-        ))
-    return out
 
 
 def _terms_view(db: sqlite3.Connection, row: sqlite3.Row, record: dict | None, *, saved: bool = True) -> InterestTerms:
@@ -1065,6 +1172,7 @@ def update_terms(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> InterestTerms:
     """Keep a generated preview, or save edits to the stored topics."""
+    _editable(db, int(user["id"]), key)
     from rag_lib import interest_terms
     from rag_lib.db.repos import profiles as profiles_repo
 
@@ -1104,7 +1212,24 @@ def preview_topics(
         topic_filters, new = wizard_service.preview_topics(db, user_id=int(user["id"]), slug=key)
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _topics_out(topic_filters, new)
+    return topic_filters_to_topics(topic_filters, new)
+
+
+@router.get("/{key}/scan-topics", response_model=ScanTopics)
+def scan_topics(
+    key: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> ScanTopics:
+    """Whether the topics switched on now, or the seeds, differ from the
+    ones the last successful scan searched and scored with: the edit page's
+    threshold step then says the recommendations no longer match
+    (FUNCTIONAL_SPEC T.2-4, E.2-5)."""
+    try:
+        got = wizard_service.scan_outdated(db, user_id=int(user["id"]), slug=key)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return ScanTopics(changed=got["topics"] or got["seeds"], **got)
 
 
 @router.put("/{key}/topics", response_model=list[Topic])
@@ -1116,6 +1241,7 @@ def save_topics(
 ) -> list[Topic]:
     """Switch the interest's topics: exactly ``selected_topic_ids`` on. 409
     when that would leave none on. Takes effect from the next scan."""
+    _editable(db, int(user["id"]), key)
     try:
         topic_filters = wizard_service.save_topics(
             db, user_id=int(user["id"]), slug=key, selected_topic_ids=body.selected_topic_ids,
@@ -1124,7 +1250,7 @@ def save_topics(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    return _topics_out(topic_filters)
+    return topic_filters_to_topics(topic_filters)
 
 
 @router.post("/{key}/llm-topics", response_model=LlmTopicsResult)
@@ -1138,6 +1264,7 @@ def map_llm_topics(
     add the new ones, switched off, as ``source: llm``. No LLM call: the
     labels are embedded locally. 409 without saved LLM topics or mid-import;
     503 when the topic index or the embedder is unavailable."""
+    _editable(db, int(user["id"]), key)
     try:
         out = wizard_service.map_llm_topics(db, settings, user_id=int(user["id"]), slug=key)
     except LookupError as exc:
@@ -1152,8 +1279,8 @@ def map_llm_topics(
         log.warning("profile.llm_topics_unavailable", key=key, error=str(exc))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"topic mapping is not available right now: {public_error(exc)}") from exc
-    return LlmTopicsResult(added=_topics_out({"topics": out["added"]}),
-                           topics=_topics_out(out["topic_filters"]), n_labels=out["n_labels"])
+    return LlmTopicsResult(added=topic_filters_to_topics({"topics": out["added"]}),
+                           topics=topic_filters_to_topics(out["topic_filters"]), n_labels=out["n_labels"])
 
 
 @router.post("/{key}/recompute-topics", response_model=list[Topic])
@@ -1162,6 +1289,7 @@ def recompute_topics(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> list[Topic]:
+    _editable(db, int(user["id"]), key)
     try:
         topic_filters = wizard_service.aggregate_draft_topics(
             db, user_id=int(user["id"]), slug=key,
@@ -1177,22 +1305,7 @@ def recompute_topics(
         ) from exc
     from rag_lib.scheduler.jobs import request_rerank_refresh
     request_rerank_refresh(_resolve_profile_id(db, int(user["id"]), key))
-    out: list[Topic] = []
-    for entry in (topic_filters.get("topics") or []):
-        tid = entry.get("id") or ""
-        if not tid:
-            continue
-        out.append(Topic(
-            id=tid,
-            name=entry.get("display_name") or "",
-            count=int(entry.get("count") or 0),
-            papers=int(entry["papers"]) if entry.get("papers") is not None else None,
-            on=bool(entry.get("on", True)),
-            source=entry.get("source"),
-            llm_label=entry.get("llm_label"),
-            profile=entry.get("profile"),
-        ))
-    return out
+    return topic_filters_to_topics(topic_filters)
 
 
 @router.get("/{key}/researcher-topics", response_model=ProfileResearcherTopics)
@@ -1226,6 +1339,7 @@ def set_researcher_topics(
     next scan. 400 when the interest has no researcher with profile topics,
     409 while an import fills the draft or when applying would leave no
     topic on."""
+    _editable(db, int(user["id"]), key)
     try:
         topic_filters = wizard_service.set_researcher_topics(
             db, user_id=int(user["id"]), slug=key, enabled=body.enabled,
@@ -1241,7 +1355,7 @@ def set_researcher_topics(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return _topics_out(topic_filters)
+    return topic_filters_to_topics(topic_filters)
 
 
 @router.put("/{key}/researcher-topics/not-interest", response_model=list[Topic])
@@ -1257,6 +1371,7 @@ def set_not_interest_choice(
     The profile's topics must be applied. Saved straight away, like
     applying them. 400 for a topic the profile does not reject or before
     the profile is applied; 409 as ``PUT /researcher-topics``."""
+    _editable(db, int(user["id"]), key)
     try:
         topic_filters = wizard_service.set_not_interest_choice(
             db, user_id=int(user["id"]), slug=key, topic_id=body.topic_id, choice=body.choice,
@@ -1272,7 +1387,7 @@ def set_not_interest_choice(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return _topics_out(topic_filters)
+    return topic_filters_to_topics(topic_filters)
 
 
 @router.post("/{key}/refit", response_model=RefitResponse)
@@ -1292,6 +1407,7 @@ def refit_profile(
     ``?autotune=1`` (Phase 8) runs ``feedback.autotune.apply_recommended``
     after the refit and reports the new threshold inline in ``cost``.
     """
+    _editable(db, int(user["id"]), key)
     try:
         fit = wizard_service.refit_profile(db, user_id=int(user["id"]), slug=key)
     except LookupError as exc:
@@ -1387,6 +1503,30 @@ def _resolve_profile_id(db: sqlite3.Connection, user_id: int, key: str) -> int:
     return int(row["id"])
 
 
+def _editable(db: sqlite3.Connection, user_id: int, key: str) -> None:
+    """409 for a saved interest: it changes only through Edit interest,
+    which changes a copy and saves it in one go (FUNCTIONAL_SPEC E.2-8,
+    E.6 R12). Drafts -- a new interest's, or that copy -- pass; an unknown
+    key passes too, for the route's own 404."""
+    from rag_lib.db.repos import profiles as profiles_repo
+
+    row = profiles_repo.get_by_slug(db, user_id, key)
+    if row is not None and not row["is_draft"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"'{key}' is a saved interest: change it in Edit interest, which saves all the changes at once.",
+        )
+
+
+def _refuse_if_edited(db: sqlite3.Connection, profile_id: int) -> None:
+    """409 while the interest has a copy open in Edit interest (E.7 R9)."""
+    if edit_copy_service.open_copy_of(db, profile_id) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This interest is being edited. Save or discard the changes first.",
+        )
+
+
 def _refuse_if_scanning(db: sqlite3.Connection, profile_id: int) -> None:
     """409 while one of the interest's scans is still running."""
     from rag_lib.db.repos import gather_runs as gather_runs_repo
@@ -1440,6 +1580,7 @@ def gather_now(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
     profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
+    _refuse_if_edited(db, profile_id)
     openalex_status.check()   # paused: a 503, no run started (FUNCTIONAL_SPEC F2)
     # Open the audit row eagerly so we can echo a real run_id; the
     # background job reuses it via the ``run_id`` kwarg.
@@ -1492,6 +1633,7 @@ def backfill(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"no live interest '{key}'")
     profile_id = int(row["id"])
     _refuse_if_scanning(db, profile_id)
+    _refuse_if_edited(db, profile_id)
     openalex_status.check()   # paused: a 503, no run started (FUNCTIONAL_SPEC F2)
     start, _end = years_rules.fetch_span(body.year_from, body.year_to)
     run_id = _open_scan_run(

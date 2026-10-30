@@ -24,6 +24,10 @@ from rag_lib.db.repos import (
     profiles as profiles_repo,
     users as users_repo,
 )
+from tests.edit_helpers import edit_saved, refit
+
+
+SAVED_REFUSED = "is a saved interest: change it in Edit interest"
 
 
 def _seed_db(db_path) -> dict:
@@ -136,6 +140,21 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(_run())
 
 
+def _edit(app, slug, **kw):
+    """Edit interest: a saved interest changes only on a copy (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug, **kw)
+
+
+def _refit(tmp_path, slug):
+    """What the next scan does first: fit on the saved seeds, rescore."""
+    conn = connect(tmp_path / "radar.db")
+    try:
+        uid = conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0]
+        refit(conn, uid, slug)
+    finally:
+        conn.close()
+
+
 def test_list_profiles_returns_seeded_profile(app):
     resp = _request(app, "GET", "/api/profiles")
     assert resp.status_code == 200, resp.text
@@ -186,13 +205,17 @@ def test_profile_detail_shape(app):
     assert body["feedbackLog"] == [] and body["feedbackMoreCount"] == 0
 
 
-def test_refit_response_shape(app):
+def test_refit_is_refused_for_a_saved_interest_and_its_copy(app, tmp_path):
+    # Spec E: a saved interest is refitted by its next scan, not on request
+    # (409); the copy Edit interest works on is a draft, which is not fitted
+    # until it is saved and scanned (400). Nothing is written either way.
+    before = _profile_row(tmp_path)
     resp = _request(app, "POST", "/api/profiles/provenance-fairscape/refit")
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["ok"] is True
-    assert body["key"] == "provenance-fairscape"
-    assert isinstance(body["cost"], str)
+    assert resp.status_code == 409 and SAVED_REFUSED in resp.text, resp.text
+    with _edit(app, "provenance-fairscape", save=False) as copy:
+        resp = _request(app, "POST", f"/api/profiles/{copy}/refit")
+        assert resp.status_code == 400 and "draft" in resp.text, resp.text
+    assert _profile_row(tmp_path) == before
 
 
 def test_refit_unknown_profile_404(app):
@@ -224,37 +247,53 @@ def test_dry_run_reports_candidate_count(app):
 SLUG = "provenance-fairscape"
 
 
-def _profile_row(tmp_path):
+def _profile_row(tmp_path, slug=SLUG):
     import json as _json
 
     conn = connect(tmp_path / "radar.db")
     row = conn.execute(
-        "SELECT selector_config_json, n_seed FROM profiles WHERE slug = ?", (SLUG,),
+        "SELECT selector_config_json, n_seed FROM profiles WHERE slug = ?", (slug,),
     ).fetchone()
     seeds = [r[0] for r in conn.execute(
         "SELECT ps.openalex_id FROM profile_seeds ps JOIN profiles p ON p.id = ps.profile_id "
-        "WHERE p.slug = ?", (SLUG,))]
+        "WHERE p.slug = ?", (slug,))]
     conn.close()
     cfg = _json.loads(row[0]) if row[0] else {}
     return cfg.get("centroid"), row[1], seeds
 
 
 def test_refit_fits_the_current_seeds(app, tmp_path):
-    resp = _request(app, "POST", f"/api/profiles/{SLUG}/refit")
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["cost"].endswith("12 vecs")  # was always "0.00 s · 0 vecs"
+    # Spec E: the refit a scan runs first (the route is refused, above).
+    from rag_lib.api.services import wizard
+
+    conn = connect(tmp_path / "radar.db")
+    try:
+        uid = conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0]
+        fit = wizard.refit_profile(conn, user_id=uid, slug=SLUG)
+    finally:
+        conn.close()
+    assert fit["n_embedded"] == 12                     # was always "0.00 s · 0 vecs"
     centroid, n_seed, _ = _profile_row(tmp_path)
     assert centroid is not None and len(centroid) == 64
     assert n_seed == 12
 
 
 def test_removing_a_seed_from_a_live_interest_refits_it(app, tmp_path):
-    _request(app, "POST", f"/api/profiles/{SLUG}/refit")
+    """Spec E: the seed is removed in Edit interest; saving does not refit
+    (E.4 Q5), the next scan does."""
+    _refit(tmp_path, SLUG)
     before, _, _ = _profile_row(tmp_path)
     resp = _request(app, "DELETE", f"/api/profiles/{SLUG}/seeds", params={"openalex_id": "W1000000"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 409 and SAVED_REFUSED in resp.text, resp.text
+    with _edit(app, SLUG) as copy:
+        resp = _request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": "W1000000"})
+        assert resp.status_code == 200, resp.text
+        assert _profile_row(tmp_path)[2] == [f"W{1000000 + i}" for i in range(12)]   # not yet
     after, n_seed, seeds = _profile_row(tmp_path)
     assert "W1000000" not in seeds and n_seed == 11
+    assert after == before, "saving does not refit"
+    _refit(tmp_path, SLUG)
+    after, _, _ = _profile_row(tmp_path)
     assert after != before, "the centroid must follow the seeds"
 
 
@@ -280,8 +319,10 @@ def test_the_last_seed_of_a_live_interest_is_kept(app, tmp_path):
     for i in range(1, 12):
         profiles_repo.detach_seed(conn, pid, f"W{1000000 + i}")
     conn.close()
-    resp = _request(app, "DELETE", f"/api/profiles/{SLUG}/seeds", params={"openalex_id": "W1000000"})
-    assert resp.status_code == 409, resp.text
+    # Spec E: refused on the copy as on the interest; the interest keeps it.
+    with _edit(app, SLUG, save=False) as copy:
+        resp = _request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": "W1000000"})
+        assert resp.status_code == 409 and "at least one seed" in resp.text, resp.text
     assert _profile_row(tmp_path)[2] == ["W1000000"]
 
 
@@ -299,17 +340,25 @@ def test_a_feed_paper_can_become_a_seed_of_a_live_interest(app, tmp_path):
         oa = f"W{1000000 + i}"
         embeddings_repo.upsert(conn, oa, "placeholder-v1", embed(f"Seed paper {i + 1}"))
     conn.close()
-    _request(app, "POST", f"/api/profiles/{SLUG}/refit")
+    _refit(tmp_path, SLUG)
     before, _, _ = _profile_row(tmp_path)
+    # Spec E (R1): the feed's "add as seed" is gone; the paper is added in
+    # Edit interest, and the next scan refits on it.
     resp = _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": ["W2000000"]})
-    assert resp.status_code == 200, resp.text
-    # The candidates have no stored vector except the new seed itself.
-    assert resp.json() == {"attached": 1, "rejected": [], "rescored": 1}
-    conn = connect(tmp_path / "radar.db")
-    assert embeddings_repo.has(conn, "W2000000", "placeholder-v1")
-    conn.close()
+    assert resp.status_code == 409 and SAVED_REFUSED in resp.text, resp.text
+    with _edit(app, SLUG) as copy:
+        resp = _request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": ["W2000000"]})
+        assert resp.status_code == 200, resp.text
+        # A copy is not refitted or rescored on attach.
+        assert resp.json() == {"attached": 1, "rejected": [], "rescored": None}
+        conn = connect(tmp_path / "radar.db")
+        assert embeddings_repo.has(conn, "W2000000", "placeholder-v1")   # embedded at once
+        conn.close()
     after, n_seed, seeds = _profile_row(tmp_path)
     assert "W2000000" in seeds and n_seed == 13
+    assert after == before, "saving does not refit"
+    _refit(tmp_path, SLUG)
+    after, _, _ = _profile_row(tmp_path)
     assert after != before
 
 
@@ -317,9 +366,11 @@ def test_a_paper_that_is_not_the_users_is_refused(app, tmp_path):
     conn = connect(tmp_path / "radar.db")
     papers_repo.upsert(conn, {"openalex_id": "W4000000", "title": "someone else's", "source": "openalex_gatherer"})
     conn.close()
-    resp = _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": ["W4000000"]})
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"attached": 0, "rejected": ["W4000000"], "rescored": None}
+    with _edit(app, SLUG, save=False) as copy:     # spec E: seeds are added on the copy
+        resp = _request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": ["W4000000"]})
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"attached": 0, "rejected": ["W4000000"], "rescored": None}
+        assert "W4000000" not in _profile_row(tmp_path, copy)[2]
 
 
 def test_a_feed_paper_attached_to_a_draft_is_embedded_at_once(app, tmp_path):
@@ -424,23 +475,32 @@ def test_a_commit_with_a_bad_cron_is_refused_before_anything_changes(app, tmp_pa
 
 def test_removing_a_seed_is_refused_before_anything_changes_if_nothing_could_be_fitted(app, tmp_path, monkeypatch):
     """The seed row used to be deleted first and the refit run after; a refit
-    that then failed answered an error with the seed already gone."""
-    from rag_lib.api.services import wizard as wizard_service
+    that then failed answered an error with the seed already gone. Spec E:
+    the seed is removed on the Edit interest copy, and saving a copy whose
+    seeds left cannot be placed is refused with the interest as it was."""
+    from rag_lib.api.services import edit_copy, wizard as wizard_service
+    from tests.edit_helpers import edit_saved_db
 
     monkeypatch.setattr(wizard_service, "embed_missing", lambda *a, **k: 0)
     conn = connect(tmp_path / "radar.db")
     conn.execute("DELETE FROM paper_embeddings WHERE openalex_id <> 'W1000000'")
     conn.commit()
     uid = conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0]
-    with pytest.raises(ValueError):
+    with pytest.raises(wizard_service.SavedInterest):
         wizard_service.remove_seed(conn, user_id=uid, slug=SLUG, openalex_id="W1000000")
+    with edit_saved_db(conn, uid, SLUG, save=False) as copy:
+        assert wizard_service.remove_seed(conn, user_id=uid, slug=copy, openalex_id="W1000000")
+        with pytest.raises(ValueError):
+            edit_copy.save_copy(conn, user_id=uid, slug=copy)
     conn.close()
     assert "W1000000" in _profile_row(tmp_path)[2]
 
 
 def test_a_failed_attach_is_repaired_by_trying_again(app, tmp_path, monkeypatch):
     """The seed row commits before embedding runs. If embedding failed, a
-    retry found it 'already attached' and never embedded or re-fitted it."""
+    retry found it 'already attached' and never embedded or re-fitted it.
+    Spec E: attached on the Edit interest copy; once saved, the next fit
+    (a scan's) places it."""
     from rag_lib.api.services import researchers as researchers_service
     from rag_lib.api.services import wizard as wizard_service
     from rag_lib.embedders import get_embedder
@@ -463,11 +523,16 @@ def test_a_failed_attach_is_repaired_by_trying_again(app, tmp_path, monkeypatch)
         return real(*a, **k)
     monkeypatch.setattr(wizard_service, "embed_missing", flaky)
 
-    with pytest.raises(RuntimeError):
-        researchers_service.attach_seeds(conn, user_id=uid, slug=SLUG, openalex_ids=["W2000005"])
-    assert not embeddings_repo.has(conn, "W2000005", "placeholder-v1")
-    researchers_service.attach_seeds(conn, user_id=uid, slug=SLUG, openalex_ids=["W2000005"])
-    assert embeddings_repo.has(conn, "W2000005", "placeholder-v1")
+    from tests.edit_helpers import edit_saved_db, refit
+
+    with edit_saved_db(conn, uid, SLUG) as copy:
+        with pytest.raises(RuntimeError):
+            researchers_service.attach_seeds(conn, user_id=uid, slug=copy, openalex_ids=["W2000005"])
+        assert not embeddings_repo.has(conn, "W2000005", "placeholder-v1")
+        researchers_service.attach_seeds(conn, user_id=uid, slug=copy, openalex_ids=["W2000005"])
+        assert embeddings_repo.has(conn, "W2000005", "placeholder-v1")
+    assert _profile_row(tmp_path)[0] == before          # saving does not refit (E.4 Q5)
+    refit(conn, uid, SLUG)
     conn.close()
     assert _profile_row(tmp_path)[0] != before
 
@@ -505,11 +570,17 @@ def test_moving_the_threshold_changes_the_feed_at_once(app, tmp_path):
         finally:
             c.close()
 
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": 0.795}).status_code == 200
+    def set_threshold(t):
+        # Spec E: in Edit interest; saving a new threshold re-decides the feed (E.6 R10).
+        assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": t}).status_code == 409
+        with _edit(app, SLUG) as copy:
+            assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": t}).status_code == 200
+
+    set_threshold(0.795)
     n, pcts = feed()
     assert n == 16                                       # 0.95 .. 0.80
     assert max(pcts) == 1.0 and min(pcts) == 0.0         # ranked among themselves
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": 0.595}).status_code == 200
+    set_threshold(0.595)
     assert feed()[0] == 36
 
     body = _request(app, "POST", f"/api/profiles/{SLUG}/dry-run").json()
@@ -533,7 +604,7 @@ def test_adding_a_seed_rescores_the_papers_already_found(app, tmp_path):
     for i in range(50):                                # stored as a gather now stores them
         embeddings_repo.upsert(conn, f"W{2000000 + i}", "placeholder-v1", embed(f"Candidate paper {i + 1}"))
     conn.close()
-    assert _request(app, "POST", f"/api/profiles/{SLUG}/refit").status_code == 200
+    _refit(tmp_path, SLUG)
 
     def scores():
         c = connect(tmp_path / "radar.db")
@@ -545,10 +616,16 @@ def test_adding_a_seed_rescores_the_papers_already_found(app, tmp_path):
             c.close()
 
     before = scores()
-    resp = _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": ["W2000007"]})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["rescored"] == 50
+    # Spec E: the seed is added in Edit interest; saving leaves every score
+    # as it was (E.4 Q5); the next scan refits and rescores them all.
+    with _edit(app, SLUG) as copy:
+        resp = _request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": ["W2000007"]})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["rescored"] is None
+    assert scores() == before
+    _refit(tmp_path, SLUG)
     after = scores()
+    assert len(after) == 50
 
     c = connect(tmp_path / "radar.db")
     cfg = _json.loads(c.execute("SELECT selector_config_json FROM profiles WHERE slug = ?", (SLUG,)).fetchone()[0])
@@ -591,12 +668,18 @@ def test_a_saved_interests_topics_can_be_previewed_and_switched(app, tmp_path):
     assert topics["T10123"]["on"] is False and topics["T10123"]["new"] is True   # new starts off
     assert stored() == {"T11431": True}                                          # nothing written
 
+    # Spec E: switched in Edit interest, written when the copy is saved.
     resp = _request(app, "PUT", f"/api/profiles/{SLUG}/topics", json={"selected_topic_ids": ["T10123"]})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 409 and SAVED_REFUSED in resp.text, resp.text
+    with _edit(app, SLUG) as copy:
+        resp = _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": ["T10123"]})
+        assert resp.status_code == 200, resp.text
+        assert stored() == {"T11431": True}                                      # the copy only
     assert stored() == {"T11431": False, "T10123": True}
 
-    resp = _request(app, "PUT", f"/api/profiles/{SLUG}/topics", json={"selected_topic_ids": []})
-    assert resp.status_code == 409
+    with _edit(app, SLUG, save=False) as copy:
+        resp = _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": []})
+        assert resp.status_code == 409
     assert stored() == {"T11431": False, "T10123": True}                         # unchanged
 
 
@@ -642,10 +725,17 @@ def test_an_interests_years_bound_its_feed_and_its_ranking_pool(app, tmp_path):
         finally:
             c.close()
 
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": 0.4}).status_code == 200
+    # Spec E: threshold and years change in Edit interest; saving them
+    # re-decides the feed and its ranking pool (E.6 R10).
+    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"threshold": 0.4}).status_code == 409
+    with _edit(app, SLUG) as copy:
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 0.4}).status_code == 200
     assert len(feed()) == 50
-    resp = _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2020, "year_to": None}})
-    assert resp.status_code == 200 and resp.json()["yearFrom"] == 2020 and resp.json()["yearTo"] is None
+    with _edit(app, SLUG) as copy:
+        resp = _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2020, "year_to": None}})
+        assert resp.status_code == 200 and resp.json()["yearFrom"] == 2020 and resp.json()["yearTo"] is None
+        assert len(feed()) == 50                                  # the copy only
+    assert _request(app, "GET", f"/api/profiles/{SLUG}").json()["yearFrom"] == 2020
     rows = feed()
     assert len(rows) == 40 and all(r["year"] == 2026 for r in rows)
     assert max(r["score_pct"] for r in rows) == 1.0 and min(r["score_pct"] for r in rows) == 0.0
@@ -659,4 +749,5 @@ def test_an_interests_years_bound_its_feed_and_its_ranking_pool(app, tmp_path):
     # The feed's own "published since" filter narrows further.
     assert len(feed(year_from=2027)) == 0
     assert _request(app, "GET", "/api/radar/daily?year_from=2027").json()["cards"] == []
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2021, "year_to": 2019}}).status_code == 400
+    with _edit(app, SLUG, save=False) as copy:
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2021, "year_to": 2019}}).status_code == 400

@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from rag_lib.db import connect
+from tests.edit_helpers import edit_saved
 from tests.test_private_upload_versions import W, _post, _upload, pdfs  # noqa: F401 -- fixture
 from tests.test_researchers import env  # noqa: F401 -- fixture
 from tests.test_review_round12_isolation import A, B, _request, world  # noqa: F401 -- fixture
@@ -115,8 +116,13 @@ def test_s4_an_upload_another_interest_uses_stays(pdfs):
     _save(pdfs, y)
     d = _draft(pdfs, "S4")
     n = _upload(pdfs, b"note N", A, d)
-    again = _upload(pdfs, b"note N", A, y)
+    # Y is saved: the upload goes into its Edit-interest copy, saved back
+    # onto Y (spec E).
+    with edit_saved(lambda m, p, **kw: _request(pdfs["app"], m, p, headers=A, **kw), y) as copy:
+        again = _upload(pdfs, b"note N", A, copy)
     assert again["duplicate"] and again["id"] == n["id"]
+    assert _q(pdfs, "SELECT s.openalex_id FROM profile_seeds s JOIN profiles p ON p.id = s.profile_id "
+                    "WHERE p.slug = ?", y) == [(n["id"],)]
     path = _q(pdfs, "SELECT local_path FROM paper_uploads WHERE openalex_id = ?", n["id"])[0][0]
 
     _discard(pdfs, d)
@@ -160,10 +166,18 @@ def test_saving_clears_what_the_draft_brought_in(pdfs):
 
 
 def test_an_upload_into_a_saved_interest_is_nobodys(pdfs):
+    """Spec E: a saved interest takes an upload only through its Edit-
+    interest copy; the copy owns it while open, and saving makes it the
+    interest's for good (nothing left in draft_owned)."""
     y = _draft(pdfs, "Y")
     _save(pdfs, y)
-    _upload(pdfs, b"matched P", A, y)
+    r = _post(pdfs, b"matched P", A, y)
+    assert r.status_code == 409 and "Edit interest" in r.json()["detail"]
+    with edit_saved(lambda m, p, **kw: _request(pdfs["app"], m, p, headers=A, **kw), y) as copy:
+        u = _upload(pdfs, b"matched P", A, copy)
+        assert _q(pdfs, "SELECT * FROM draft_owned")
     assert _q(pdfs, "SELECT * FROM draft_owned") == []
+    assert u["id"] in _vault(pdfs)
 
 
 def test_a_discard_that_fails_keeps_the_draft_and_its_uploads(pdfs, monkeypatch):

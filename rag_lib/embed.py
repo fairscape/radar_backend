@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .paper import Paper
+from .pdf_text import lead_text
 
 
 DEFAULT_MAX_TOKENS = 512
@@ -97,7 +98,9 @@ def _build_sections(paper: Paper) -> dict[str, str]:
         "MESH": mesh,
         "KEYWORDS": keywords,
         "SUBSTANCES": substances,
-        "BODY": paper.body_text or "",
+        # A PDF's text from its first paragraph: what stands in for a
+        # missing abstract is not the journal name and the affiliations.
+        "BODY": lead_text(paper.body_text),
     }
 
 

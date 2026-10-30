@@ -16,6 +16,7 @@ import pytest
 
 from rag_lib.db import apply_migrations, connect
 from rag_lib.db.migrate import MIGRATIONS_DIR
+from tests.test_db_migrate import EXPECTED_VERSIONS
 
 TABLES = [
     "users", "profiles", "papers", "paper_embeddings", "profile_seeds",
@@ -102,10 +103,11 @@ def test_0021_to_head_keeps_every_row_and_adds_the_new_rules(db_at_0020):
         before = _counts(conn)
         seq_before = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'profiles'").fetchone()[0]
         assert seq_before == 13
+        cols_before = [r[1] for r in conn.execute("PRAGMA table_info(profiles)")]
         profiles_before = [tuple(r) for r in conn.execute("SELECT * FROM profiles ORDER BY id")]
 
         applied = apply_migrations(conn)
-        assert applied == ["0021_profile_names_per_user", "0022_score_raw_backfill", "0023_researcher_marks", "0024_reserve_all_slug", "0025_bars_on_grid", "0026_merge_duplicate_candidates", "0027_implausible_years", "0028_merge_zenodo_versions", "0029_private_upload_versions", "0030_draft_owned"]
+        assert applied == EXPECTED_VERSIONS[EXPECTED_VERSIONS.index("0021_profile_names_per_user"):]
 
         # 0029: user 2's upload of W1 became their own paper. W1's row had
         # no record of whose file its text was, so its vector (made from
@@ -114,10 +116,14 @@ def test_0021_to_head_keeps_every_row_and_adds_the_new_rules(db_at_0020):
         assert _counts(conn) == before
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        # Same rows, same ids, same column values (0021 copies every column).
+        # Same rows, same ids, same column values (0021 copies every column);
+        # 0033 and 0034 add columns, empty on these rows (none has a researcher's
+        # topics applied, which is what fills ``researcher_doc_json``).
         cols_after = [r[1] for r in conn.execute("PRAGMA table_info(profiles)")]
-        assert len(cols_after) == len(profiles_before[0])
-        assert [tuple(r) for r in conn.execute("SELECT * FROM profiles ORDER BY id")] == profiles_before
+        assert cols_after == cols_before + ["edit_of", "researcher_doc_json", "edit_tab", "edit_seen_at"]
+        old = ", ".join(cols_before)
+        assert [tuple(r) for r in conn.execute(f"SELECT {old} FROM profiles ORDER BY id")] == profiles_before
+        assert conn.execute("SELECT COUNT(*) FROM profiles WHERE edit_of IS NOT NULL OR researcher_doc_json IS NOT NULL").fetchone()[0] == 0
         # Children still point at the surviving parents.
         assert conn.execute("SELECT COUNT(*) FROM profile_candidates pc JOIN profiles p ON p.id = pc.profile_id").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM gather_runs g JOIN profiles p ON p.id = g.profile_id").fetchone()[0] == 3

@@ -357,15 +357,36 @@ def aggregate_draft_topics(
     # Part of the seeds would give part of the topics (step 3 by Back/Forward).
     if gather_runs_repo.has_unfinished_import(conn, profile_id):
         raise ImportInProgress(slug)
-    # Topics we've never seen start on.
+    # Topics we've never seen start on -- but in a copy being edited they
+    # join a saved interest's list, and start off as on its edit page.
+    new_on = not is_edit_copy(row)
     return _write_rebuilt_topics(
-        conn, profile_id, lambda: _aggregate_topics(conn, profile_id, new_on=True),
+        conn, profile_id, lambda: _aggregate_topics(conn, profile_id, new_on=new_on),
     )
 
 
 def _is_draft(conn: sqlite3.Connection, profile_id: int) -> bool | None:
     got = conn.execute("SELECT is_draft FROM profiles WHERE id = ?", (profile_id,)).fetchone()
     return bool(got[0]) if got is not None else None
+
+
+def is_edit_copy(row) -> bool:
+    """A copy of a saved interest made by Edit interest (FUNCTIONAL_SPEC E):
+    a draft row pointing at the interest it copies."""
+    return row is not None and bool(row["is_draft"]) and row["edit_of"] is not None
+
+
+def is_new_draft(row) -> bool:
+    """A draft of a new interest (the wizard's): its topic list follows its
+    seeds, a new topic starts on. A copy being edited is a draft too -- not
+    listed, scanned or scored -- but its topics are a saved interest's."""
+    return row is not None and bool(row["is_draft"]) and row["edit_of"] is None
+
+
+def _follows_seeds(conn: sqlite3.Connection, profile_id: int) -> bool | None:
+    """``is_new_draft`` of the row as stored now; None when it is gone."""
+    row = conn.execute("SELECT is_draft, edit_of FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    return is_new_draft(row) if row is not None else None
 
 
 def _raw_topic_filters(conn: sqlite3.Connection, profile_id: int) -> str | None:
@@ -407,7 +428,7 @@ def _write_rebuilt_topics(conn: sqlite3.Connection, profile_id: int, build) -> d
             if now == seen:
                 conn.execute(
                     "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
-                    (json.dumps(topic_filters), profile_id),
+                    (json.dumps(_without_unmatched_marks(topic_filters)), profile_id),
                 )
                 conn.commit()
                 return topic_filters
@@ -454,18 +475,26 @@ def _aggregate_topics(
     _keep_adopted_topics(stored, topic_filters)
     llm_topics.keep_stored(stored, topic_filters)
 
-    # Best-effort UMLS topic merge: read the per-paper mapped topics
-    # that vault.upload() stored and merge novel ones into the filters.
-    topic_filters = _try_merge_umls_topics(conn, profile_id, topic_filters)
-
     # The researcher's own profile topics, once the user has applied them
     # (``set_researcher_topics``): the list is rebuilt from the seeds every
     # time, so they are folded in again here, from the profile as stored now.
     applied = researcher_topics.is_applied(stored) if profile_topics is None else bool(profile_topics)
     from_profile = _researcher_topics_for(conn, profile_id) if applied else None
+
+    # Best-effort UMLS topic merge: read the per-paper mapped topics
+    # that vault.upload() stored and merge novel ones into the filters.
+    # A topic the profile wants is the interest's already: not a UMLS one.
+    topic_filters = _try_merge_umls_topics(
+        conn, profile_id, topic_filters, also_have=(from_profile or {}).get("wanted") or [])
+    # Before the profile is applied: it marks these as any other topic, and
+    # a mark it has on one is not taken for a mark that vanished.
+    topic_filters = _keep_unmatched_seed_topics(conn, profile_id, stored, topic_filters)
     if from_profile is not None:
         topic_filters[researcher_topics.CHOICES] = researcher_topics.stored_choices(stored, from_profile)
-        topic_filters = researcher_topics.apply(topic_filters, from_profile)
+        # A topic only a removed seed brought still counts as the seeds'
+        # (E.8: removing a seed moves no switch, so neither the not-wanted
+        # default), as in ``_overlap_basis``: the same default either way.
+        topic_filters = researcher_topics.apply(topic_filters, from_profile, basis=topic_filters)
         if from_profile.get("labels_unmapped"):
             # Part of the profile (its text labels) could not be mapped just
             # now: the topics they gave, their marks and states, are kept
@@ -498,7 +527,7 @@ def _aggregate_topics(
                     for t in stored.get("topics") or [] if t.get("id")}
     for t in topic_filters.get("topics") or []:
         if t.get("id"):
-            t["on"] = prior_on.get(t["id"], new_on)
+            t["on"] = prior_on.get(t["id"], _new_topic_on(t, new_on))
             # A topic the profile has an opinion on starts as the profile
             # says when the user has not seen it, or has not seen the
             # profile's opinion on it: a mark new since the stored list (a
@@ -508,10 +537,110 @@ def _aggregate_topics(
             # Either way the state it would have had is remembered, so
             # removing the profile can put it back (``set_researcher_topics``).
             if from_profile is not None and t.get("profile"):
-                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], new_on))
+                t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], _new_topic_on(t, new_on)))
                 if t["id"] not in prior_on or stored_marks.get(researcher_topics.code(t["id"])) != t["profile"]:
                     t["on"] = t["profile"] == researcher_topics.INTEREST
     return topic_filters
+
+
+# A saved topic no seed brings any more (FUNCTIONAL_SPEC T.2-2).
+UNMATCHED = "unmatched"
+# The topics a seed brings: OpenAlex's own (no source), read from an
+# unmatched PDF's text, mapped from its UMLS concepts. A researcher's
+# profile or Claude-generated topics are not the seeds'.
+_SEED_SOURCES = (None, "pdf_content", "umls")
+
+
+def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, stored: dict,
+                                topic_filters: dict) -> dict:
+    """``topic_filters`` plus the saved interest's seed topics the rebuild
+    left out (FUNCTIONAL_SPEC T.2-2, T.2-3).
+
+    The list is rebuilt from the seeds, so removing a seed used to take its
+    topics out of the edit page's list, and the next save took them out of
+    the scans with it: removing a paper and changing what the interest
+    searches are separate choices. A topic no current seed brings stays as
+    saved, on or off, marked ``unmatched``, with no seed counted; the user
+    switches it off. One a seed still brings that this rebuild left out
+    (OpenAlex's beyond the list's length, PDF-text topics switched off)
+    stays too, unmarked -- except a UMLS one, which the merge's own rules
+    (its cap, a surer concept) settle. A new interest's draft still follows
+    its seeds: nothing searches by it yet. A copy being edited is the saved
+    interest's list (FUNCTIONAL_SPEC E).
+    """
+    topics = list(topic_filters.get("topics") or [])
+    for t in topics:
+        t.pop(UNMATCHED, None)
+    if _follows_seeds(conn, profile_id) is not False:
+        return {**topic_filters, "topics": topics} if topics else topic_filters
+    code = researcher_topics.code
+    have_ids = {code(t.get("id")) for t in topics if t.get("id")}
+    have_names = {(t.get("display_name") or "").lower() for t in topics}
+    brought = _seed_topic_codes(conn, profile_id)
+    # Already in the rebuild but no seed's: a stored copy put back as it was
+    # (``_keep_stored_umls`` after a merge that failed).
+    for i, t in enumerate(topics):
+        if t.get("id") and t.get("source") in _SEED_SOURCES and code(t["id"]) not in brought:
+            topics[i] = {**t, "count": 0, "papers": 0, UNMATCHED: True}
+    kept = []
+    for old in stored.get("topics") or []:
+        name = (old.get("display_name") or "").lower()
+        if (not old.get("id") or old.get("source") not in _SEED_SOURCES
+                or code(old["id"]) in have_ids or (name and name in have_names)):
+            continue
+        still = code(old["id"]) in brought
+        if still and old.get("source") == "umls":
+            continue
+        # The researcher's marks are put on by ``researcher_topics.apply``,
+        # which runs on this list next (as on the rest of it).
+        t = {k: v for k, v in old.items() if k not in ("profile", researcher_topics.BEFORE)}
+        if not still:
+            t.update(count=0, papers=0)
+            t[UNMATCHED] = True
+        kept.append(t)
+        have_ids.add(code(t["id"]))
+        have_names.add(name)
+    return {**topic_filters, "topics": [*topics, *kept]}
+
+
+def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int) -> set[str]:
+    """Every topic a current seed brings, as ``researcher_topics.code``: its
+    OpenAlex or PDF-text topics (``topics_json``) and the ones its UMLS
+    concepts map to (``umls_mapped_topics_json``) -- read from the seeds,
+    not from what a rebuild kept."""
+    out: set[str] = set()
+    for oa_id in profiles_repo.list_seed_openalex_ids(conn, profile_id):
+        row = conn.execute("SELECT topics_json, umls_mapped_topics_json FROM papers WHERE openalex_id = ?",
+                           (oa_id,)).fetchone()
+        if row is None:
+            continue
+        for raw, read in ((row[0], lambda d: (d.get("topics") or []) + [d.get("primary_topic")]),
+                          (row[1], lambda d: d)):
+            try:
+                got = read(json.loads(raw)) if raw else []
+            except (ValueError, TypeError, AttributeError):
+                continue
+            for t in got if isinstance(got, list) else []:
+                tid = (t.get("id") or t.get("topic_id")) if isinstance(t, dict) else None
+                if tid:
+                    out.add(researcher_topics.code(tid))
+    return out
+
+
+def _without_unmatched_marks(topic_filters: dict) -> dict:
+    """What is stored: ``unmatched`` is worked out on each aggregation from
+    the seeds of the time, so a stored one would go stale (a seed added back)."""
+    topics = topic_filters.get("topics")
+    if not topics or not any(UNMATCHED in t for t in topics):
+        return topic_filters
+    return {**topic_filters, "topics": [{k: v for k, v in t.items() if k != UNMATCHED} for t in topics]}
+
+
+def _new_topic_on(t: dict, new_on: bool) -> bool:
+    """The state of a topic the list did not have before. A UMLS topic
+    starts off whatever the others do: matched on the words alone, it is
+    the user's to switch on (FUNCTIONAL_SPEC U.2-8)."""
+    return new_on and t.get("source") != "umls"
 
 
 def _keep_stored_profile(stored: dict, topic_filters: dict) -> dict:
@@ -549,6 +678,10 @@ def _stored_topic_filters(conn: sqlite3.Connection, profile_id: int) -> dict:
 
 
 def _has_researcher(conn: sqlite3.Connection, profile_id: int) -> bool:
+    """The interest has a researcher's profile to read: the copy it took
+    when it applied the topics, or the researcher it was built from."""
+    if _researcher_snapshot(conn, profile_id) is not None:
+        return True
     row = conn.execute(
         "SELECT 1 FROM profiles p JOIN researchers r ON r.id = p.researcher_id WHERE p.id = ?",
         (profile_id,),
@@ -614,18 +747,80 @@ def _carry_before_states(stored: dict, topic_filters: dict) -> None:
             t[researcher_topics.BEFORE] = before[t["id"]]
 
 
-def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int) -> dict | None:
-    """The profile topics of the researcher this interest was built from, or
-    None when there is no researcher or their source listed none."""
-    row = conn.execute(
-        "SELECT r.* FROM researchers r JOIN profiles p ON p.researcher_id = r.id WHERE p.id = ?",
+def _researcher_snapshot(conn: sqlite3.Connection, profile_id: int) -> dict | None:
+    """The researcher's profile as the interest took it when it applied the
+    topics (``{"researcher_id", "name", "document"}``), or None.
+
+    A new interest's draft has it only while the researcher is there: the
+    draft is still being built from them, and deleting them takes their
+    topics off it (E.7). Every reader of the copy asks here, so none of them
+    keeps a deleted researcher's topics on a draft."""
+    got = conn.execute(
+        "SELECT p.researcher_doc_json, p.is_draft, p.edit_of, r.id AS rid FROM profiles p"
+        " LEFT JOIN researchers r ON r.id = p.researcher_id WHERE p.id = ?",
         (profile_id,),
     ).fetchone()
-    if row is None:
+    if got is None or not got["researcher_doc_json"]:
         return None
+    if got["is_draft"] and got["edit_of"] is None and got["rid"] is None:
+        return None
+    got = (got["researcher_doc_json"],)
+    try:
+        snap = json.loads(got[0])
+    except (ValueError, TypeError):
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
+def _take_researcher_snapshot(conn: sqlite3.Connection, profile_id: int, rrow: sqlite3.Row) -> None:
+    """Copy the researcher's profile onto the interest, as applying the
+    topics takes it: from then on the interest reads this copy, so a
+    re-import or a delete of the researcher does not change its topics
+    (FUNCTIONAL_SPEC E.7). Committed."""
+    try:
+        document = json.loads(rrow["document_json"]) if rrow["document_json"] else None
+    except (ValueError, TypeError):
+        document = None
+    conn.execute(
+        "UPDATE profiles SET researcher_doc_json = ? WHERE id = ?",
+        (json.dumps({"researcher_id": int(rrow["id"]), "name": rrow["name"], "document": document}), profile_id),
+    )
+    conn.commit()
+
+
+def _researcher_topics_for(conn: sqlite3.Connection, profile_id: int, *, live: bool = False) -> dict | None:
+    """The profile topics of the researcher this interest was built from, or
+    None when there is none or their profile listed none.
+
+    Read from the copy the interest took when it applied them; ``live`` (or
+    no copy yet) reads the researcher as stored now -- what applying them
+    would take."""
+    snap = None if live else _researcher_snapshot(conn, profile_id)
+    if snap is not None:
+        document = snap.get("document")
+        base = researcher_topics.read(document if isinstance(document, dict) else None)
+    else:
+        row = conn.execute(
+            "SELECT r.* FROM researchers r JOIN profiles p ON p.researcher_id = r.id WHERE p.id = ?",
+            (profile_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        base = researcher_topics.from_row(row)
     from ..settings import get_settings
-    view = researcher_topics.with_labels(researcher_topics.from_row(row), settings=get_settings())
+    view = researcher_topics.with_labels(base, settings=get_settings())
     return view if researcher_topics.available(view) else None
+
+
+class SavedInterest(RuntimeError):
+    """A saved interest's seeds change only through its Edit interest copy
+    (FUNCTIONAL_SPEC E.6 R12). Refused in the services, not only by the
+    routes: a route without the check (``POST /draft/{slug}/seeds``) added
+    seeds to a saved interest, refitted and rescored it."""
+
+    def __init__(self, slug: str):
+        super().__init__(f"'{slug}' is a saved interest: change its seeds in Edit interest")
+        self.slug = slug
 
 
 class NoTopicOn(ValueError):
@@ -637,7 +832,9 @@ def drop_profile_topics(conn: sqlite3.Connection, profile_id: int) -> bool:
     marked topics back as they were, profile-only topics gone, flag off.
     Returns whether anything was applied. For forgetting the researcher:
     the not-wanted choices go too, applied or not (``strip`` keeps them for
-    a re-apply, which there will not be).
+    a re-apply, which there will not be). Only a new interest's draft: a
+    saved interest, or one saved meanwhile, keeps the topics it was saved
+    with (E.7).
 
     Read and written under one write lock, so a switch made in another tab
     meanwhile is not undone."""
@@ -645,23 +842,22 @@ def drop_profile_topics(conn: sqlite3.Connection, profile_id: int) -> bool:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # Draft or saved, read under the lock: a commit since the caller
-        # listed the interests makes it a saved one.
-        live = _is_draft(conn, profile_id) is False
-        applied = _drop_profile_topics_locked(conn, profile_id, live=live)
+        # Read under the lock: a commit since the caller listed the drafts
+        # makes it a saved interest, which keeps the topics it was saved
+        # with -- its copy of the profile stays (E.7).
+        row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        live = row is None or not is_new_draft(row)
+        applied = False if live else _drop_profile_topics_locked(conn, profile_id)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    if applied and live:
-        from rag_lib.scheduler.jobs import request_rerank_refresh
-        request_rerank_refresh(profile_id)
     if applied:
         log.info("wizard.researcher_topics_dropped", profile_id=profile_id)
     return applied
 
 
-def _drop_profile_topics_locked(conn: sqlite3.Connection, profile_id: int, *, live: bool) -> bool:
+def _drop_profile_topics_locked(conn: sqlite3.Connection, profile_id: int) -> bool:
     stored = _stored_topic_filters(conn, profile_id)
     if not researcher_topics.is_applied(stored):
         if researcher_topics.CHOICES in stored:
@@ -672,21 +868,11 @@ def _drop_profile_topics_locked(conn: sqlite3.Connection, profile_id: int, *, li
                 (json.dumps(out), profile_id),
             )
         return False
-    if live:
-        # The list is what the user saved the interest with and what every
-        # scan searches by. Forgetting the person does not change it: the
-        # marks go, the profile's topics stay as the interest's own, every
-        # state as it is. Putting the seeds' topics back "as they were" put
-        # a topic the profile had said no to back on and dropped the two
-        # the user had committed with.
-        out = researcher_topics.adopt(stored)
-        log.info("wizard.researcher_topics_adopted", profile_id=profile_id)
-    else:
-        topics = [dict(t) for t in stored.get("topics") or []]
-        for t in topics:
-            _restore_before(t)
-        out = researcher_topics.strip({**stored, "topics": topics})
-        out.pop(researcher_topics.CHOICES, None)
+    topics = [dict(t) for t in stored.get("topics") or []]
+    for t in topics:
+        _restore_before(t)
+    out = researcher_topics.strip({**stored, "topics": topics})
+    out.pop(researcher_topics.CHOICES, None)
     conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now') WHERE id = ?",
         (json.dumps(out), profile_id),
@@ -707,11 +893,22 @@ def researcher_topics_view(conn: sqlite3.Connection, *, user_id: int, slug: str)
     rrow = None
     if row["researcher_id"] is not None:
         rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
-    view = _researcher_topics_for(conn, profile_id) if rrow is not None else None
+    applied = researcher_topics.is_applied(stored)
+    # Applied: the copy the interest took, which stays when the researcher
+    # is re-imported or deleted. Not applied: the researcher as stored now,
+    # which is what applying would take.
+    snap = _researcher_snapshot(conn, profile_id) if applied else None
+    if snap is not None:
+        view = _researcher_topics_for(conn, profile_id)
+        name = rrow["name"] if rrow is not None else snap.get("name")
+    else:
+        view = _researcher_topics_for(conn, profile_id, live=True) if rrow is not None else None
+        name = rrow["name"] if rrow is not None else None
+    present = rrow is not None or snap is not None
     return {
         "researcher_id": int(rrow["id"]) if rrow is not None else None,
-        "researcher_name": rrow["name"] if rrow is not None else None,
-        "applied": bool(rrow is not None and researcher_topics.is_applied(stored)),
+        "researcher_name": name,
+        "applied": bool(present and applied),
         "topics": {"available": view is not None,
                    **researcher_topics.public(view or researcher_topics.read(None)),
                    "not_interest": _not_interest_rows(conn, row, view, stored) if view is not None else []},
@@ -779,13 +976,24 @@ def set_researcher_topics(
     if gather_runs_repo.has_unfinished_import(conn, profile_id):
         raise ImportInProgress(slug)
     if enabled:
-        rrow = None
-        if row["researcher_id"] is not None:
-            rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
-        if rrow is None or _researcher_topics_for(conn, profile_id) is None:
-            raise ValueError(
-                "this interest was not built from a researcher whose profile lists topics"
-            )
+        applied = researcher_topics.is_applied(_stored_topic_filters(conn, profile_id))
+        if applied and _researcher_snapshot(conn, profile_id) is not None:
+            # Applied already (a not-wanted choice, or the same apply again):
+            # the copy it took stands, whatever the researcher is now.
+            if _researcher_topics_for(conn, profile_id) is None:
+                raise ValueError(
+                    "this interest was not built from a researcher whose profile lists topics"
+                )
+        else:
+            rrow = None
+            if row["researcher_id"] is not None:
+                rrow = researchers_repo.get_for_user(conn, user_id, int(row["researcher_id"]))
+            if rrow is None or _researcher_topics_for(conn, profile_id, live=True) is None:
+                raise ValueError(
+                    "this interest was not built from a researcher whose profile lists topics"
+                )
+            # Applying takes the profile as it is now; the interest keeps that.
+            _take_researcher_snapshot(conn, profile_id, rrow)
     for _attempt in range(3):
         # The row again each time: a commit in between makes a draft a saved
         # interest, whose list must not be rebuilt from the seeds.
@@ -826,7 +1034,7 @@ def _set_researcher_topics_once(
         choices = {**researcher_topics.stored_choices(stored, view), c: choice[1]}
         new = researcher_topics.chosen_topic(stored, view, c, choice[1], basis=_overlap_basis(conn, profile_id))
         full = _with_one_topic_from(stored, new, c, choices)
-    elif row["is_draft"]:
+    elif is_new_draft(row):
         full = _researcher_topics_rebuilt(conn, profile_id, enabled=enabled)
     else:
         full = _researcher_topics_on_stored(conn, profile_id, stored, enabled=enabled)
@@ -838,12 +1046,12 @@ def _set_researcher_topics_once(
         kept = full.get("topics") or []
         # On a saved interest the list is what the next scan searches by; a
         # draft's is settled on step 3, which says so when nothing is ticked.
-        if not row["is_draft"] and kept and not any(t.get("on", True) for t in kept):
+        if not is_new_draft(row) and kept and not any(t.get("on", True) for t in kept):
             raise NoTopicOn("removing the profile's topics would leave none on: switch one on first")
     cur = conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now')"
         " WHERE id = ? AND topic_filters_json IS ? AND is_draft = ?",
-        (json.dumps(full), profile_id, raw, row["is_draft"]),
+        (json.dumps(_without_unmatched_marks(full)), profile_id, raw, row["is_draft"]),
     )
     conn.commit()
     if cur.rowcount == 0:
@@ -990,7 +1198,8 @@ def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict
             continue
         raw = prow["topics_json"]
         if versions_repo.is_unmatched(conn, oa_id) and not raw:
-            raw = content_topics.try_topics_json(prow["title"], prow["body_text"], settings=get_settings())
+            raw = content_topics.try_topics_json(prow["title"], prow["abstract"], prow["body_text"],
+                                                 settings=get_settings())
             if raw is not None:
                 conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (raw, oa_id))
                 conn.commit()
@@ -1090,6 +1299,40 @@ def save_topics(
     from rag_lib.scheduler.jobs import request_rerank_refresh
     request_rerank_refresh(profile_id)
     return pruned
+
+
+def scan_outdated(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
+    """Whether the recommendations no longer match the interest: the topics
+    switched on, or the seeds, are not the ones its last successful scan
+    searched and scored with (FUNCTIONAL_SPEC T.2-4, E.2-5). For a copy
+    being edited, its topics and seeds against the saved interest's last
+    scan, or against the saved interest itself when that scan recorded no
+    seeds or topics (E.9). ``{"topics": bool, "seeds": bool}``; for a saved
+    interest, both False with no scan that recorded them."""
+    row = _require_profile(conn, user_id, slug)
+    return outdated(conn, int(row["id"]))
+
+
+def outdated(conn: sqlite3.Connection, profile_id: int) -> dict:
+    """``scan_outdated`` by id."""
+    row = conn.execute("SELECT id, edit_of FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    if row is None:
+        return {"topics": False, "seeds": False}
+    scanned = int(row["edit_of"]) if row["edit_of"] is not None else profile_id
+    last = gather_runs_repo.last_scan(conn, scanned)
+    topics, seeds = last if last is not None else (None, None)
+    if row["edit_of"] is not None:
+        # A copy whose interest's last scan recorded no seeds or topics (it
+        # ran before migration 0032): the interest as saved stands in, so a
+        # seed removed in this edit is still said (FUNCTIONAL_SPEC E.9).
+        if topics is None:
+            topics = enabled_topic_ids(_stored_topic_filters(conn, scanned))
+        if seeds is None:
+            seeds = profiles_repo.list_seed_openalex_ids(conn, scanned)
+    now_topics = set(enabled_topic_ids(_stored_topic_filters(conn, profile_id)))
+    now_seeds = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    return {"topics": topics is not None and now_topics != set(topics),
+            "seeds": seeds is not None and now_seeds != set(seeds)}
 
 
 class NoLlmTopics(ValueError):
@@ -1724,49 +1967,36 @@ def refit_profile(conn: sqlite3.Connection, *, user_id: int, slug: str,
 def remove_seed(
     conn: sqlite3.Connection, *, user_id: int, slug: str, openalex_id: str
 ) -> bool:
-    """Drop one seed from a draft or a live profile.
+    """Drop one seed from a draft: a new interest's, or the copy Edit
+    interest changes. A saved interest's seeds change only through that
+    copy (``SavedInterest``, FUNCTIONAL_SPEC E.6 R12); nothing is refitted
+    here -- the copy's save does not refit either, the next scan does.
 
     Raises ``LookupError`` for an unknown profile and ``ValueError`` when
-    it would leave a live interest with no seed (there would be nothing to
-    fit). Returns False when the paper was not one of its seeds. A live
-    profile is re-fitted at once, so its next scan scores against the
-    seeds it actually has.
+    it would leave a copy with no seed (it becomes the interest, which
+    needs one). Returns False when the paper was not one of its seeds.
+    The topics stay as they were, on or off (FUNCTIONAL_SPEC E.2-3 as
+    revised): the ones no seed left brings are only marked, worked out from
+    the seeds when the list is read (``_keep_unmatched_seed_topics``).
     """
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None:
         raise LookupError(f"profile '{slug}' not found for current user")
+    if not row["is_draft"]:
+        raise SavedInterest(slug)
     profile_id = int(row["id"])
     if gather_runs_repo.has_unfinished_import(conn, profile_id):
         raise ImportInProgress(slug)
     stored = _as_seed_id(conn, profile_id, openalex_id)
     if stored is None:
         return False
-    if not row["is_draft"]:
-        # Checked before anything is written. detach_seed commits at once,
-        # so a refit that then failed -- the remaining seeds all lacking a
-        # vector, say -- used to answer an error with the seed already
-        # gone and the old centroid still in use. Counting seeds was not
-        # enough: what the fit needs is an *embedded* one.
-        if gather_runs_repo.running_scan(conn, profile_id) is not None:
-            # Before the detach: the refit that follows refuses under a
-            # scan, and a refused refit after the detach left the seed
-            # gone, the centroid stale and the request a 500.
-            raise ScanRunning(f"a scan of '{slug}' is still running; remove seeds when it has finished")
-        remaining = [s for s in profiles_repo.list_seed_openalex_ids(conn, profile_id) if s != stored]
-        if not remaining:
-            raise ValueError("an interest needs at least one seed; add another before removing this one")
-        embed_missing(conn, row["embedding_model"], remaining)
-        if not any(embeddings_repo.has(conn, s, row["embedding_model"]) for s in remaining):
-            raise ValueError("none of the remaining seeds can be placed (no vector); add one that can before removing this one")
-    if not profiles_repo.detach_seed(
-        conn, profile_id, stored,
-        keep_embedded=None if row["is_draft"] else row["embedding_model"],
-    ):
+    copy = is_edit_copy(row)
+    if copy and not [s for s in profiles_repo.list_seed_openalex_ids(conn, profile_id) if s != stored]:
+        raise ValueError("an interest needs at least one seed; add another before removing this one")
+    if not profiles_repo.detach_seed(conn, profile_id, stored, keep_embedded=None):
         if _as_seed_id(conn, profile_id, openalex_id) is None:
             return False  # removed meanwhile, in another tab
         raise ValueError("an interest needs at least one seed that can be placed; add another before removing this one")
-    if not row["is_draft"]:
-        refit_profile(conn, user_id=user_id, slug=slug)
     return True
 
 
@@ -1778,8 +2008,13 @@ def remove_seed(
 def _require_draft(
     conn: sqlite3.Connection, user_id: int, slug: str
 ) -> sqlite3.Row:
+    """A new interest's draft: what the wizard's own routes (coherence,
+    topics, dry-run, seeds, save) take. An Edit interest copy is a draft
+    too, but not one of these: saving it as a new interest made a second
+    "X (editing)" interest that kept the original locked (spec E). It is
+    changed through the interest routes and saved with save-edit."""
     row = profiles_repo.get_by_slug(conn, user_id, slug)
-    if row is None or not row["is_draft"]:
+    if row is None or not is_new_draft(row):
         raise LookupError(f"draft '{slug}' not found")
     return row
 
@@ -2192,6 +2427,15 @@ def _keep_stored_umls(conn: sqlite3.Connection, profile_id: int, topic_filters: 
             if t.get("source") == "umls" and t.get("id") and t["id"] not in have
             # Topics stored before ``seeds`` was recorded are kept as before.
             and (unread is None or not t.get("seeds") or unread & set(t["seeds"]))]
+    # Within the same bounds as a merge: a name the list has is not added
+    # twice, and the interest keeps at most MAX_TOPIC_ADDITIONS UMLS topics
+    # (the stored ones are in the merge's order, surest first).
+    from ..settings import get_settings
+
+    names = {(t.get("display_name") or "").lower() for t in topic_filters.get("topics") or []}
+    room = get_settings().RADAR_UMLS_MAX_TOPIC_ADDITIONS - sum(
+        t.get("source") == "umls" for t in topic_filters.get("topics") or [])
+    keep = [t for t in keep if (t.get("display_name") or "").lower() not in names][:max(room, 0)]
     if not keep:
         return topic_filters
     # The researcher's marks are put on afresh by ``_aggregate_topics`` when
@@ -2206,11 +2450,12 @@ def _try_merge_umls_topics(
     conn: sqlite3.Connection,
     profile_id: int,
     topic_filters: dict,
+    also_have: list[dict] | None = None,
 ) -> dict:
     """``_merge_umls_topics``, never raising; records how it went (``umls_topics_state``)."""
     state = {"available": True, "reason": None, "n": 0}
     try:
-        merged = _merge_umls_topics(conn, profile_id, topic_filters, state)
+        merged = _merge_umls_topics(conn, profile_id, topic_filters, state, also_have)
     except Exception as exc:  # noqa: BLE001
         locked = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
         state.update(available=False, reason="busy" if locked else "error", n=0)
@@ -2225,11 +2470,42 @@ def _try_merge_umls_topics(
     return merged
 
 
+def forget_stale_umls_mappings(conn: sqlite3.Connection, seed_ids: list[str]) -> None:
+    """Send back to extraction the seeds whose stored topic mapping was made
+    by the earlier rules (``topic_mapper.stale_mapping``): the topics are now
+    chosen on the concepts' confidence, which those did not record."""
+    from ...umls.topic_mapper import stale_mapping
+
+    stale = []
+    for oa_id in seed_ids:
+        row = conn.execute("SELECT umls_concepts_json, umls_mapped_topics_json FROM papers WHERE openalex_id = ?",
+                           (oa_id,)).fetchone()
+        if row is None or row[0] is None:
+            continue      # not extracted yet
+        try:
+            concepts = json.loads(row[0])
+            entries = json.loads(row[1]) if row[1] else []
+        except ValueError:
+            continue      # unreadable: the merge marks it as bad data
+        # Concepts and no mapping at all: the earlier rules found no topic
+        # near enough to any of them (now each concept has its nearest).
+        if (row[1] is None and concepts) or (
+                isinstance(entries, list) and stale_mapping([e for e in entries if isinstance(e, dict)])):
+            stale.append(oa_id)
+    if stale:
+        conn.executemany(
+            "UPDATE papers SET umls_concepts_json = NULL, umls_mapped_topics_json = NULL "
+            "WHERE openalex_id = ?", [(oa,) for oa in stale])
+        conn.commit()
+        log.info("wizard.umls_stale_mappings", n=len(stale))
+
+
 def _merge_umls_topics(
     conn: sqlite3.Connection,
     profile_id: int,
     topic_filters: dict,
     state: dict,
+    also_have: list[dict] | None = None,
 ) -> dict:
     """Best-effort merge of UMLS-mapped topics into topic_filters.
 
@@ -2267,6 +2543,7 @@ def _merge_umls_topics(
     if not seed_ids:
         return topic_filters
 
+    forget_stale_umls_mappings(conn, seed_ids)
     _extract_missing_umls(conn, settings, seed_ids)
 
     from .vault import _recently_failed
@@ -2293,6 +2570,7 @@ def _merge_umls_topics(
                     similarity=e["similarity"],
                     source_cui=e["source_cui"],
                     source_name=e["source_name"],
+                    confidence=e["confidence"],
                 )
                 for e in json.loads(raw)
             ])
@@ -2322,21 +2600,18 @@ def _merge_umls_topics(
     _merged = merge_umls_topics(
         topic_filters,
         umls_per_paper,
+        min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
+        per_paper=settings.RADAR_UMLS_TOPICS_PER_PAPER,
         max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
         cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+        also_have=also_have,
     )
 
-    # Which seeds each UMLS topic came from, so that a later merge that
-    # cannot read some seeds keeps only their topics (_keep_stored_umls).
-    by_topic: dict[str, list[str]] = {}
-    for oa, mts in zip(paper_ids, umls_per_paper):
-        for mt in mts:
-            by_topic.setdefault(mt.topic_id, [])
-            if oa not in by_topic[mt.topic_id]:
-                by_topic[mt.topic_id].append(oa)
+    # Which seeds chose each UMLS topic, so that a later merge that cannot
+    # read some seeds keeps only their topics (_keep_stored_umls).
     for t in _merged.get("topics") or []:
-        if t.get("source") == "umls" and t.get("id") in by_topic:
-            t["seeds"] = by_topic[t["id"]]
+        if t.get("source") == "umls" and "papers" in t:
+            t["seeds"] = [paper_ids[i] for i in t.pop("papers")]
     return _keep_stored_umls(conn, profile_id, _merged, unread) if unread else _merged
 
 

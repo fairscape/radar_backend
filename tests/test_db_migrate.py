@@ -59,6 +59,10 @@ EXPECTED_VERSIONS = [
     "0028_merge_zenodo_versions",
     "0029_private_upload_versions",
     "0030_draft_owned",
+    "0031_abstract_source",
+    "0032_scan_topic_ids",
+    "0033_edit_copies",
+    "0034_edit_lock",
 ]
 
 

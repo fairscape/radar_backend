@@ -21,6 +21,7 @@ from rag_lib.db.repos import (
     profiles as profiles_repo,
     users as users_repo,
 )
+from tests.edit_helpers import edit_saved
 from tests.test_prosopia_import import StubProsopia, _stub_profile
 from tests.test_researcher_marks import _both_stubs
 from tests.test_researchers import _app, _request, env  # noqa: F401 -- fixture
@@ -96,15 +97,33 @@ def _ok(r, *codes):
     return r
 
 
+def _edit(app, slug, headers, **kw):
+    """Edit interest on saved ``slug``: a saved interest changes only on
+    this copy, saved in one go (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda method, path, **k: _request(app, method, path, headers=headers, **k), slug, **kw)
+
+
+def profiles_seeds(env, slug) -> list[str]:
+    conn = connect(env)
+    try:
+        return sorted(profiles_repo.list_seed_openalex_ids(conn, int(conn.execute(
+            "SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0])))
+    finally:
+        conn.close()
+
+
 def test_feed_paper_becomes_seed_and_back(app, env):
     slug, cards = _live(env, "alice@example.com")
     c1 = cards[0]
     _ok(_request(app, "POST", "/api/radar/cards/save", json={"card_id": c1, "profile": slug, "on": True}, headers=A))
     feed = _ok(_request(app, "GET", f"/api/radar/daily?profile={slug}", headers=A)).json()
     assert feed["states"][c1] == "saved"
-    # The feed paper can be a seed (owned through its candidate row).
-    r = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [c1]}, headers=A)).json()
-    assert r == {"attached": 1, "rejected": [], "rescored": r["rescored"]}
+    # The feed paper can be a seed (owned through its candidate row) -- added
+    # in Edit interest and saved (FUNCTIONAL_SPEC E; the feed's own "add as
+    # seed" is gone, E.7 R1).
+    with _edit(app, slug, A) as copy:
+        r = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [c1]}, headers=A)).json()
+        assert r == {"attached": 1, "rejected": [], "rescored": r["rescored"]}
     feed = _ok(_request(app, "GET", f"/api/radar/daily?profile={slug}", headers=A)).json()
     assert c1 not in {c["id"] for c in feed["cards"]}          # a seed is not shown to itself
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail", headers=A)).json()
@@ -118,16 +137,25 @@ def test_feed_paper_becomes_seed_and_back(app, env):
     dry = _ok(_request(app, "POST", f"/api/profiles/{slug}/dry-run", headers=A)).json()
     assert c1 not in {p["id"] for p in dry["papers"]} and dry["n"] == 5
     # And back out again: the candidate row (still saved) returns to the feed.
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds?openalex_id={c1}", headers=A))
+    with _edit(app, slug, A) as copy:
+        _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds?openalex_id={c1}", headers=A))
     feed = _ok(_request(app, "GET", f"/api/radar/daily?profile={slug}", headers=A)).json()
     assert feed["states"][c1] == "saved"
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail", headers=A)).json()
     assert len(detail["seeds"]) == 3 and detail["profile"]["seeds"] == 3
-    # Removing down to the last seed is refused; the one before it is fine.
-    for s in [d["id"] for d in detail["seeds"]][:2]:
-        _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds?openalex_id={s}", headers=A))
-    last = _request(app, "GET", f"/api/profiles/{slug}/detail", headers=A).json()["seeds"][0]["id"]
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds?openalex_id={last}", headers=A), 409)
+    # Removing down to the last seed is fine; an interest with none is not,
+    # on the Edit interest copy as on the interest (FUNCTIONAL_SPEC E).
+    with _edit(app, slug, A) as copy:
+        for s in [d["id"] for d in detail["seeds"]][:2]:
+            _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds?openalex_id={s}", headers=A))
+    assert len(_request(app, "GET", f"/api/profiles/{slug}/detail", headers=A).json()["seeds"]) == 1
+    with _edit(app, slug, A, save=False) as copy:
+        left = profiles_seeds(env, copy)
+        assert len(left) == 1
+        r = _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds?openalex_id={left[0]}", headers=A), 409)
+        assert "at least one seed" in r.json()["detail"]
+        assert profiles_seeds(env, copy) == left
+    assert len(_request(app, "GET", f"/api/profiles/{slug}/detail", headers=A).json()["seeds"]) == 1
     # A below-threshold card can still be saved, and then shows in the vault.
     low = cards[-1]
     _ok(_request(app, "POST", "/api/radar/cards/save", json={"card_id": low, "profile": slug, "on": True}, headers=A))
@@ -138,15 +166,19 @@ def test_feed_paper_becomes_seed_and_back(app, env):
 
 def test_patch_threshold_and_years_validation(app, env):
     slug, _ = _live(env, "alice@example.com")
-    p = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 0.6, "years": {"year_from": 2020, "year_to": None}}, headers=A)).json()
-    assert p["threshold"] == 0.6 and p["yearFrom"] == 2020 and p["yearTo"] is None
-    p = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": None, "year_to": None}}, headers=A)).json()
-    assert p["yearFrom"] is None and p["yearTo"] is None and p["threshold"] == 0.6
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2030, "year_to": None}}, headers=A), 400)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A), 400)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 1.5}, headers=A), 422)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": "nan"}, headers=A), 422)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={}, headers=A), 400)
+    # Threshold and years change on the Edit interest copy (FUNCTIONAL_SPEC E).
+    with _edit(app, slug, A) as copy:
+        p = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 0.6, "years": {"year_from": 2020, "year_to": None}}, headers=A)).json()
+        assert p["threshold"] == 0.6 and p["yearFrom"] == 2020 and p["yearTo"] is None
+        p = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": None}}, headers=A)).json()
+        assert p["yearFrom"] is None and p["yearTo"] is None and p["threshold"] == 0.6
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2030, "year_to": None}}, headers=A), 400)
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A), 400)
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 1.5}, headers=A), 422)
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": "nan"}, headers=A), 422)
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={}, headers=A), 400)
+    p = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail", headers=A)).json()["profile"]
+    assert p["threshold"] == 0.6 and p["yearFrom"] is None and p["yearTo"] is None
     _ok(_request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_from": 1800}, headers=A), 400, 503)
     _ok(_request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_to": 2020}, headers=A), 400, 503)
 
@@ -168,12 +200,17 @@ def test_forget_under_a_live_interest_then_import_again(app, env):
     assert len(detail["seeds"]) == 5 and detail["profile"]["researcherId"] is None
     rt = _ok(_request(app, "GET", f"/api/profiles/{slug}/researcher-topics", headers=A)).json()
     assert rt["researcher_id"] is None and rt["applied"] is False
-    _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}, headers=A), 400)
-    _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}, headers=A))
+    # Changes go to the Edit interest copy (FUNCTIONAL_SPEC E).
+    with _edit(app, slug, A) as copy:
+        _ok(_request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": True}, headers=A), 400)
+        _ok(_request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": False}, headers=A))
+        for path in ("recompute-coherence", "recompute-topics"):
+            _ok(_request(app, "POST", f"/api/profiles/{copy}/{path}", headers=A))
+        # The copy is not fitted (the next scan fits the interest, E.4 Q5).
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/refit", headers=A), 400)
     assert _ok(_request(app, "GET", "/api/vault/stats", headers=A)).json()["docs"] == 5    # seeds stay in the vault
     assert len(_ok(_request(app, "GET", f"/api/vault/docs?tag={slug}", headers=A)).json()) == 5
-    for path in ("refit", "recompute-coherence", "recompute-topics", "dry-run"):
-        _ok(_request(app, "POST", f"/api/profiles/{slug}/{path}", headers=A))
+    _ok(_request(app, "POST", f"/api/profiles/{slug}/dry-run", headers=A))
     _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview", headers=A))
     _ok(_request(app, "GET", f"/api/profiles/{slug}/runs", headers=A))
 
@@ -185,8 +222,9 @@ def test_forget_under_a_live_interest_then_import_again(app, env):
     assert _ok(_request(app, "GET", "/api/vault/stats", headers=A)).json()["docs"] == 5
     # The old interest's seeds can be re-attached from the new researcher's papers.
     ids = [p["id"] for p in det["papers"]]
-    r = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": ids}, headers=A)).json()
-    assert r["attached"] == 0 and r["rejected"] == []
+    with _edit(app, slug, A) as copy:
+        r = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": ids}, headers=A)).json()
+        assert r["attached"] == 0 and r["rejected"] == []
     # Marks and order with the new row.
     _ok(_request(app, "PATCH", f"/api/researchers/{r2['researcher_id']}", json={"mark": "self"}, headers=A))
     _ok(_request(app, "PUT", "/api/researchers/order", json={"ids": [r2["researcher_id"]]}, headers=A))

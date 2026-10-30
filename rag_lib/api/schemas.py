@@ -140,6 +140,10 @@ class VaultDoc(_Model):
     version: int | None = None
     # Upload response only: this user had already uploaded these bytes.
     duplicate: bool | None = None
+    abstract: str | None = None
+    # 'pdf': read from this user's uploaded file (OpenAlex has none);
+    # None: OpenAlex's, or no abstract (FUNCTIONAL_SPEC P.5 Q2).
+    abstractSource: str | None = None
 
 
 class Seed(_Model):
@@ -201,6 +205,51 @@ class Topic(_Model):
     profile: str | None = None
     # ``source: llm``: the research topic it was mapped from (rag_lib/llm_topics.py).
     llm_label: str | None = None
+    # ``source: umls``: the UMLS concept it was mapped from, and that
+    # concept's confidence (rag_lib.umls.topic_mapper.merge_umls_topics).
+    umls_concept: str | None = None
+    umls_confidence: float | None = None
+    # A saved interest's topic that no seed brings any more (a seed removed
+    # since): kept as saved (FUNCTIONAL_SPEC T.2-2). Set on the edit page's
+    # list (``topics/preview``); None elsewhere.
+    unmatched: bool | None = None
+
+
+class ScanTopics(_Model):
+    """``GET /api/profiles/{key}/scan-topics``: whether the recommendations
+    still match (FUNCTIONAL_SPEC T.2-4, E.2-5). For a copy being edited,
+    its topics and seeds against the saved interest's last scan."""
+
+    # Either below.
+    changed: bool
+    # The topics on now are not the ones the last scan searched.
+    topics: bool = False
+    # The seeds are not the ones the last scan scored with.
+    seeds: bool = False
+
+
+class EditCopy(_Model):
+    """``POST /api/profiles/{key}/edit``: the copy Edit interest changes
+    (FUNCTIONAL_SPEC E). ``slug`` is the copy's, for every step's calls;
+    ``editOf`` the saved interest's."""
+
+    slug: str
+    editOf: str
+
+
+class EditTab(_Model):
+    """The tab an Edit interest page runs in: an id the page keeps for the
+    life of its tab (a reload keeps it). A copy belongs to the tab that
+    opened it (FUNCTIONAL_SPEC E.7 R5)."""
+
+    tab: str = Field(default="", max_length=64)
+
+
+class EditCopyState(_Model):
+    """``GET /api/profiles/edit/{slug}``: whether the copy differs from the
+    interest it copies (the edit page asks before leaving)."""
+
+    changed: bool
 
 
 class LlmTopicsResult(_Model):

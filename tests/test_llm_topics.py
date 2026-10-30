@@ -14,6 +14,7 @@ import numpy as np
 from rag_lib import llm_topics
 from rag_lib.llm_topics import LabelMatch
 from rag_lib.openalex_tiers import enabled_topic_ids
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
     _go_live, _ok, _q, _request, app, env,
 )
@@ -100,6 +101,10 @@ def _stored(env, slug):
     return json.loads(_q(env, "SELECT topic_filters_json FROM profiles WHERE slug = ?", slug)[0][0])
 
 
+def _call(app):
+    return lambda method, path, **kw: _request(app, method, path, **kw)
+
+
 def test_the_route_adds_llm_topics_off_and_a_rebuild_keeps_them(app, env, monkeypatch):
     slug, _ = _go_live(app, env, "LLM One")
     calls = []
@@ -110,34 +115,42 @@ def test_the_route_adds_llm_topics_off_and_a_rebuild_keeps_them(app, env, monkey
                 _m(9002, "Speech and Audio Processing", labels[1], 0.81)]
     monkeypatch.setattr(llm_topics, "map_labels", fake_map)
 
-    # Nothing generated yet, then a list the cluster method made: refused.
-    r = _request(app, "POST", f"/api/profiles/{slug}/llm-topics")
-    assert r.status_code == 409, r.text
-    _set_terms(env, slug, source="rp-sdk-cluster")
-    assert _request(app, "POST", f"/api/profiles/{slug}/llm-topics").status_code == 409
-    assert calls == []
+    # A saved interest changes only on its Edit interest copy (FUNCTIONAL_SPEC E).
+    with edit_saved(_call(app), slug) as copy:
+        # Nothing generated yet, then a list the cluster method made: refused.
+        r = _request(app, "POST", f"/api/profiles/{copy}/llm-topics")
+        assert r.status_code == 409 and "Edit interest" not in r.text, r.text
+        _set_terms(env, copy, source="rp-sdk-cluster")
+        r = _request(app, "POST", f"/api/profiles/{copy}/llm-topics")
+        assert r.status_code == 409 and "Edit interest" not in r.text, r.text
+        assert calls == []
 
-    _set_terms(env, slug)
-    before = enabled_topic_ids(_stored(env, slug))
-    res = _ok(_request(app, "POST", f"/api/profiles/{slug}/llm-topics"))
-    assert calls == [["Dementia & Cognitive Impairment", "Speech Analysis"]]
-    assert [(t["name"], t["source"], t["on"], t["llm_label"]) for t in res["added"]] == [
-        ("Dementia and Cognitive Impairment Research", "llm", False, "Dementia & Cognitive Impairment"),
-        ("Speech and Audio Processing", "llm", False, "Speech Analysis"),
-    ]
-    # Off: the next scan searches exactly what it did before.
-    assert enabled_topic_ids(_stored(env, slug)) == before
+        _set_terms(env, copy)
+        before = enabled_topic_ids(_stored(env, copy))
+        assert before == enabled_topic_ids(_stored(env, slug))
+        res = _ok(_request(app, "POST", f"/api/profiles/{copy}/llm-topics"))
+        assert calls == [["Dementia & Cognitive Impairment", "Speech Analysis"]]
+        assert [(t["name"], t["source"], t["on"], t["llm_label"]) for t in res["added"]] == [
+            ("Dementia and Cognitive Impairment Research", "llm", False, "Dementia & Cognitive Impairment"),
+            ("Speech and Audio Processing", "llm", False, "Speech Analysis"),
+        ]
+        # Off: the next scan searches exactly what it did before.
+        assert enabled_topic_ids(_stored(env, copy)) == before
 
-    # The list rebuilt from the seeds (Recompute) keeps them, still off.
-    _ok(_request(app, "POST", f"/api/profiles/{slug}/recompute-topics"))
-    llm = [t for t in _stored(env, slug)["topics"] if t.get("source") == "llm"]
-    assert [(t["id"], t["on"]) for t in llm] == [(f"{T}9001", False), (f"{T}9002", False)]
+        # The list rebuilt from the seeds (Recompute) keeps them, still off.
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/recompute-topics"))
+        llm = [t for t in _stored(env, copy)["topics"] if t.get("source") == "llm"]
+        assert [(t["id"], t["on"]) for t in llm] == [(f"{T}9001", False), (f"{T}9002", False)]
 
-    # Switched on with the rest, it is searched by -- and stays on through a rebuild.
-    _ok(_request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": before + [f"{T}9001"]}))
-    _ok(_request(app, "POST", f"/api/profiles/{slug}/recompute-topics"))
+        # Switched on with the rest, it is searched by -- and stays on through a rebuild.
+        _ok(_request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": before + [f"{T}9001"]}))
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/recompute-topics"))
+        assert f"{T}9001" in enabled_topic_ids(_stored(env, copy))
+    # Saved: the interest searches by it, not by the one left off.
     assert f"{T}9001" in enabled_topic_ids(_stored(env, slug))
     assert f"{T}9002" not in enabled_topic_ids(_stored(env, slug))
+    llm = [t for t in _stored(env, slug)["topics"] if t.get("source") == "llm"]
+    assert [(t["id"], t["on"]) for t in llm] == [(f"{T}9001", True), (f"{T}9002", False)]
 
     # The interest page lists them with their source and label.
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
@@ -153,6 +166,10 @@ def test_an_unavailable_topic_index_is_a_503_and_changes_nothing(app, env, monke
     def broken(*a, **k):
         raise FileNotFoundError("no topic index in data/umls_cache")
     monkeypatch.setattr(llm_topics, "map_labels", broken)
-    r = _request(app, "POST", f"/api/profiles/{slug}/llm-topics")
-    assert r.status_code == 503, r.text
+    # On the Edit interest copy (FUNCTIONAL_SPEC E); left without saving.
+    with edit_saved(_call(app), slug, save=False) as copy:
+        copy_before = _stored(env, copy)
+        r = _request(app, "POST", f"/api/profiles/{copy}/llm-topics")
+        assert r.status_code == 503, r.text
+        assert _stored(env, copy) == copy_before
     assert _stored(env, slug) == before

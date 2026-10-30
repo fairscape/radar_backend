@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from rag_lib.db import connect
 from rag_lib.scheduler import jobs as scheduler_jobs
+from tests.edit_helpers import edit_saved
 from tests.fixture_gatherer import FixtureGatherer
 from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
     _feed, _go_live, _ok, _one, _q, _request, _scan, app, env,
 )
+
+
+def _set_years(app, slug, year_from, year_to):
+    """In Edit interest, saved (FUNCTIONAL_SPEC E): a saved interest's own
+    PATCH is refused; saving new years re-decides the feed."""
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": year_from, "year_to": year_to}}))
 
 
 class _RecentGatherer(FixtureGatherer):
@@ -23,7 +31,7 @@ class _RecentGatherer(FixtureGatherer):
 def test_scan_new_count_ignores_interest_years(app, env, monkeypatch):
     slug, _ = _go_live(app, env, threshold=0.0)
     # The interest only recommends 2015-2020.
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2015, "year_to": 2020}}))
+    _set_years(app, slug, 2015, 2020)
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer",
                         lambda **kw: _RecentGatherer(seed=9, n_candidates=10))
     run_id = _scan(app, slug)["run_id"]
@@ -39,7 +47,7 @@ def test_scan_new_count_ignores_interest_years(app, env, monkeypatch):
 
 def test_scan_out_of_years_papers_are_kept_but_not_counted_or_credited(app, env, monkeypatch):
     slug, _ = _go_live(app, env, threshold=0.0)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2015, "year_to": 2020}}))
+    _set_years(app, slug, 2015, 2020)
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer",
                         lambda **kw: _RecentGatherer(seed=9, n_candidates=10))
     run_id = _scan(app, slug)["run_id"]
@@ -60,6 +68,6 @@ def test_scan_out_of_years_papers_are_kept_but_not_counted_or_credited(app, env,
 
     assert credited() == 0
     # Widening the years brings them into the feed, and into the topic's yield.
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": None, "year_to": None}}))
+    _set_years(app, slug, None, None)
     assert any(c["date"].startswith("2026") for c in _feed(app, slug)["cards"])
     assert credited() > 0

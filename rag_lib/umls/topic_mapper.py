@@ -31,16 +31,29 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class MappedTopic:
-    """An OpenAlex topic matched from a UMLS concept."""
+    """The OpenAlex topic nearest to one UMLS concept of a paper."""
 
     topic_id: str  # e.g. "https://openalex.org/T12345"
     display_name: str
-    similarity: float
+    similarity: float  # concept name to topic name; shown, not used to choose
     source_cui: str  # which UMLS concept triggered this match
     source_name: str  # UMLS concept name for traceability
+    # The concept's confidence (how surely the text's words are this
+    # concept): what the topics are chosen by (merge_umls_topics). None
+    # in a mapping stored before it was recorded (stale_mapping).
+    confidence: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+# How the UMLS topics of an interest are chosen (FUNCTIONAL_SPEC U.2):
+# from each seed, its concepts of CONFIDENCE or more, each with its one
+# nearest topic, PER_PAPER of them by confidence; at most MAX_TOPICS for
+# the interest, by confidence. They are added switched off.
+CONFIDENCE = 0.9
+PER_PAPER = 5
+MAX_TOPICS = 20
 
 
 # ---------------------------------------------------------------------------
@@ -51,35 +64,14 @@ class MappedTopic:
 def map_concepts_to_topics(
     concepts: list[UmlsConcept],
     *,
-    min_similarity: float = 0.40,
-    top_k: int = 3,
     embedding_model: str = "mxbai-embed-large",
     cache_dir: str | None = None,
 ) -> list[MappedTopic]:
-    """Map UMLS concepts to OpenAlex topics via embedding similarity.
+    """Each concept's nearest OpenAlex topic, by embedding its name.
 
-    For each concept, embeds its canonical name, searches the topic
-    index for the top-k most similar topics, and returns all matches
-    above min_similarity. Results are deduplicated by topic_id (keeping
-    the highest similarity).
-
-    Parameters
-    ----------
-    concepts:
-        UmlsConcept list from extract_umls_concepts().
-    min_similarity:
-        Minimum cosine similarity to keep a mapping.
-    top_k:
-        Number of top matches per concept to consider.
-    embedding_model:
-        Embedder key (must be registered in rag_lib.embedders).
-    cache_dir:
-        Directory containing the topic index files.
-
-    Returns
-    -------
-    List of MappedTopic, deduplicated by topic_id, sorted by similarity
-    descending.
+    One entry per concept, in the order given, however near or far the
+    topic is: which of them an interest gets is decided on the concepts'
+    confidence (merge_umls_topics), not on this similarity.
     """
     if not concepts or not cache_dir:
         return []
@@ -90,33 +82,28 @@ def map_concepts_to_topics(
     index = get_topic_index(cache_dir)
     index.check_compatible(embedding_model)
 
-    # Collect all mappings, dedup by topic_id (keep highest similarity)
-    best: dict[str, MappedTopic] = {}
-
+    out: list[MappedTopic] = []
     for concept in concepts:
-        # Embed the UMLS concept name
         vec = np.array(embedder(concept.name), dtype=np.float32)
         # An index without META_FILE can still be caught on dimension
         # (a bare matmul error said nothing about why).
         index.check_compatible(embedding_model, dim=int(vec.shape[-1]))
-
-        # Search topic index
-        matches = index.search(vec, top_k=top_k, min_similarity=min_similarity)
-
-        for topic_dict, sim in matches:
-            tid = topic_dict["id"]
-            if tid in best and best[tid].similarity >= sim:
-                continue
-            best[tid] = MappedTopic(
-                topic_id=tid,
+        for topic_dict, sim in index.search(vec, top_k=1, min_similarity=-1.0):
+            out.append(MappedTopic(
+                topic_id=topic_dict["id"],
                 display_name=topic_dict["display_name"],
                 similarity=round(sim, 4),
                 source_cui=concept.cui,
                 source_name=concept.name,
-            )
+                confidence=round(float(concept.confidence), 4),
+            ))
+    return out
 
-    results = sorted(best.values(), key=lambda m: m.similarity, reverse=True)
-    return results
+
+def stale_mapping(entries: list[dict]) -> bool:
+    """A stored ``umls_mapped_topics_json`` made by the earlier mapping
+    (three topics a concept, no confidence): it is mapped again."""
+    return any("confidence" not in e for e in entries)
 
 
 def _name_similarity(a: str, b: str) -> float:
@@ -174,16 +161,27 @@ def merge_umls_topics(
     base_filters: dict[str, Any],
     umls_topics_per_paper: list[list[MappedTopic]],
     *,
-    max_additions: int = 4,
+    min_confidence: float = CONFIDENCE,
+    per_paper: int = PER_PAPER,
+    max_additions: int = MAX_TOPICS,
     cache_dir: str | None = None,
+    also_have: list[dict] | None = None,
 ) -> dict[str, Any]:
-    """Merge UMLS-mapped topics into existing topic_filters.
+    """``base_filters`` with the UMLS topics of its seeds appended, switched
+    off (FUNCTIONAL_SPEC U.2).
 
-    Takes the base topic_filters dict (from Profile.aggregate_topic_filters)
-    and a list of per-paper MappedTopic lists. Counts how often each
-    UMLS-mapped topic appears across papers, excludes topics already
-    present in the base filters (by ID, name, or embedding proximity),
-    and appends the top ``max_additions`` new topics.
+    Chosen on the concepts' confidence alone. In each seed, the concepts
+    of ``min_confidence`` or more, by confidence: one whose topic the
+    interest already has (same id or name, or an embedding cosine of
+    _DEDUP_COSINE_THRESHOLD or more to one of ``base_filters``' topics)
+    is skipped, and so is one whose topic a concept of the same seed
+    already gave; ``per_paper`` are taken. The seeds' topics together:
+    each once (same id, or the same name under another id), with its best
+    confidence; ``max_additions`` of them, by confidence.
+
+    Each entry carries the concept it came from (``concept``, its
+    ``confidence``), how many seeds chose it (``count``) and which
+    (``papers``: their indexes in ``umls_topics_per_paper``).
 
     Parameters
     ----------
@@ -191,9 +189,10 @@ def merge_umls_topics(
         The existing topic_filters dict with keys "topics", "subfields",
         "fields", "domains".
     umls_topics_per_paper:
-        One list of MappedTopic per seed paper.
-    max_additions:
-        Maximum number of new topics to add.
+        One list of MappedTopic per seed paper (map_concepts_to_topics).
+    also_have:
+        Topics (``id``, ``display_name``) the interest has that are not in
+        ``base_filters``: the researcher profile's wanted ones.
     cache_dir:
         Directory holding the OpenAlex topic embedding index. When given,
         near-duplicate detection compares topic *embeddings* (cosine)
@@ -202,8 +201,7 @@ def merge_umls_topics(
 
     Returns
     -------
-    A new topic_filters dict with UMLS topics appended to the "topics"
-    list. Does not modify base_filters in place.
+    A new topic_filters dict. Does not modify base_filters in place.
     """
     if not umls_topics_per_paper:
         return dict(base_filters)
@@ -218,105 +216,69 @@ def merge_umls_topics(
                 "falling back to word-overlap similarity", exc,
             )
 
-    # Existing topics as (id, name) so we can compare by embedding, not
-    # just by exact string match.
     existing = [
         (t["id"], t.get("display_name") or "")
-        for t in base_filters.get("topics", [])
+        for t in [*(base_filters.get("topics") or []), *(also_have or [])]
         if t.get("id")
     ]
     existing_ids = {tid for tid, _ in existing}
-    existing_names_lower = {n.lower() for _, n in existing if n}
+    existing_names = {n.lower() for _, n in existing if n}
+    known: dict[str, bool] = {}     # topic id -> the interest has it already
 
-    # Count how often each UMLS-mapped topic appears across papers
-    topic_counter: Counter[str] = Counter()
-    topic_info: dict[str, MappedTopic] = {}  # keep best similarity
+    def has_already(mt: MappedTopic) -> bool:
+        if mt.topic_id not in known:
+            known[mt.topic_id] = (
+                mt.topic_id in existing_ids
+                or mt.display_name.lower() in existing_names
+                # Synonyms such as "Renal Diseases and Glomerulopathies" vs
+                # "Renal and Vascular Pathologies". Not applied between
+                # the UMLS topics themselves: siblings within one field
+                # measure 0.719-0.815 and would be lost as "duplicates".
+                or any(_is_near_duplicate(index, mt.topic_id, mt.display_name, eid, ename)
+                       for eid, ename in existing)
+            )
+        return known[mt.topic_id]
 
-    for paper_topics in umls_topics_per_paper:
-        seen_this_paper: set[str] = set()
-        for mt in paper_topics:
-            if mt.topic_id in existing_ids:
+    def by_confidence(mt: MappedTopic):
+        return (-(mt.confidence or 0.0), mt.display_name.lower(), mt.topic_id)
+
+    best: dict[str, MappedTopic] = {}       # topic name (lowercased) -> its best concept
+    papers: dict[str, list[int]] = {}
+    for i, paper_topics in enumerate(umls_topics_per_paper):
+        chosen: dict[str, MappedTopic] = {}
+        for mt in sorted(paper_topics, key=by_confidence):
+            if len(chosen) >= per_paper:
+                break
+            if mt.confidence is None or mt.confidence < min_confidence:
                 continue
-            if mt.display_name.lower() in existing_names_lower:
+            name = mt.display_name.lower()
+            if name in chosen or has_already(mt):
                 continue
-            if mt.topic_id not in seen_this_paper:
-                topic_counter[mt.topic_id] += 1
-                seen_this_paper.add(mt.topic_id)
-            # Keep the mapping with highest similarity
-            if mt.topic_id not in topic_info or topic_info[mt.topic_id].similarity < mt.similarity:
-                topic_info[mt.topic_id] = mt
+            chosen[name] = mt
+        for name, mt in chosen.items():
+            papers.setdefault(name, []).append(i)
+            if name not in best or by_confidence(mt) < by_confidence(best[name]):
+                best[name] = mt
 
-    if not topic_counter:
-        return dict(base_filters)
-
-    # Rank by mapping confidence, breaking ties on how many seed papers
-    # mentioned the concept.
-    #
-    # Similarity leads deliberately. With a handful of seed papers the
-    # count can only be 1/2/3, so it has almost no discriminating power —
-    # sorting on it first lets a generic term that happens to appear in
-    # every paper's reference list (0.4 similarity, count 3) outrank a
-    # high-confidence domain match (0.89 similarity, count 1).
-    ranked_ids = sorted(
-        topic_counter.keys(),
-        key=lambda tid: (topic_info[tid].similarity, topic_counter[tid]),
-        reverse=True,
-    )
-
-    # Second pass: drop candidates that duplicate a topic the profile
-    # already has. The exact-match checks above only catch identical
-    # ids/names; the embedding test also catches synonyms such as "Renal
-    # Diseases and Glomerulopathies" vs "Renal and Vascular Pathologies".
-    #
-    # Candidates are NOT compared to each other by embedding, only by
-    # name. The cosine threshold was calibrated against synonym pairs
-    # (0.806-0.854) and unrelated pairs (0.512-0.687), and 0.75 sits in
-    # that gap — but sibling topics within one field were not in the
-    # calibration set and measure 0.719-0.815, straddling the threshold
-    # and overlapping the synonym band. On a type-2 diabetes profile,
-    # accepting "Diabetes and associated disorders" therefore discarded
-    # "Diabetes, Cardiovascular Risks and Lipoproteins" (0.761) and
-    # "Diabetes Treatment and Management" (0.815) as duplicates of it —
-    # three distinct OpenAlex topics, two of them in the Endocrinology
-    # and Diabetes subfield, that retrieve different papers. No single
-    # threshold separates siblings from synonyms, so the test is not
-    # applied here at all: these are candidates the user prunes in the
-    # wizard, and an extra near-neighbour costs one toggle while a
-    # discarded one can never be chosen.
-    accepted: list[str] = []
-    accepted_names: set[str] = set()
-    for tid in ranked_ids:
-        name = topic_info[tid].display_name
-        if any(
-            _is_near_duplicate(index, tid, name, eid, ename)
-            for eid, ename in existing
-        ):
-            continue
-        # Identical names are still duplicates — OpenAlex carries pairs
-        # like "Medical research and treatments" / "Medical Research and
-        # Treatments" under different ids. Checked here rather than after
-        # the cut, so a collision costs a slot no longer.
-        if name.lower() in accepted_names:
-            continue
-        accepted.append(tid)
-        accepted_names.add(name.lower())
-        if len(accepted) >= max_additions:
-            break
-
+    accepted = sorted(best, key=lambda n: by_confidence(best[n]))[:max_additions]
     new_entries = [
         {
-            "id": tid,
-            "display_name": topic_info[tid].display_name,
-            "count": topic_counter[tid],
+            "id": best[n].topic_id,
+            "display_name": best[n].display_name,
+            "count": len(papers[n]),
             "source": "umls",
+            "on": False,
+            "concept": best[n].source_name,
+            "confidence": best[n].confidence,
+            "papers": papers[n],
         }
-        for tid in accepted
+        for n in accepted
     ]
+    if not new_entries:
+        return dict(base_filters)
 
-    # Merge
     merged = copy.deepcopy(base_filters)
     merged.setdefault("topics", []).extend(new_entries)
-
     log.info(
         "Merged %d UMLS topics into topic_filters (total now: %d)",
         len(new_entries),

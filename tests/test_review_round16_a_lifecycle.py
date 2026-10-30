@@ -23,17 +23,23 @@ def _delete_now(env, pid):
 
 def test_add_seeds_racing_a_delete_is_not_a_500(app, env, monkeypatch):
     """POST /{key}/seeds reads the interest, then DELETE /{key} commits on
-    another request thread, then the seed insert hits the vanished id."""
+    another request thread, then the seed insert hits the vanished id.
+
+    Spec E: seeds of a saved interest change only on its Edit-interest
+    copy, so the add goes to the copy; deleting the interest takes the
+    copy with it (``edit_of`` cascades)."""
     from rag_lib.db.repos import researchers as researchers_repo
 
     slug, rid = _go_live(app, env, name="Seed Race")
     pid = _one(env, "SELECT id FROM profiles WHERE slug = ?", slug)["id"]
     papers = _ok(_request(app, "GET", f"/api/researchers/{rid}"))["papers"]
     seeds = {r["openalex_id"] for r in _q(env, "SELECT openalex_id FROM profile_seeds WHERE profile_id = ?", pid)}
-    # A paper the user owns (a researcher's) but not yet a seed of this interest.
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": papers[-1]["id"]}))
+    copy = _ok(_request(app, "POST", f"/api/profiles/{slug}/edit"))["slug"]
+    copy_id = _one(env, "SELECT id FROM profiles WHERE slug = ?", copy)["id"]
+    # A paper the user owns (a researcher's) but not yet a seed of the copy.
+    _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": papers[-1]["id"]}))
     target = papers[-1]["id"]
-    assert target not in {r["openalex_id"] for r in _q(env, "SELECT openalex_id FROM profile_seeds WHERE profile_id = ?", pid)}
+    assert target not in {r["openalex_id"] for r in _q(env, "SELECT openalex_id FROM profile_seeds WHERE profile_id = ?", copy_id)}
     del seeds
 
     real = researchers_repo.user_owns_papers
@@ -45,11 +51,12 @@ def test_add_seeds_racing_a_delete_is_not_a_500(app, env, monkeypatch):
 
     monkeypatch.setattr(researchers_repo, "user_owns_papers", _owns_then_deleted)
     try:
-        res = _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [target]})
+        res = _request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [target]})
         code = res.status_code
     except Exception as exc:  # noqa: BLE001 -- ASGITransport re-raises app errors
         code = f"unhandled {type(exc).__name__}: {exc}"
     assert code in (404, 409), code
+    assert not _q(env, "SELECT 1 FROM profiles WHERE id IN (?, ?)", pid, copy_id)
 
 
 class _BlockingGatherer(FixtureGatherer):
@@ -173,11 +180,16 @@ def test_second_user_cannot_touch_first_users_interest(app, env):
 
 def test_upload_seed_then_interest_deleted_before_refit_is_not_a_500(app, env, monkeypatch):
     """The Seeds tab's PDF drop: the seed row lands, then DELETE /{key} commits
-    (no scan runs, so it is allowed), then the upload's refit looks the slug up."""
+    (no scan runs, so it is allowed), then the upload's refit looks the slug up.
+
+    Spec E: the drop goes into the interest's Edit-interest copy (an upload
+    into the saved slug is 409); deleting the interest cascades the copy."""
     from rag_lib.api.services import wizard as wizard_service
 
     slug, _ = _go_live(app, env, name="Late Delete", seeds_from_researcher=False)
     pid = _one(env, "SELECT id FROM profiles WHERE slug = ?", slug)["id"]
+    assert _upload(app, b"late-delete-body", "late.pdf", slug).status_code == 409
+    copy = _ok(_request(app, "POST", f"/api/profiles/{slug}/edit"))["slug"]
     real = wizard_service.embed_missing
 
     def _embed_then_deleted(conn, model, ids):
@@ -187,8 +199,9 @@ def test_upload_seed_then_interest_deleted_before_refit_is_not_a_500(app, env, m
 
     monkeypatch.setattr(wizard_service, "embed_missing", _embed_then_deleted)
     try:
-        res = _upload(app, b"late-delete-body", "late.pdf", slug)
+        res = _upload(app, b"late-delete-body", "late.pdf", copy)
         code = res.status_code
     except Exception as exc:  # noqa: BLE001
         code = f"unhandled {type(exc).__name__}: {exc}"
     assert code in (200, 404), code
+    assert not _q(env, "SELECT 1 FROM profiles WHERE slug IN (?, ?)", slug, copy)

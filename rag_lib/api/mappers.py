@@ -303,7 +303,7 @@ def seed_row_to_seed(
     )
 
 
-def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
+def topic_filters_to_topics(topic_filters: dict | None, new: set[str] | None = None) -> list[Topic]:
     """Read the ``profiles.topic_filters_json`` blob → ``Topic[]``.
 
     Uses the ``topics`` level (not subfields/fields/domains); those
@@ -341,6 +341,11 @@ def topic_filters_to_topics(topic_filters: dict | None) -> list[Topic]:
             source=it.get("source"),
             profile=it.get("profile"),
             llm_label=it.get("llm_label"),
+            umls_concept=it.get("concept") if it.get("source") == "umls" else None,
+            umls_confidence=it.get("confidence") if it.get("source") == "umls" else None,
+            # topics the seeds brought in since the list was saved (a preview)
+            new=(tid in new) if new is not None else None,
+            unmatched=True if it.get("unmatched") else None,
         ))
     return out
 

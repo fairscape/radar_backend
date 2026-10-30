@@ -30,6 +30,7 @@ from rag_lib.db.repos import (
     users as users_repo,
 )
 from rag_lib.vault import PdfIngestRecord
+from tests.edit_helpers import edit_saved
 
 
 # -----------------------------------------------------------------------------
@@ -173,13 +174,24 @@ def test_upload_is_idempotent_for_same_bytes(app):
     assert sum(1 for d in docs if d["id"] == a["id"]) == 1
 
 
+def _upload_saved(app, content: bytes, slug: str) -> dict:
+    """Upload into saved interest ``slug``: only through its Edit-interest
+    copy, saved back on the way out (spec E)."""
+    with edit_saved(lambda m, p, **kw: _request(app, m, p, **kw), slug) as copy:
+        resp = _upload(app, content, profile_slug=copy)
+        assert resp.status_code == 200, resp.text
+        return resp.json()     # its tags leave the copy out: a copy is not listed (spec E)
+
+
 def test_upload_tagged_to_profile_appears_under_tag(app):
-    up = _upload(app, b"unique-bytes", profile_slug="neonatal-vitals").json()
-    assert "neonatal-vitals" in up["tags"]
+    # 'neonatal-vitals' is saved: a direct upload into it is refused (spec E).
+    resp = _upload(app, b"unique-bytes", profile_slug="neonatal-vitals")
+    assert resp.status_code == 409 and "Edit interest" in resp.json()["detail"]
+    up = _upload_saved(app, b"unique-bytes", "neonatal-vitals")
 
     docs = _request(app, "GET", "/api/vault/docs",
                     params={"tag": "neonatal-vitals"}).json()
-    assert any(d["id"] == up["id"] for d in docs)
+    assert any(d["id"] == up["id"] and "neonatal-vitals" in d["tags"] for d in docs)
 
 
 def test_upload_rejects_empty_file(app):
@@ -232,7 +244,7 @@ def test_meta_contains_paths_and_chunk_policy(app):
 
 
 def test_tags_endpoint_includes_all_total(app):
-    _upload(app, b"u1", profile_slug="neonatal-vitals")
+    _upload_saved(app, b"u1", "neonatal-vitals")   # saved: through Edit interest (spec E)
     _upload(app, b"u2")  # into the inbox draft
     counts = _request(app, "GET", "/api/vault/tags").json()
     # multi-tagged docs would only count once under "all"

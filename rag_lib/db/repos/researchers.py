@@ -364,9 +364,10 @@ def user_owns_papers(
 def interests_for(
     conn: sqlite3.Connection, researcher_id: int
 ) -> list[sqlite3.Row]:
-    """Profiles (drafts included) built from this researcher."""
+    """Profiles (drafts included) built from this researcher. Not an Edit
+    interest copy: it is the interest it copies, being edited (spec E)."""
     return conn.execute(
-        "SELECT * FROM profiles WHERE researcher_id = ? ORDER BY id",
+        "SELECT * FROM profiles WHERE researcher_id = ? AND edit_of IS NULL ORDER BY id",
         (researcher_id,),
     ).fetchall()
 

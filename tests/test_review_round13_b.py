@@ -14,7 +14,7 @@ import pytest
 from rag_lib.db import connect
 from rag_lib.db.repos import profiles as profiles_repo
 from rag_lib.db.repos import users as users_repo
-from tests.test_review_round13_b_probe import A, SLUG, _ok, _request, app, env  # noqa: F401
+from tests.test_review_round13_b_probe import A, SLUG, _edit, _ok, _request, app, env  # noqa: F401
 
 
 def test_b1_profiles_upsert_keeps_the_slug_of_an_existing_interest(env):
@@ -102,24 +102,31 @@ def test_b4_checked_ok_feed_years_vault_users(app, env):
     assert _request(app, "POST", "/api/radar/cards/save", json={"card_id": cid, "profile": SLUG}, headers=B).status_code == 404
     assert _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": [cid]}, headers=B).status_code == 404
     assert _ok(_request(app, "GET", "/api/vault/docs?tag=" + SLUG, headers=B)) == []
-    # Years: validation, to-only, feed + threshold list restricted, clear.
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2030}}, headers=A).status_code == 400
-    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A).status_code == 400
-    _ok(_request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": None, "year_to": 2020}}, headers=A))
+    # B cannot open A's interest in Edit interest either.
+    assert _request(app, "POST", f"/api/profiles/{SLUG}/edit", headers=B).status_code == 404
+    # Years (in Edit interest, saved -- spec E): validation, to-only, feed +
+    # threshold list restricted, clear.
+    assert _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2020}}, headers=A).status_code == 409
+    with _edit(app) as copy:
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2030}}, headers=A).status_code == 400
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A).status_code == 400
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": 2020}}, headers=A))
     assert _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))["cards"] == []
     # The histogram follows the saved years as the feed does; the paper list
     # beside the slider keeps every stored year, since the Threshold tab
     # filters it by the range being tried out (which may be wider).
     dr = _ok(_request(app, "POST", f"/api/profiles/{SLUG}/dry-run", headers=A))
     assert dr["scores"] == [] and len(dr["papers"]) == 50
-    _ok(_request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": None, "year_to": None}}, headers=A))
+    with _edit(app) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": None}}, headers=A))
     assert len(_ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))["cards"]) == 50
     # Backfill: validation, run accounting, out-of-range rows get no percentile.
     assert _request(app, "POST", f"/api/profiles/{SLUG}/backfill", json={"year_from": None}, headers=A).status_code == 400
     run = _ok(_request(app, "POST", f"/api/profiles/{SLUG}/backfill", json={"year_from": 2000, "year_to": 2003}, headers=A))
     runs = _ok(_request(app, "GET", f"/api/profiles/{SLUG}/runs", headers=A))
     assert runs[0]["id"] == run["run_id"] and runs[0]["n_fetched"] == 10 and runs[0]["since_date"] == "2000-01-01"
-    _ok(_request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2001, "year_to": 2002}}, headers=A))
+    with _edit(app) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2001, "year_to": 2002}}, headers=A))
     conn = connect(env)
     outside = conn.execute(
         "SELECT count(*) FROM profile_candidates pc JOIN papers p USING (openalex_id)"

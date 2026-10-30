@@ -24,6 +24,7 @@ from rag_lib.db import apply_migrations, connect
 from rag_lib.db.repos import gather_runs as gather_runs_repo, users as users_repo
 from rag_lib.scheduler import jobs as scheduler_jobs
 from rag_lib.vault import PdfIngestRecord
+from tests.edit_helpers import edit_saved
 from tests.fixture_gatherer import FixtureGatherer
 from tests.test_orcid_import import ORCID, WORKS, StubOrcidOpenAlex
 from tests.test_prosopia_import import StubProsopia, _stub_openalex, _stub_profile
@@ -363,17 +364,26 @@ def test_j1_wizard_to_feed_and_back(app, env):
     s3 = [c["score"] for c in feed3["cards"]]
     assert s3 == sorted(s3, reverse=True)
 
-    # "Add to the seeds" from the feed: the card leaves the feed and the fit moves.
+    # A feed paper as a seed. Spec E (R1): the feed's "add as seed" is gone
+    # (the route refuses); the paper is added in Edit interest. Once saved
+    # the card leaves the feed; the fit moves at the next scan (E.4 Q5).
     fit_before = _one(env, "SELECT selector_config_json FROM profiles WHERE slug = ?", slug)[0]
-    seeded = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [saved_then_undone["id"]]}))
-    assert seeded["attached"] == 1 and seeded["rejected"] == [] and isinstance(seeded["rescored"], int)
-    assert _one(env, "SELECT selector_config_json FROM profiles WHERE slug = ?", slug)[0] != fit_before
+    r = _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [saved_then_undone["id"]]})
+    assert r.status_code == 409, r.text
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug) as copy:
+        seeded = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [saved_then_undone["id"]]}))
+        assert seeded["attached"] == 1 and seeded["rejected"] == [] and seeded["rescored"] is None
+        # Already a seed: nothing attached, nothing rejected (the page says "already a seed").
+        again = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [saved_then_undone["id"]]}))
+        assert again["attached"] == 0 and again["rejected"] == []
+        assert saved_then_undone["id"] in {c["id"] for c in _feed(app)["cards"]}    # not before saving
+    assert _one(env, "SELECT selector_config_json FROM profiles WHERE slug = ?", slug)[0] == fit_before
     feed4 = _feed(app)
     assert saved_then_undone["id"] not in {c["id"] for c in feed4["cards"]}
     assert len(_ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]) == 3 + len(oa_ids)
-    # Already a seed: nothing attached, nothing rejected (the page says "already a seed").
-    again = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [saved_then_undone["id"]]}))
-    assert again["attached"] == 0 and again["rejected"] == []
+    _scan(app, slug)
+    assert _one(env, "SELECT selector_config_json FROM profiles WHERE slug = ?", slug)[0] != fit_before
+    assert saved_then_undone["id"] not in {c["id"] for c in _feed(app)["cards"]}
 
     # Below the bar / buckets / year filter answer, never 500.
     for params in ({"bucket": "high"}, {"bucket": "medium"}, {"bucket": "low"}, {"year_from": 2030}, {"profile": "nope"}):
@@ -481,21 +491,25 @@ def test_j2_researcher_profiles_end_to_end(app, env):
     assert {t["id"] for t in detail["topics"] if t["on"]} == set(on)
     assert _ok(_request(app, "GET", f"/api/researchers/{rid}"))["interests"][0]["key"] == slug
 
-    # Forget the researcher: the marks go and the list stays as the user
-    # saved it (round 12): the profile's topics become the interest's own.
+    # Forget the researcher. Spec E.7 (X-15): an interest is independent of
+    # the researcher once made -- its seeds and its topics, profile marks
+    # and the copy of the profile they were applied from, stay as saved;
+    # only the link back goes.
+    stored_before = _one(env, "SELECT topic_filters_json FROM profiles WHERE slug = ?", slug)[0]
+    detail_before = [(t["id"], t["on"], t["profile"]) for t in detail["topics"]]
     assert _ok(_request(app, "DELETE", f"/api/researchers/{rid}")) == {"ok": True}
     assert _request(app, "GET", f"/api/researchers/{rid}").status_code == 404
     assert [r["id"] for r in _ok(_request(app, "GET", "/api/researchers"))] == [rid2]
-    stored = json.loads(_one(env, "SELECT topic_filters_json FROM profiles WHERE slug = ?", slug)[0])
-    assert stored["researcher_topics"] is False
-    kept_on = {t["id"] for t in stored["topics"] if t["on"]}
-    assert kept_on == set(on)
-    assert all("profile" not in t and "on_before_profile" not in t and t.get("source") != "researcher" for t in stored["topics"])
+    assert _one(env, "SELECT topic_filters_json FROM profiles WHERE slug = ?", slug)[0] == stored_before
+    stored = json.loads(stored_before)
+    assert stored["researcher_topics"] is True
+    assert {t["id"] for t in stored["topics"] if t["on"]} == set(on)
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
-    assert {t["id"] for t in detail["topics"] if t["on"]} == set(on) and all(t["profile"] is None for t in detail["topics"])
+    assert [(t["id"], t["on"], t["profile"]) for t in detail["topics"]] == detail_before
     view = _ok(_request(app, "GET", f"/api/profiles/{slug}/researcher-topics"))
-    assert view["researcher_id"] is None and view["applied"] is False and view["topics"]["available"] is False
-    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 400
+    assert view["researcher_id"] is None and view["applied"] is True and view["topics"]["available"] is True
+    # A saved interest's profile topics change only in Edit interest (spec E).
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 409
     # Its seeds stay, in the vault too.
     assert len(detail["seeds"]) == 3
     assert _one(env, "SELECT researcher_id FROM profiles WHERE slug = ?", slug)[0] is None
@@ -503,11 +517,14 @@ def test_j2_researcher_profiles_end_to_end(app, env):
     vault = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs"))}
     assert set(picked) <= vault
 
-    # The edit page: preview keeps the adopted topics on; saving them sticks.
-    preview = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))}
-    assert set(on) <= set(preview) and all(preview[i]["on"] for i in on)
-    saved = _ok(_request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": on}))
-    assert {t["id"] for t in saved if t["on"]} == set(on)
+    # The edit page (on the copy, spec E): preview keeps the adopted topics
+    # on; saving them sticks.
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug) as copy:
+        preview = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{copy}/topics/preview"))}
+        assert set(on) <= set(preview) and all(preview[i]["on"] for i in on)
+        saved = _ok(_request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": on}))
+        assert {t["id"] for t in saved if t["on"]} == set(on)
+    assert {t["id"] for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["topics"] if t["on"]} == set(on)
 
     # Re-import the same person: a new row, the interest is not re-linked
     # (forgetting was the user's choice), the list and order are sane.
@@ -544,123 +561,172 @@ def test_j2_removing_the_profile_topics_on_a_draft_restores_the_seed_topics(app,
 
 
 def test_j3_edit_a_saved_interest(app, env):
+    """Spec E: a saved interest changes only in Edit interest, on a copy
+    saved in one go; its own routes refuse every change. Saving does not
+    refit or rescore (except threshold / years, which re-decide the feed);
+    the next scan refits."""
     slug, rid = _go_live(app, env, name="Edit Me")
     pid = _one(env, "SELECT id FROM profiles WHERE slug = ?", slug)["id"]
     _scan(app, slug)
     assert _feed(app, slug)["cards"]
 
-    # Threshold tab: the stored scores, a new threshold, the feed follows.
+    def edit(**kw):
+        return edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug, **kw)
+
+    def seeds(key=slug):
+        return {s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{key}/detail"))["seeds"]}
+
+    # The saved interest's own routes refuse every change.
+    for method, path, kw in (
+            ("PATCH", "", {"json": {"threshold": 0.5}}),
+            ("POST", "/seeds", {"json": {"openalex_ids": ["W1"]}}),
+            ("DELETE", "/seeds", {"params": {"openalex_id": "W1"}}),
+            ("PUT", "/topics", {"json": {"selected_topic_ids": ["T1"]}}),
+            ("POST", "/recompute-coherence", {}), ("POST", "/recompute-topics", {}), ("POST", "/refit", {})):
+        r = _request(app, method, f"/api/profiles/{slug}{path}", **kw)
+        assert r.status_code == 409 and "Edit interest" in r.text, (method, path, r.text)
+    assert _upload(app, b"not-here", "no.pdf", slug).status_code == 409
+
+    # Threshold tab: the stored scores, a new threshold, the feed follows once saved.
     scores = _ok(_request(app, "POST", f"/api/profiles/{slug}/dry-run"))
     assert scores["key"] == slug and scores["n"] == 10 and len(scores["papers"]) == 10
     top = max(scores["scores"])
-    tight = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": round(top + 0.001, 3) if top < 0.999 else 1.0}))
-    assert tight["key"] == slug
+    with edit() as copy:
+        tight = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": round(top + 0.001, 3) if top < 0.999 else 1.0}))
+        assert tight["key"] == copy
+        assert _feed(app, slug)["cards"]                                  # not before saving
     assert _feed(app, slug)["cards"] == []
     assert len(_feed(app, slug, bucket="low")["cards"]) == 10
-    loose = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 0.0}))
-    assert loose["threshold"] == 0.0
+    with edit() as copy:
+        loose = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 0.0}))
+        assert loose["threshold"] == 0.0
     n_pass = len(_feed(app, slug)["cards"])
     assert n_pass > 0
-    # Bad bodies: 422 (schema) or 400 (nothing), never 500.
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 1.5}).status_code == 422
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": -0.1}).status_code == 422
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={}).status_code == 400
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"name": "Renamed"}).status_code == 400
+    with edit(save=False) as copy:
+        # Bad bodies: 422 (schema) or 400 (nothing), never 500.
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 1.5}).status_code == 422
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": -0.1}).status_code == 422
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={}).status_code == 400
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"name": "Renamed"}).status_code == 400
     assert _request(app, "PATCH", "/api/profiles/nope", json={"threshold": 0.5}).status_code == 404
 
     # Years: set, the feed narrows, clear.
-    yr = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2020, "year_to": 2021}}))
-    assert yr["key"] == slug and yr["yearFrom"] == 2020 and yr["yearTo"] == 2021
+    with edit() as copy:
+        yr = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2020, "year_to": 2021}}))
+        assert yr["key"] == copy and yr["yearFrom"] == 2020 and yr["yearTo"] == 2021
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2030, "year_to": None}}).status_code == 400
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2022, "year_to": 2019}}).status_code == 400
+        assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 1800, "year_to": None}}).status_code == 400
+    prof = _ok(_request(app, "GET", f"/api/profiles/{slug}"))
+    assert prof["yearFrom"] == 2020 and prof["yearTo"] == 2021
     assert isinstance(_feed(app, slug)["cards"], list)
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2030, "year_to": None}}).status_code == 400
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2022, "year_to": 2019}}).status_code == 400
-    assert _request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 1800, "year_to": None}}).status_code == 400
-    cleared = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": None, "year_to": None}}))
-    assert cleared["key"] == slug and len(_feed(app, slug)["cards"]) == n_pass
+    with edit() as copy:
+        cleared = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": None}}))
+        assert cleared["key"] == copy
+    assert len(_feed(app, slug)["cards"]) == n_pass
 
-    # Seeds tab: add a researcher paper not yet a seed... all are; upload a new PDF instead.
+    # Seeds step: upload a new PDF into the copy.
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     n_seeds = len(detail["seeds"])
     fit0 = _one(env, "SELECT selector_config_json FROM profiles WHERE id = ?", pid)[0]
-    up = _ok(_upload(app, b"late-seed", "late.pdf", slug))
-    assert slug in up["tags"]
+    with edit() as copy:
+        up = _ok(_upload(app, b"late-seed", "late.pdf", copy))
+        assert up["id"] in seeds(copy) and up["id"] not in seeds()       # the copy only
+        # Recompute coherence (step 2) on the copy; the draft-only preview route.
+        coh = _ok(_request(app, "POST", f"/api/profiles/{copy}/recompute-coherence"))
+        assert coh["n"] == n_seeds + 1
+    assert _request(app, "POST", f"/api/profiles/draft/{slug}/coherence").status_code == 404     # drafts only
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     assert len(detail["seeds"]) == n_seeds + 1 and detail["profile"]["seeds"] == n_seeds + 1
-    assert _one(env, "SELECT selector_config_json FROM profiles WHERE id = ?", pid)[0] != fit0, "a live interest is re-fitted on upload"
-    # Recompute coherence (the Seeds tab's button); the edit page's preview.
-    coh = _ok(_request(app, "POST", f"/api/profiles/{slug}/recompute-coherence"))
-    assert coh["n"] == n_seeds + 1
-    assert _request(app, "POST", f"/api/profiles/draft/{slug}/coherence").status_code == 404     # drafts only
+    assert up["id"] in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": slug}))}
+    # Saving does not refit (E.4 Q5); the next scan does.
+    assert _one(env, "SELECT selector_config_json FROM profiles WHERE id = ?", pid)[0] == fit0, "saving does not refit"
+    _scan(app, slug)
+    assert _one(env, "SELECT selector_config_json FROM profiles WHERE id = ?", pid)[0] != fit0, "the scan refits on the new seed"
 
     # Remove a seed (query-string id, as the client sends it).
     gone = up["id"]
-    assert _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": gone})) == {"ok": True}
-    assert len(_ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]) == n_seeds
-    # Twice: 404, not 500.
-    assert _request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": gone}).status_code == 404
+    full = next(s["id"] for s in detail["seeds"] if s["id"].startswith("https://openalex.org/W"))
+    bare = full.rsplit("/", 1)[-1]
+    with edit() as copy:
+        assert _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": gone})) == {"ok": True}
+        assert len(seeds(copy)) == n_seeds and gone in seeds()
+        # Twice: 404, not 500.
+        assert _request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": gone}).status_code == 404
+        # A bare W-id names the same seed as the full URL.
+        assert _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": bare})) == {"ok": True}
+        assert full not in seeds(copy)
+        # Put it back from the researcher's papers (Add from a saved profile).
+        back = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [full]}))
+        assert back["attached"] == 1 and back["rescored"] is None             # a copy is not rescored
+    assert len(seeds()) == n_seeds and full in seeds()
     # The paper is still in the vault, just not a seed here.
     assert gone in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs"))}
     assert gone not in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": slug}))}
-    # A bare W-id names the same seed as the full URL.
-    full = next(s["id"] for s in detail["seeds"] if s["id"].startswith("https://openalex.org/W"))
-    bare = full.rsplit("/", 1)[-1]
-    assert _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": bare})) == {"ok": True}
-    assert full not in {s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]}
-    # Put it back from the researcher's papers (Add from a saved profile).
-    back = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [full]}))
-    assert back["attached"] == 1 and isinstance(back["rescored"], int)
 
-    # While a scan is running (an open manual run): removing a seed is refused
-    # before anything is written; an upload still lands; refit is refused.
+    # While a scan is running (an open manual run): the copy can be changed,
+    # but saving is refused (it would record the old seeds as the scan's,
+    # E.6 R11) until the scan has finished; scans stay refused.
     conn = connect(env)
     open_run = gather_runs_repo.start(conn, profile_id=pid, user_id=1, tier_used="manual")
     conn.close()
-    res = _request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": full})
-    assert res.status_code == 409, res.text
-    assert full in {s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]}
-    assert _request(app, "POST", f"/api/profiles/{slug}/refit").status_code == 409
     assert _request(app, "POST", f"/api/profiles/{slug}/gather-now?days=7&limit=500").status_code == 409
     assert _request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_from": 2020, "year_to": 2021}).status_code == 409
-    during = _ok(_upload(app, b"under-a-scan", "scan.pdf", slug))
-    assert slug in during["tags"]
-    assert during["id"] in {s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]}
-    # Adding seeds under a scan attaches them and reports no rescore.
-    added = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [during["id"]]}))
+    copy = _ok(_request(app, "POST", f"/api/profiles/{slug}/edit"))["slug"]
+    assert _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": full})) == {"ok": True}
+    during = _ok(_upload(app, b"under-a-scan", "scan.pdf", copy))
+    assert during["id"] in seeds(copy)
+    # Adding a seed the copy already has attaches nothing and reports no rescore.
+    added = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [during["id"]]}))
     assert added["attached"] == 0 and added["rescored"] is None
+    res = _request(app, "POST", f"/api/profiles/draft/{copy}/save-edit")
+    assert res.status_code == 409 and "scan" in res.text, res.text
+    assert full in seeds() and during["id"] not in seeds()                  # nothing written
     conn = connect(env)
     gather_runs_repo.finish(conn, open_run, n_fetched=0, n_new=0, n_redup=0)
     conn.close()
-    assert _ok(_request(app, "POST", f"/api/profiles/{slug}/refit"))["ok"] is True
+    # The copy is open: the interest cannot be scanned meanwhile (E.7 R9).
+    assert _request(app, "POST", f"/api/profiles/{slug}/gather-now?days=7&limit=500").status_code == 409
+    assert _request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_from": 2020, "year_to": 2021}).status_code == 409
+    _ok(_request(app, "POST", f"/api/profiles/draft/{copy}/save-edit"))
+    assert full not in seeds() and during["id"] in seeds()
 
-    # Topics on the edit page: preview (writes nothing), save, refuse an empty set.
-    preview = _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))
-    assert preview and all("new" in t for t in preview)
+    # Topics step: preview (writes nothing), switch, refuse an empty set; saved with the copy.
     stored_before = _one(env, "SELECT topic_filters_json FROM profiles WHERE id = ?", pid)[0]
-    assert _one(env, "SELECT topic_filters_json FROM profiles WHERE id = ?", pid)[0] == stored_before
-    assert _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": []}).status_code == 409
-    assert _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": ["T-not-there"]}).status_code == 409
-    sel = [t["id"] for t in preview][:1]
-    saved = _ok(_request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": sel + sel}))
-    assert [t["id"] for t in saved if t["on"]] == sel
-    recomputed = _ok(_request(app, "POST", f"/api/profiles/{slug}/recompute-topics"))
-    assert {t["id"] for t in recomputed} >= set(sel)
+    with edit() as copy:
+        preview = _ok(_request(app, "GET", f"/api/profiles/{copy}/topics/preview"))
+        assert preview and all("new" in t for t in preview)
+        assert _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": []}).status_code == 409
+        assert _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": ["T-not-there"]}).status_code == 409
+        sel = [t["id"] for t in preview][:1]
+        saved = _ok(_request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": sel + sel}))
+        assert [t["id"] for t in saved if t["on"]] == sel
+        recomputed = _ok(_request(app, "POST", f"/api/profiles/{copy}/recompute-topics"))
+        assert {t["id"] for t in recomputed} >= set(sel)
+        assert _one(env, "SELECT topic_filters_json FROM profiles WHERE id = ?", pid)[0] == stored_before
+    stored = json.loads(_one(env, "SELECT topic_filters_json FROM profiles WHERE id = ?", pid)[0])
+    assert [t["id"] for t in stored["topics"] if t.get("on", True)] == sel
 
-    # Year backfill (a background run, inline here).
+    # Year backfill (a background run, inline here); it refits on the seeds saved since.
     bf = _ok(_request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_from": 2020, "year_to": 2021}))
     run = next(r for r in _ok(_request(app, "GET", f"/api/profiles/{slug}/runs")) if r["id"] == bf["run_id"])
     assert run["tier_used"] == "backfill" and run["finished_at"] and run["error"] is None and run["since_date"] == "2020-01-01"
+    fit_ids = json.loads(_one(env, "SELECT selector_config_json FROM profiles WHERE id = ?", pid)[0])["fit_seed_ids"]
+    assert sorted(fit_ids) == sorted(seeds())
     assert _request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_from": 2022, "year_to": 2019}).status_code == 400
     assert _request(app, "POST", f"/api/profiles/{slug}/backfill", json={"year_to": 2019}).status_code == 400
     assert _request(app, "POST", "/api/profiles/nope/backfill", json={"year_from": 2020}).status_code == 404
 
-    # The last seed cannot go.
-    for s in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"][:-1]:
-        assert _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": s["id"]})) == {"ok": True}
-    last = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]
-    assert len(last) == 1
-    res = _request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": last[0]["id"]})
-    assert res.status_code == 409, res.text
-    assert len(_ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["seeds"]) == 1
+    # The last seed cannot go, on the copy as on the interest (spec E).
+    with edit(save=False) as copy:
+        listed = [s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{copy}/detail"))["seeds"]]
+        for s in listed[:-1]:
+            assert _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": s})) == {"ok": True}
+        res = _request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": listed[-1]})
+        assert res.status_code == 409 and "at least one seed" in res.text, res.text
+        assert seeds(copy) == {listed[-1]}
+        assert len(seeds()) == n_seeds                                      # nothing written
+    assert len(seeds()) == n_seeds                                          # discarded
     # Reads on the page still answer.
     for path in ("detail", "runs", "feedback", "feedback-threshold", "topic-yield", "reranker-comparison", "umls", "terms", "researcher-topics"):
         _ok(_request(app, "GET", f"/api/profiles/{slug}/{path}"))
@@ -722,9 +788,22 @@ def test_j4_two_users_do_not_see_each_other(app, env):
     if only_b:
         assert _request(app, "POST", "/api/radar/cards/save", json={"card_id": only_b[0], "profile": "shared", "on": True}).status_code == 404
 
-    # A adds the paper as a seed: B's interest does not change.
-    fit_b = _one(env, "SELECT selector_config_json, n_seed FROM profiles WHERE id = ?", idb)
-    _ok(_request(app, "POST", "/api/profiles/shared/seeds", json={"openalex_ids": [paper]}))
+    # Spec E: each user changes their interest in Edit interest, on a copy
+    # only they can see or change (X-11).
+    def edit(headers=None, **kw):
+        return edit_saved(lambda m, p, **k: _request(app, m, p, headers=headers or {}, **k), "shared", **kw)
+
+    with edit() as copy_a:
+        for method, path, kw in (("GET", f"/api/profiles/{copy_a}/detail", {}),
+                                 ("POST", f"/api/profiles/{copy_a}/seeds", {"json": {"openalex_ids": [paper]}}),
+                                 ("PATCH", f"/api/profiles/{copy_a}", {"json": {"threshold": 0.5}}),
+                                 ("POST", f"/api/profiles/draft/{copy_a}/save-edit", {}),
+                                 ("DELETE", f"/api/profiles/draft/{copy_a}", {})):
+            r = _request(app, method, path, headers=B, **kw)
+            assert r.status_code == 404 or (r.status_code == 200 and r.json() is None), (method, path, r.status_code, r.text)
+        # A adds the paper as a seed: B's interest does not change.
+        fit_b = _one(env, "SELECT selector_config_json, n_seed FROM profiles WHERE id = ?", idb)
+        _ok(_request(app, "POST", f"/api/profiles/{copy_a}/seeds", json={"openalex_ids": [paper]}))
     assert paper not in {c["id"] for c in _feed(app)["cards"]}
     assert paper in {c["id"] for c in _feed(app, headers=B)["cards"]}
     fit_b2 = _one(env, "SELECT selector_config_json, n_seed FROM profiles WHERE id = ?", idb)
@@ -733,20 +812,24 @@ def test_j4_two_users_do_not_see_each_other(app, env):
     # a paper B does not own is rejected.
     local_a = _ok(_upload(app, b"only-a", "a.pdf"))["id"]
     assert local_a not in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", headers=B))}
-    rej = _ok(_request(app, "POST", "/api/profiles/shared/seeds", json={"openalex_ids": [local_a]}, headers=B))
-    assert rej == {"attached": 0, "rejected": [local_a], "rescored": None}
+    with edit(B, save=False) as copy_b:
+        rej = _ok(_request(app, "POST", f"/api/profiles/{copy_b}/seeds", json={"openalex_ids": [local_a]}, headers=B))
+        assert rej == {"attached": 0, "rejected": [local_a], "rescored": None}
 
     # The same PDF uploaded by both: each user's own paper, each lists only
     # theirs, each user's seeds are their own.
-    da = _ok(_upload(app, b"the-same-pdf", "same.pdf", "shared"))
-    db_ = _ok(_upload(app, b"the-same-pdf", "same.pdf", "shared", headers=B))
+    with edit() as copy_a:
+        da = _ok(_upload(app, b"the-same-pdf", "same.pdf", copy_a))
+    with edit(B) as copy_b:
+        db_ = _ok(_upload(app, b"the-same-pdf", "same.pdf", copy_b, headers=B))
     assert da["id"] != db_["id"] and da["duplicate"] is not True and db_["duplicate"] is not True
     mine = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}))}
     theirs = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}, headers=B))}
     assert da["id"] in mine and db_["id"] not in mine and db_["id"] in theirs and da["id"] not in theirs
     assert _q(env, "SELECT user_id FROM paper_uploads WHERE openalex_id = ?", da["id"]).__len__() == 1
     # A removes it from A's seeds; B keeps theirs.
-    _ok(_request(app, "DELETE", "/api/profiles/shared/seeds", params={"openalex_id": da["id"]}))
+    with edit() as copy_a:
+        _ok(_request(app, "DELETE", f"/api/profiles/{copy_a}/seeds", params={"openalex_id": da["id"]}))
     assert da["id"] not in {s["id"] for s in _ok(_request(app, "GET", "/api/profiles/shared/detail"))["seeds"]}
     assert db_["id"] in {s["id"] for s in _ok(_request(app, "GET", "/api/profiles/shared/detail", headers=B))["seeds"]}
     assert da["id"] in {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs"))}, "A's upload is still A's"
@@ -877,8 +960,11 @@ def test_j5_names_slugs_and_odd_payloads(app, env):
     _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     _scan(app, slug)
     assert all(c["profile"] == slug for c in _feed(app, slug)["cards"])
-    doc = _ok(_upload(app, b"uni-2", "uni2.pdf", slug))
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": doc["id"]}))
+    # Spec E: a saved interest's seeds change in Edit interest, opened (and
+    # saved) through the encoded slug.
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug) as copy:
+        doc = _ok(_upload(app, b"uni-2", "uni2.pdf", copy))
+        _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": doc["id"]}))
     assert _ok(_request(app, "GET", "/api/vault/tags")).get(slug) == 1
 
     # Topic selections with duplicate / unknown ids.
@@ -1116,8 +1202,9 @@ def test_j4_one_user_two_interests_share_a_paper(app, env):
     assert _ok(_request(app, "POST", "/api/radar/cards/save", json={"card_id": paper, "profile": a, "on": False}))["state"] is None
     cards = {c["profile"]: c for c in _feed(app)["cards"] if c["id"] == paper}
     assert cards[a]["state"] is None and cards[b]["state"] == "dismissed"
-    # Seeding it in A leaves B's card.
-    _ok(_request(app, "POST", f"/api/profiles/{a}/seeds", json={"openalex_ids": [paper]}))
+    # Seeding it in A (in Edit interest, spec E) leaves B's card.
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), a) as copy:
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [paper]}))
     cards = {c["profile"]: c for c in _feed(app)["cards"] if c["id"] == paper}
     assert set(cards) == {b}
 
@@ -1175,10 +1262,15 @@ def test_j3_backfill_then_the_feeds_year_filter(app, env):
     later = _feed(app, slug, year_from=2021)["cards"]
     assert later and all(c["date"].startswith("2021") for c in later)
     assert _feed(app, slug, year_from=2022)["cards"] == []
-    # The interest's own range narrows the feed the same way, and clears.
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": 2021, "year_to": 2021}}))
+    # The interest's own range (saved from Edit interest, spec E) narrows
+    # the feed the same way, and clears.
+    def set_years(body):
+        with edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug) as copy:
+            _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": body}))
+
+    set_years({"year_from": 2021, "year_to": 2021})
     assert {c["date"][:4] for c in _feed(app, slug)["cards"]} == {"2021"}
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": None, "year_to": None}}))
+    set_years({"year_from": None, "year_to": None})
     assert len(_feed(app, slug)["cards"]) == len(years)
 
 
@@ -1215,11 +1307,17 @@ def test_j5_tiny_drafts_zero_and_one_seed(app, env):
     assert _feed(app, d1)["cards"]
     detail = _ok(_request(app, "GET", f"/api/profiles/{d1}/detail"))
     assert len(detail["seeds"]) == 1 and detail["seeds"][0]["id"] == one["id"]
-    assert _ok(_request(app, "POST", f"/api/profiles/{d1}/recompute-coherence"))["n"] == 1
+    # Spec E: coherence is recomputed in Edit interest, on the copy.
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), d1, save=False) as copy:
+        assert _ok(_request(app, "POST", f"/api/profiles/{copy}/recompute-coherence"))["n"] == 1
+        # Its only seed cannot go, on the copy as on the interest.
+        r = _request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": one["id"]})
+        assert r.status_code == 409 and "at least one seed" in r.text, r.text
     for bucket in ("high", "medium", "low"):
         assert isinstance(_feed(app, d1, bucket=bucket)["cards"], list)
-    # Its only seed cannot go; removing a draft's only seed can.
     assert _request(app, "DELETE", f"/api/profiles/{d1}/seeds", params={"openalex_id": one["id"]}).status_code == 409
+    assert [s["id"] for s in _ok(_request(app, "GET", f"/api/profiles/{d1}/detail"))["seeds"]] == [one["id"]]
+    # Removing a draft's only seed can.
     d2 = _ok(_request(app, "POST", "/api/profiles/draft", json={"name": "Two"}))["slug"]
     two = _ok(_upload(app, b"only-seed-2", "only2.pdf", d2))
     assert _ok(_request(app, "DELETE", f"/api/profiles/{d2}/seeds", params={"openalex_id": two["id"]})) == {"ok": True}

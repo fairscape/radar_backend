@@ -10,6 +10,7 @@ import pytest
 from rag_lib.api import settings as settings_module
 from rag_lib.db import apply_migrations, connect
 from rag_lib.db.repos import papers as papers_repo, profiles as profiles_repo, users as users_repo
+from tests.edit_helpers import edit_saved
 
 
 @pytest.fixture()
@@ -57,6 +58,12 @@ def _request(app, method, path, **kw):
     return asyncio.run(_run())
 
 
+def _edit(app):
+    """'chromatin' is saved: topics are recomputed on its Edit-interest
+    copy (spec E); discarded after, the tests are about the copy's step 3."""
+    return edit_saved(lambda m, p, **kw: _request(app, m, p, **kw), "chromatin", save=False)
+
+
 def test_status_then_extraction_leaves_nothing_pending_and_counts_the_failure(app):
     before = _request(app, "GET", "/api/profiles/chromatin/umls").json()
     assert (before["total"], before["pending"], before["done"]) == (3, 3, 0)
@@ -86,11 +93,12 @@ def test_a_merge_that_cannot_run_keeps_the_stored_umls_topics_and_says_so(app, t
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(wizard, "_merge_umls_topics", locked)
-    topics = _request(app, "POST", "/api/profiles/chromatin/recompute-topics").json()
-    kept = [t for t in topics if t["id"] == "https://openalex.org/T9"]
-    assert kept and kept[0]["on"] is False and kept[0]["source"] == "umls"   # kept, still switched off
-    st = _request(app, "GET", "/api/profiles/chromatin/umls").json()
-    assert st["topics_available"] is False and st["topics_reason"] == "busy"
+    with _edit(app) as copy:
+        topics = _request(app, "POST", f"/api/profiles/{copy}/recompute-topics").json()
+        kept = [t for t in topics if t["id"] == "https://openalex.org/T9"]
+        assert kept and kept[0]["on"] is False and kept[0]["source"] == "umls"   # kept, still switched off
+        st = _request(app, "GET", f"/api/profiles/{copy}/umls").json()
+        assert st["topics_available"] is False and st["topics_reason"] == "busy"
 
 
 def test_an_unreadable_seed_is_sent_back_to_extraction_and_reported(app, tmp_path):
@@ -100,9 +108,10 @@ def test_an_unreadable_seed_is_sent_back_to_extraction_and_reported(app, tmp_pat
                  "WHERE openalex_id = 'W0'")
     conn.commit()
     conn.close()
-    _request(app, "POST", "/api/profiles/chromatin/recompute-topics")
-    st = _request(app, "GET", "/api/profiles/chromatin/umls").json()
-    assert (st["topics_available"], st["topics_reason"], st["topics_n"]) == (False, "bad_data", 1)
+    with _edit(app) as copy:
+        _request(app, "POST", f"/api/profiles/{copy}/recompute-topics")
+        st = _request(app, "GET", f"/api/profiles/{copy}/umls").json()
+        assert (st["topics_available"], st["topics_reason"], st["topics_n"]) == (False, "bad_data", 1)
     conn = connect(tmp_path / "radar.db")
     assert conn.execute("SELECT umls_concepts_json FROM papers WHERE openalex_id = 'W0'").fetchone()[0] is None
     conn.close()

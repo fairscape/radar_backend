@@ -23,6 +23,8 @@ import types
 
 import pytest
 
+from rag_lib import pdf_text
+
 from rag_lib.vault import (
     DOI_REGEX,
     PdfIngestRecord,
@@ -90,6 +92,10 @@ def fake_pdfplumber(monkeypatch):
 
     module.open = _open  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pdfplumber", module)
+    # The body is laid out by pdfminer (rag_lib.pdf_text.read_pages): each
+    # stub page is one text block of its lines.
+    monkeypatch.setattr(pdf_text, "read_pages", lambda _path: [
+        [l.strip() for l in (t or "").splitlines() if l.strip()] + [""] for t in state["pages"]])
 
     def set_pdf(*, pages, metadata=None, chars=None):
         state["pages"] = pages
@@ -452,10 +458,10 @@ def test_metadata_alone_must_appear_on_page_one(fake_pdfplumber, tmp_path):
 # -----------------------------------------------------------------------------
 
 
-def test_body_joins_pages_with_blank_line_and_strips(fake_pdfplumber, tmp_path):
+def test_body_ends_each_page_with_a_form_feed_and_strips(fake_pdfplumber, tmp_path):
     fake_pdfplumber(pages=["  first  ", "second"])
     rec = ingest_pdf(tmp_path / "p.pdf")
-    assert rec.body_text == "first  \n\nsecond"
+    assert rec.body_text == "first\n\f\nsecond\n\f\n"
 
 
 def test_pages_with_no_text_layer_count_toward_n_pages(fake_pdfplumber, tmp_path):
@@ -467,7 +473,7 @@ def test_pages_with_no_text_layer_count_toward_n_pages(fake_pdfplumber, tmp_path
     fake_pdfplumber(pages=["text", None, "more"])
     rec = ingest_pdf(tmp_path / "p.pdf")
     assert rec.n_pages == 3
-    assert rec.body_text == "text\n\n\n\nmore"
+    assert rec.body_text == "text\n\f\n\n\f\nmore\n\f\n"
 
 
 def test_record_carries_the_path_as_given(fake_pdfplumber, tmp_path):
@@ -762,3 +768,13 @@ def test_umls_input_is_title_only_when_that_is_all_there_is():
     from rag_lib.api.services.vault import _umls_input_text
 
     assert _umls_input_text("A Title", None, None) == "A Title"
+
+
+def test_a_doi_only_in_the_running_footer_is_still_found(fake_pdfplumber, tmp_path):
+    """Footers repeated on most pages are dropped from the body; the DOI
+    they print is still the paper's (FUNCTIONAL_SPEC P.3-4)."""
+    foot = "https://doi.org/10.1000/own.7"
+    fake_pdfplumber(pages=["Cover page\nno identifier here"] + [f"Text of page {i}\n{foot}" for i in range(4)])
+    rec = ingest_pdf(tmp_path / "p.pdf")
+    assert foot not in rec.body_text
+    assert rec.doi == "10.1000/own.7"

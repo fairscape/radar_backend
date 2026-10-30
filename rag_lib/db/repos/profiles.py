@@ -92,9 +92,11 @@ def list_for_user(
     not surface drafts to the sidebar / Radar / detail UI; only the
     wizard endpoints opt in via ``include_drafts=True``.
     """
+    # Never a copy made by Edit interest (``edit_of``): it is the interest
+    # being edited, not one of its own (FUNCTIONAL_SPEC E).
     if include_drafts:
         return conn.execute(
-            "SELECT * FROM profiles WHERE user_id = ? ORDER BY id",
+            "SELECT * FROM profiles WHERE user_id = ? AND edit_of IS NULL ORDER BY id",
             (user_id,),
         ).fetchall()
     return conn.execute(
@@ -169,7 +171,7 @@ def list_drafts_for_user(conn: sqlite3.Connection, user_id: int) -> list[sqlite3
                  ORDER BY g.id DESC LIMIT 1) AS import_error
           FROM profiles p
           LEFT JOIN researchers r ON r.id = p.researcher_id
-         WHERE p.user_id = ? AND p.is_draft = 1
+         WHERE p.user_id = ? AND p.is_draft = 1 AND p.edit_of IS NULL
          ORDER BY p.id DESC
         """,
         # In textual order: the two EXISTS put the tiers before the cutoff,

@@ -20,6 +20,7 @@ import pytest
 from rag_lib.api import settings as settings_module
 from rag_lib.db import apply_migrations, connect
 from rag_lib.db.repos import papers as papers_repo, profiles as profiles_repo, users as users_repo
+from tests.edit_helpers import edit_saved
 
 SLUG = "chromatin"
 KEY = "sk-ant-TEST-" + "q7Zp" * 6          # unique enough to grep for
@@ -81,10 +82,16 @@ def _request(app, method, path, **kwargs) -> httpx.Response:
     return asyncio.run(_run())
 
 
-def _stored(tmp_path):
+def _edit(app, **kw):
+    """Edit interest on the saved interest: its research topics change on
+    this copy and are saved with it (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda method, path, **k: _request(app, method, path, **k), SLUG, **kw)
+
+
+def _stored(tmp_path, slug=SLUG):
     conn = connect(tmp_path / "radar.db")
     try:
-        raw = conn.execute("SELECT interest_terms_json FROM profiles WHERE slug = ?", (SLUG,)).fetchone()[0]
+        raw = conn.execute("SELECT interest_terms_json FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]
     finally:
         conn.close()
     return json.loads(raw) if raw else None
@@ -118,18 +125,22 @@ class FakeLLM:
 
 
 def test_without_a_key_the_sdk_cluster_method_runs_and_topics_name_their_papers(app, tmp_path):
-    resp = _request(app, "POST", f"/api/profiles/{SLUG}/terms/generate", json={})
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["source"] == "rp-sdk-cluster" and body["terms"]
-    # The SDK collects paper ids only from summary chunks; a lite profile's
-    # chunks are abstracts, so without the chunk mapping every list was empty.
-    assert all(t["paper_ids"] for t in body["terms"])
-    assert all(p.startswith("https://openalex.org/W90") for t in body["terms"] for p in t["paper_ids"])
-    # A preview: nothing is saved until the user keeps it.
-    assert body["saved"] is False and _stored(tmp_path) is None
-    kept = _request(app, "PUT", f"/api/profiles/{SLUG}/terms", json={**body, "edited": False})
-    assert kept.status_code == 200 and kept.json()["saved"] is True
+    with _edit(app) as copy:
+        resp = _request(app, "POST", f"/api/profiles/{copy}/terms/generate", json={})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["source"] == "rp-sdk-cluster" and body["terms"]
+        # The SDK collects paper ids only from summary chunks; a lite profile's
+        # chunks are abstracts, so without the chunk mapping every list was empty.
+        assert all(t["paper_ids"] for t in body["terms"])
+        assert all(p.startswith("https://openalex.org/W90") for t in body["terms"] for p in t["paper_ids"])
+        # A preview: nothing is saved until the user keeps it.
+        assert body["saved"] is False and _stored(tmp_path, copy) is None
+        kept = _request(app, "PUT", f"/api/profiles/{copy}/terms", json={**body, "edited": False})
+        assert kept.status_code == 200 and kept.json()["saved"] is True
+        assert _stored(tmp_path, copy)["source"] == "rp-sdk-cluster"
+        # Kept on the copy; the interest gets them when the copy is saved.
+        assert _stored(tmp_path) is None
     assert _stored(tmp_path)["source"] == "rp-sdk-cluster" and _stored(tmp_path)["edited"] is False
     root = tmp_path / "rp_profiles"
     assert any(root.rglob("profile.jsonld")) and any(root.rglob("papers.jsonld"))
@@ -206,12 +217,14 @@ def test_a_prosopia_backed_interest_uses_the_profiles_own_fields(app, tmp_path, 
 
 
 def test_edits_are_kept_and_a_seed_change_marks_the_topics_stale(app, tmp_path):
-    preview = _request(app, "POST", f"/api/profiles/{SLUG}/terms/generate", json={}).json()
-    resp = _request(app, "PUT", f"/api/profiles/{SLUG}/terms",
-                    json={**preview, "terms": [{"label": "my own topic"}], "not_interests": ["wet lab"], "edited": True})
-    assert resp.status_code == 200
-    assert resp.json()["edited"] is True and resp.json()["stale"] is False
+    with _edit(app) as copy:
+        preview = _request(app, "POST", f"/api/profiles/{copy}/terms/generate", json={}).json()
+        resp = _request(app, "PUT", f"/api/profiles/{copy}/terms",
+                        json={**preview, "terms": [{"label": "my own topic"}], "not_interests": ["wet lab"], "edited": True})
+        assert resp.status_code == 200
+        assert resp.json()["edited"] is True and resp.json()["stale"] is False
     assert [t["label"] for t in _stored(tmp_path)["terms"]] == ["my own topic"]
+    assert _request(app, "GET", f"/api/profiles/{SLUG}/terms").json()["stale"] is False
 
     conn = connect(tmp_path / "radar.db")
     conn.execute("DELETE FROM profile_seeds WHERE openalex_id = 'https://openalex.org/W905'")
@@ -238,19 +251,24 @@ def test_struck_out_topics_are_kept_apart_and_never_used_as_queries(app, tmp_pat
     from rag_lib import interest_terms
     from rag_lib.db.repos import profiles as profiles_repo
 
-    preview = _request(app, "POST", f"/api/profiles/{SLUG}/terms/generate", json={}).json()
-    first, *rest = preview["terms"]
-    body = _request(app, "PUT", f"/api/profiles/{SLUG}/terms",
-                    json={**preview, "terms": rest, "removed": [first]}).json()
-    assert [t["label"] for t in body["removed"]] == [first["label"]]
-    assert first["label"] not in [t["label"] for t in body["terms"]]
+    # On the Edit interest copy, saved each time (FUNCTIONAL_SPEC E).
+    with _edit(app) as copy:
+        preview = _request(app, "POST", f"/api/profiles/{copy}/terms/generate", json={}).json()
+        first, *rest = preview["terms"]
+        body = _request(app, "PUT", f"/api/profiles/{copy}/terms",
+                        json={**preview, "terms": rest, "removed": [first]}).json()
+        assert [t["label"] for t in body["removed"]] == [first["label"]]
+        assert first["label"] not in [t["label"] for t in body["terms"]]
 
     conn = connect(tmp_path / "radar.db")
     row = profiles_repo.get_by_slug(conn, 1, SLUG)
+    assert [t["label"] for t in interest_terms.load(row)["removed"]] == [first["label"]]
     assert first["label"] not in interest_terms.query_labels(interest_terms.load(row))
     conn.close()
 
     # Put back: it leaves the struck-out list.
-    body = _request(app, "PUT", f"/api/profiles/{SLUG}/terms",
-                    json={"terms": [first, *rest], "removed": [first]}).json()
-    assert body["removed"] == [] and first["label"] in [t["label"] for t in body["terms"]]
+    with _edit(app) as copy:
+        body = _request(app, "PUT", f"/api/profiles/{copy}/terms",
+                        json={"terms": [first, *rest], "removed": [first]}).json()
+        assert body["removed"] == [] and first["label"] in [t["label"] for t in body["terms"]]
+    assert _stored(tmp_path)["removed"] == [] and first["label"] in [t["label"] for t in _stored(tmp_path)["terms"]]

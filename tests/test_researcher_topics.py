@@ -22,6 +22,7 @@ import pytest
 from rag_lib import researcher_topics as rt
 from rag_lib.api.mappers import topic_filters_to_topics
 from rag_lib.db import connect
+from tests.edit_helpers import edit_saved
 from tests.test_orcid_import import ORCID, WORKS, StubOrcidOpenAlex
 from tests.test_prosopia_import import StubProsopia, _stub_openalex, _stub_profile
 from tests.test_researchers import _app, _request, env  # noqa: F401 -- fixture
@@ -239,6 +240,12 @@ def _choose(app, slug, topic_id, choice="filter"):
                     json={"topic_id": topic_id, "choice": choice})
     assert resp.status_code == 200, resp.text
     return {t["id"]: t for t in resp.json()}
+
+
+def _edit(app, slug, *, save=True):
+    """Edit interest on saved interest ``slug``: yields the copy's slug
+    (FUNCTIONAL_SPEC E -- a saved interest changes only through a copy)."""
+    return edit_saved(lambda method, path, **kw: _request(app, method, path, **kw), slug, save=save)
 
 
 def _apply_filtering(app, slug, topic_id="T10001"):
@@ -485,10 +492,13 @@ def test_removing_puts_the_seeds_topics_back_as_they_were(env):
     assert back["T10001"]["on"] is False
 
 
-def test_a_saved_interest_keeps_the_profile_and_its_new_wanted_topics_start_on(env):
-    """Commit carries the flag and the profile-only topics; on the saved
-    interest, where new topics otherwise start off, a topic the profile
-    gains later (a re-import) still starts on, and a not-wanted one off."""
+def test_a_saved_interest_keeps_the_profile_it_applied_when_the_researcher_changes(env):
+    """Commit carries the flag and the profile-only topics. The researcher's
+    document changing afterwards (a re-import gains a wanted topic) does not
+    reach the saved interest: it reads the copy of the profile it took when
+    it applied the topics (FUNCTIONAL_SPEC E.7, X-14). It used to fold the
+    new topic in, switched on. A topics save (on an Edit interest copy,
+    spec E) keeps the flag and the profile-only topics."""
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
@@ -500,7 +510,7 @@ def test_a_saved_interest_keeps_the_profile_and_its_new_wanted_topics_start_on(e
     assert {t["id"] for t in stored["topics"] if t.get("source") == "researcher"} == {"https://openalex.org/T10222", "https://openalex.org/T10515"}
     assert _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["applied"] is True
 
-    # The profile gains a declared wanted topic and a declared unwanted one the seeds carry.
+    # The researcher's profile gains a declared wanted topic.
     conn = connect(env)
     try:
         doc = dict(DOCUMENT)
@@ -510,14 +520,21 @@ def test_a_saved_interest_keeps_the_profile_and_its_new_wanted_topics_start_on(e
     finally:
         conn.close()
     preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
-    assert preview["https://openalex.org/T77777"]["on"] is True and preview["https://openalex.org/T77777"]["new"] is True
+    assert "https://openalex.org/T77777" not in preview
     assert preview["T10001"]["on"] is False
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    assert view["applied"] is True
+    assert "https://openalex.org/T77777" not in {t["id"] for t in view["topics"]["wanted"]}
+    assert _stored(env, slug) == stored
     # Saving the preview's ticks keeps the flag and the profile-only topics.
-    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics",
-                     json={"selected_topic_ids": [i for i, t in preview.items() if t["on"]]})
-    assert saved.status_code == 200, saved.text
-    assert _stored(env, slug)["researcher_topics"] is True
-    assert "https://openalex.org/T77777" in {t["id"] for t in saved.json()}
+    with _edit(app, slug) as copy:
+        saved = _request(app, "PUT", f"/api/profiles/{copy}/topics",
+                         json={"selected_topic_ids": [i for i, t in preview.items() if t["on"]]})
+        assert saved.status_code == 200, saved.text
+    after = _stored(env, slug)
+    assert after["researcher_topics"] is True
+    assert {t["id"] for t in after["topics"] if t.get("source") == "researcher"} == {"https://openalex.org/T10222", "https://openalex.org/T10515"}
+    assert "https://openalex.org/T77777" not in {t["id"] for t in after["topics"]}
 
 
 def test_the_profile_being_unreadable_for_a_moment_does_not_drop_it(env, monkeypatch):
@@ -624,13 +641,13 @@ def test_re_applying_keeps_the_original_pre_apply_state(env):
     assert off["T10001"]["on"] is True
 
 
-def test_forgetting_the_researcher_takes_the_profile_off_a_saved_interest(env):
-    """A saved interest's list is what every scan reads and nothing rebuilds
-    it on its own, so forgetting the researcher takes the marks off there
-    and then -- and leaves every topic as the user saved it: the profile's
-    topics become the interest's own (``adopted``), the one the profile had
-    said no to stays off. Round 12: it used to come back on, and the two
-    the user committed with were dropped."""
+def test_forgetting_the_researcher_leaves_a_saved_interests_topics_as_they_were(env):
+    """A saved interest's list is what every scan reads. Forgetting the
+    researcher leaves it exactly as the user saved it, marks and all: the
+    interest reads the copy of the profile it took when it applied the
+    topics (FUNCTIONAL_SPEC E.7, X-15). Before spec E the forget took the
+    marks off and made the profile's topics the interest's own
+    (``adopted``); round 12 before that put the rejected one back on."""
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
@@ -638,15 +655,24 @@ def test_forgetting_the_researcher_takes_the_profile_off_a_saved_interest(env):
     on_at_commit = [i for i, t in applied.items() if t["on"]]
     assert "T10001" not in on_at_commit and len(on_at_commit) == 2
     _commit(app, slug, on_at_commit)
+    before = _stored(env, slug)
+    detail_before = _request(app, "GET", f"/api/profiles/{slug}/detail").json()["topics"]
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
     stored = _stored(env, slug)
-    assert stored["researcher_topics"] is False
+    assert stored == before and stored["researcher_topics"] is True
     assert [t["id"] for t in stored["topics"] if t["on"]] == on_at_commit
-    assert all("profile" not in t and "on_before_profile" not in t for t in stored["topics"])
-    assert {t["source"] for t in stored["topics"] if t["id"] in on_at_commit} == {"adopted"}
+    assert {t["source"] for t in stored["topics"] if t["id"] in on_at_commit} == {"researcher"}
     detail = _request(app, "GET", f"/api/profiles/{slug}/detail").json()
+    assert detail["topics"] == detail_before
     assert [t["id"] for t in detail["topics"] if t["on"]] == on_at_commit
-    assert all(t["profile"] is None for t in detail["topics"])
+    # Still applied, read from the interest's copy of the profile.
+    view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
+    assert view["researcher_id"] is None and view["applied"] is True
+    assert view["researcher_name"] == "Nathan C. Sheffield" and view["topics"]["available"] is True
+    # And a rebuild (the edit page's preview) does not take them off either.
+    preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
+    assert {i for i, t in preview.items() if t["on"]} == set(on_at_commit)
+    assert preview["T10001"]["profile"] == "not_interest"
 
 
 def test_a_list_read_that_overlaps_an_apply_does_not_undo_it(env, monkeypatch):
@@ -756,9 +782,16 @@ def test_removing_that_would_leave_nothing_on_is_refused_on_a_saved_interest(env
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
     assert {t["id"] for t in applied if t["on"]} == {"T10001", "https://openalex.org/T10515"}
     _commit(app, slug, ["https://openalex.org/T10515"])            # T10001 off
-    resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False})
-    assert resp.status_code == 409 and "switch one on first" in resp.json()["detail"]
+    before = _stored(env, slug)
+    # A saved interest changes on its Edit interest copy, which keeps the
+    # saved interest's rules (FUNCTIONAL_SPEC E).
+    with _edit(app, slug, save=False) as copy:
+        copy_before = _stored(env, copy)
+        resp = _request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": False})
+        assert resp.status_code == 409 and "switch one on first" in resp.json()["detail"]
+        assert _stored(env, copy) == copy_before
     stored = _stored(env, slug)
+    assert stored == before
     assert stored["researcher_topics"] is True and any(t["on"] for t in stored["topics"])
 
 
@@ -824,7 +857,10 @@ def _switch(env, slug, states):
 def test_forgetting_the_researcher_keeps_the_profiles_topics_where_nothing_else_is_on(env):
     """The user kept only the profile's topics on. Putting the seeds' topics
     back as they were (off) would leave the saved interest searching by
-    nothing, so the profile's stay -- as ordinary topics, no marks."""
+    nothing, so the profile's stay. Since FUNCTIONAL_SPEC E.7 (X-15) the
+    forget does not touch the saved interest at all: the profile's topics
+    stay the profile's, read from the interest's copy of it (they were
+    turned into ordinary, unmarked topics before)."""
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
@@ -837,21 +873,26 @@ def test_forgetting_the_researcher_keeps_the_profiles_topics_where_nothing_else_
     only_profile = [t["id"] for t in applied if t["on"]]
     assert only_profile and "T10001" not in only_profile
     _commit(app, slug, only_profile)
+    before = _stored(env, slug)
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
     stored = _stored(env, slug)
-    assert stored["researcher_topics"] is False
+    assert stored == before and stored["researcher_topics"] is True
     assert {t["id"] for t in stored["topics"] if t["on"]} == set(only_profile)
-    assert all("profile" not in t and "on_before_profile" not in t and t.get("source") != "researcher"
-               for t in stored["topics"])
+    assert all(t.get("source") == "researcher" and t.get("profile") == "interest"
+               for t in stored["topics"] if t["id"] in only_profile)
     detail = _request(app, "GET", f"/api/profiles/{slug}/detail").json()
     assert {t["id"] for t in detail["topics"] if t["on"]} == set(only_profile)
-    assert all(t["profile"] is None for t in detail["topics"])
+    assert {t["id"] for t in detail["topics"] if t["profile"] == "interest"} == set(only_profile)
 
 
 def test_a_topic_the_profile_stops_rejecting_goes_back_to_what_it_was(env):
-    """The owner's document is re-read without the rejection: the topic the
-    profile had switched off is on again, with no mark and nothing left
-    behind for "Remove" to restore; a switch the user made since stays."""
+    """The owner's document is re-imported without the rejection. The
+    interest took a copy of the profile when it applied it, and a re-import
+    does not reach that copy (FUNCTIONAL_SPEC E.7): the topic stays off,
+    marked. Removing the profile and applying it again takes the profile
+    as it is now: the topic is on again, with no mark and nothing left
+    behind for "Remove" to restore. (Before E.7 the re-import alone did
+    this, on the next read.)"""
     profile = _stub_profile()
     profile.metadata = {"research_interests": [
         _topic("T10001", "Test Topic", weight=-0.5, method="declared"),
@@ -866,6 +907,11 @@ def test_a_topic_the_profile_stops_rejecting_goes_back_to_what_it_was(env):
 
     profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
     assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    topics = _topics(app, slug)
+    assert topics["T10001"]["on"] is False and topics["T10001"]["profile"] == "not_interest"
+    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).status_code == 200
+    again = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
+    assert again["T10001"]["on"] is True and again["T10001"]["profile"] is None
     topics = _topics(app, slug)
     assert topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
     assert "on_before_profile" not in {t["id"]: t for t in _stored(env, slug)["topics"]}["T10001"]
@@ -917,7 +963,12 @@ def test_a_rebuild_overtaken_every_time_is_refused_rather_than_written(env, monk
 
 def test_adopted_topics_survive_the_next_rebuild_and_a_save(env):
     """After the forget, a rebuild from the seeds dropped the adopted topics
-    on the first save; the preview showed only the seed topics, all off."""
+    on the first save; the preview showed only the seed topics, all off.
+
+    Since FUNCTIONAL_SPEC E.7 a forget no longer adopts on a saved interest
+    (it keeps its copy of the profile); an interest forgotten before that
+    still has its adopted list, written here as that forget wrote it. The
+    save goes through an Edit interest copy (spec E)."""
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
     slug = _draft_from(app, rid)
@@ -926,11 +977,21 @@ def test_adopted_topics_survive_the_next_rebuild_and_a_save(env):
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
     only_profile = [t["id"] for t in applied if t["on"]]
     _commit(app, slug, only_profile)
+    # The forget as it was before E.7: the profile's topics the interest's own.
+    _write_stored(env, slug, rt.adopt(_stored(env, slug)))
+    conn = connect(env)
+    try:
+        conn.execute("UPDATE profiles SET researcher_id = NULL, researcher_doc_json = NULL WHERE slug = ?", (slug,))
+        conn.commit()
+    finally:
+        conn.close()
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
+    assert all(t.get("source") == "adopted" for t in _stored(env, slug)["topics"] if t["id"] in only_profile)
     preview = {t["id"]: t for t in _request(app, "GET", f"/api/profiles/{slug}/topics/preview").json()}
     assert set(only_profile) <= set(preview) and all(preview[i]["on"] for i in only_profile)
-    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": only_profile})
-    assert saved.status_code == 200, saved.text
+    with _edit(app, slug) as copy:
+        saved = _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": only_profile})
+        assert saved.status_code == 200, saved.text
     stored = _stored(env, slug)
     assert {t["id"] for t in stored["topics"] if t["on"]} == set(only_profile)
     assert all(t.get("source") == "adopted" for t in stored["topics"] if t["id"] in only_profile)
@@ -969,17 +1030,22 @@ def test_choosing_moves_only_that_topic_on_a_saved_interest(env):
     applied = {t["id"]: t for t in _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()}
     on = [i for i, t in applied.items() if t["on"]]
     _commit(app, slug, on)
-    # The user switches a wanted topic off on the edit page.
-    saved = _request(app, "PUT", f"/api/profiles/{slug}/topics",
-                     json={"selected_topic_ids": [i for i in on if i != "https://openalex.org/T10515"]})
-    assert saved.status_code == 200, saved.text
-    before = {t["id"]: t["on"] for t in _stored(env, slug)["topics"]}
-    after = _choose(app, slug, "T10001", "filter")
-    assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
-    assert {i: t["on"] for i, t in after.items() if i != "T10001"} == {i: v for i, v in before.items() if i != "T10001"}
-    back = _choose(app, slug, "T10001", "keep")
-    assert back["T10001"]["on"] is True and back["T10001"]["profile"] is None     # back to its state before the filter
-    assert back["https://openalex.org/T10515"]["on"] is False
+    # The user switches a wanted topic off on the edit page -- on its copy
+    # of the saved interest, which keeps the saved interest's rules (spec E).
+    with _edit(app, slug) as copy:
+        saved = _request(app, "PUT", f"/api/profiles/{copy}/topics",
+                         json={"selected_topic_ids": [i for i in on if i != "https://openalex.org/T10515"]})
+        assert saved.status_code == 200, saved.text
+        before = {t["id"]: t["on"] for t in _stored(env, copy)["topics"]}
+        after = _choose(app, copy, "T10001", "filter")
+        assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
+        assert {i: t["on"] for i, t in after.items() if i != "T10001"} == {i: v for i, v in before.items() if i != "T10001"}
+        back = _choose(app, copy, "T10001", "keep")
+        assert back["T10001"]["on"] is True and back["T10001"]["profile"] is None     # back to its state before the filter
+        assert back["https://openalex.org/T10515"]["on"] is False
+        on_copy = {t["id"]: t["on"] for t in _stored(env, copy)["topics"]}
+    # Saved: the interest's list is the copy's.
+    assert {t["id"]: t["on"] for t in _stored(env, slug)["topics"]} == on_copy
 
 
 def test_choices_survive_removing_and_applying_again(env):
@@ -1099,9 +1165,15 @@ def test_a_choice_on_a_saved_interest_is_made_while_the_mapper_is_down(env, monk
     _commit(app, slug, [t["id"] for t in applied if t["on"]])
     monkeypatch.setattr(wizard.researcher_topics, "with_labels",
                         lambda view, *, settings: {**view, "labels_unmapped": True})
-    after = _choose(app, slug, "T10001", "filter")
-    assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
-    assert _stored(env, slug)["not_interest_choices"]["T10001"] == "filter"
+    # Made on the Edit interest copy and saved (FUNCTIONAL_SPEC E).
+    with _edit(app, slug) as copy:
+        after = _choose(app, copy, "T10001", "filter")
+        assert after["T10001"]["on"] is False and after["T10001"]["profile"] == "not_interest"
+        assert _stored(env, copy)["not_interest_choices"]["T10001"] == "filter"
+    stored = _stored(env, slug)
+    assert stored["not_interest_choices"]["T10001"] == "filter"
+    by = {t["id"]: t for t in stored["topics"]}
+    assert by["T10001"]["on"] is False and by["T10001"]["profile"] == "not_interest"
 
 
 def test_a_list_applied_before_choices_filters_a_not_wanted_topic_a_seed_brings_later(env):
@@ -1141,8 +1213,12 @@ def test_forgetting_the_researcher_forgets_the_choices(env):
 
 def test_a_choice_on_a_saved_interest_leaves_marks_a_re_import_changed(env):
     """Setting one choice re-applied the whole profile to the stored list:
-    a topic the re-imported profile now rejects was switched off too."""
-    app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
+    a topic the re-imported profile now rejects was switched off too.
+
+    Since FUNCTIONAL_SPEC E.7 the interest reads its own copy of the
+    profile, so the re-import does not reach it at all: the choice (made on
+    the Edit interest copy, spec E) moves that one topic and the profile
+    the interest applied still wants T10515."""
     profile = _profile_with_document()
     app = _app(StubProsopia(profile), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
@@ -1157,17 +1233,27 @@ def test_a_choice_on_a_saved_interest_leaves_marks_a_re_import_changed(env):
             entry["weight"] = -0.2                           # now rejected
     profile.metadata = doc
     assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
-    after = _choose(app, slug, "T10001", "filter")
-    assert after["T10001"]["on"] is False
-    assert after[t10515]["on"] is True and after[t10515]["profile"] == "interest"
-    others = {i: (t["on"], t.get("profile")) for i, t in after.items() if i != "T10001"}
-    assert others == {i: (t["on"], t.get("profile")) for i, t in before.items() if i != "T10001"}
+    with _edit(app, slug) as copy:
+        after = _choose(app, copy, "T10001", "filter")
+        assert after["T10001"]["on"] is False
+        assert after[t10515]["on"] is True and after[t10515]["profile"] == "interest"
+        others = {i: (t["on"], t.get("profile")) for i, t in after.items() if i != "T10001"}
+        assert others == {i: (t["on"], t.get("profile")) for i, t in before.items() if i != "T10001"}
+        view = _request(app, "GET", f"/api/profiles/{copy}/researcher-topics").json()
+        assert t10515 in {t["id"] for t in view["topics"]["wanted"]}
+    saved = {t["id"]: t for t in _stored(env, slug)["topics"]}
+    assert saved["T10001"]["on"] is False and saved[t10515]["on"] is True and saved[t10515]["profile"] == "interest"
 
 
 def test_a_saved_interest_shows_the_default_a_save_records(env):
     """A topic the profile newly rejects, which a new seed also lists: the
     view counted its default against the stored list (not there: filter),
-    the save against the rebuilt one (a seed lists it: keep)."""
+    the save against the rebuilt one (a seed lists it: keep).
+
+    Since FUNCTIONAL_SPEC E.7 a re-import does not reach the saved
+    interest (it reads its copy of the profile): the new rejection is not
+    listed until the user takes the profile again, on the Edit interest
+    copy (remove, then apply), which reads the researcher as now."""
     profile = _profile_with_document()
     app = _app(StubProsopia(profile), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
@@ -1178,9 +1264,16 @@ def test_a_saved_interest_shows_the_default_a_save_records(env):
                                                            _topic("T12345", "Something New", weight=-0.4, method="declared")]}
     assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
     _add_seed_topics(env, slug, [("T12345", "Something New")])
-    shown = _rows(app, slug)["https://openalex.org/T12345"]
-    assert shown["overlap"] == ["openalex"] and shown["choice"] == "keep"
-    assert _request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": on}).status_code == 200
+    assert "https://openalex.org/T12345" not in _rows(app, slug)
+    with _edit(app, slug) as copy:
+        assert _request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": False}).status_code == 200
+        # Not applied: the view reads the researcher as stored now.
+        shown = _rows(app, copy)["https://openalex.org/T12345"]
+        assert shown["overlap"] == ["openalex"] and shown["choice"] == "keep"
+        assert _request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": True}).status_code == 200
+        assert _stored(env, copy)["not_interest_choices"]["T12345"] == "keep"
+        assert _request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": on}).status_code == 200
+        assert _stored(env, copy)["not_interest_choices"]["T12345"] == "keep"
     assert _stored(env, slug)["not_interest_choices"]["T12345"] == "keep"
 
 
@@ -1211,13 +1304,21 @@ def test_applying_twice_changes_nothing_the_second_time(env, saved):
     _choose(app, slug, "https://openalex.org/T11986", "add")
     if saved:
         _commit(app, slug, [t["id"] for t in first if t["on"]] + ["https://openalex.org/T11986"])
-    def states():
-        stored = _stored(env, slug)
+    def states(key=slug):
+        stored = _stored(env, key)
         return ({t["id"]: (t["on"], t.get("profile"), t.get("source")) for t in stored["topics"]},
                 stored["not_interest_choices"], stored["researcher_topics"])
 
     once = states()
-    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    if not saved:
+        assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+        assert states() == once
+        return
+    # A saved interest: the second apply on its Edit interest copy (spec E).
+    with _edit(app, slug) as copy:
+        assert states(copy) == once
+        assert _request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": True}).status_code == 200
+        assert states(copy) == once
     assert states() == once
 
 
@@ -1241,7 +1342,11 @@ def test_applying_on_a_saved_interest_records_the_default_shown(env):
     _commit(app, slug, list(_topics(app, slug)))
     _add_seed_topics(env, slug, [("T12345", "Something New")])
     assert _rows(app, slug)["https://openalex.org/T12345"]["choice"] == "keep"
-    assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
+    # Applied on the Edit interest copy and saved (FUNCTIONAL_SPEC E).
+    with _edit(app, slug) as copy:
+        assert _rows(app, copy)["https://openalex.org/T12345"]["choice"] == "keep"
+        assert _request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": True}).status_code == 200
+        assert _stored(env, copy)["not_interest_choices"]["T12345"] == "keep"
     assert _stored(env, slug)["not_interest_choices"]["T12345"] == "keep"
 
 
@@ -1372,17 +1477,29 @@ def test_the_view_survives_a_rebuild_that_fails(env, monkeypatch):
 
 def test_a_choice_records_only_itself(env):
     """A choice also wrote the defaults of the other unrecorded not-wanted
-    topics, without applying them: one then read "filter" while still on."""
+    topics, without applying them: one then read "filter" while still on.
+
+    The unrecorded one came from a re-import; since FUNCTIONAL_SPEC E.7 a
+    re-import does not reach the interest's copy of the profile, so it is
+    in the profile from the start and its record is taken out by hand (a
+    list from before choices were recorded, as above). The choice is made
+    on the Edit interest copy (spec E)."""
     profile = _profile_with_document()
+    profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
+                                                           _topic("T12345", "Something New", weight=-0.4, method="declared")]}
     app = _app(StubProsopia(profile), _stub_openalex())
     slug = _draft_from(app, _import_prosopia(app))
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
     _commit(app, slug, [t["id"] for t in applied if t["on"]])
-    profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
-                                                           _topic("T12345", "Something New", weight=-0.4, method="declared")]}
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    stored = _stored(env, slug)
+    del stored["not_interest_choices"]["T12345"]
+    _write_stored(env, slug, stored)
     recorded = dict(_stored(env, slug)["not_interest_choices"])
-    _choose(app, slug, "T10001", "filter")
+    assert "T12345" not in recorded
+    with _edit(app, slug) as copy:
+        _choose(app, copy, "T10001", "filter")
+        assert _stored(env, copy)["not_interest_choices"] == {**recorded, "T10001": "filter"}
+        assert _rows(app, copy)["https://openalex.org/T10001"]["marked"] == "not_interest"
     assert _stored(env, slug)["not_interest_choices"] == {**recorded, "T10001": "filter"}
     assert _rows(app, slug)["https://openalex.org/T10001"]["marked"] == "not_interest"
 
@@ -1403,7 +1520,9 @@ def test_keep_on_a_saved_interest_keeps_a_topic_a_seed_has_brought_since(env):
     _commit(app, slug, [t["id"] for t in applied if t["on"]] + [t11986])
     _add_seed_topics(env, slug, [("T11986", "Scientific Computing")])
     assert _rows(app, slug)[t11986]["overlap"] == ["openalex"]
-    kept = _choose(app, slug, t11986, "keep")
+    # Chosen on the Edit interest copy and saved (FUNCTIONAL_SPEC E).
+    with _edit(app, slug) as copy:
+        kept = _choose(app, copy, t11986, "keep")
     # Still listed, as the seed's; back to its state before the add -- off,
     # as any topic a seed brings to a saved interest starts -- and the next
     # rebuild agrees rather than bringing it back as new.
@@ -1469,7 +1588,9 @@ def test_a_step_3_read_overtaken_by_the_commit_does_not_rebuild_the_saved_list(e
 
 def test_forgetting_after_a_commit_treats_the_interest_as_saved(env, monkeypatch):
     """Draft or saved was read before the delete, outside the lock: a commit
-    in between had the saved list stripped as a draft's."""
+    in between had the saved list stripped as a draft's. Saved by then, the
+    interest keeps the topics it was saved with, exactly (E.7: an interest
+    does not follow its researcher; it used to have them "adopted")."""
     from rag_lib.api.services import researchers as researchers_service
     app = _app(StubProsopia(_profile_with_document()), _stub_openalex())
     rid = _import_prosopia(app)
@@ -1484,9 +1605,11 @@ def test_forgetting_after_a_commit_treats_the_interest_as_saved(env, monkeypatch
         return real(conn, researcher_id)
 
     monkeypatch.setattr(researchers_service.researchers_repo, "delete", committing)
+    before = _stored(env, slug)
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
-    stored = {t["id"]: t for t in _stored(env, slug)["topics"]}
-    assert only_profile and all(stored[i]["source"] == "adopted" and stored[i]["on"] for i in only_profile)
+    assert _stored(env, slug) == before
+    stored = {t["id"]: t for t in before["topics"]}
+    assert only_profile and all(stored[i]["source"] == "researcher" and stored[i]["on"] for i in only_profile)
 
 
 def test_the_view_leaves_step_3s_umls_notice_as_it_was(env, monkeypatch):

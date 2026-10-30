@@ -6,7 +6,10 @@ producing a lightweight record (``PdfIngestRecord``) that
 the same path CSV-driven builds use.
 
 pdfplumber is imported lazily so ``rag_lib`` remains importable without
-the ``phase1b`` extras installed.
+the ``phase1b`` extras installed. It reads page 1 for the title and the
+first-page DOI, as before; the body is read by :mod:`rag_lib.pdf_text`
+(pdfminer layout: columns in order, headers and footers dropped, broken
+words joined), which also finds the abstract.
 
 What this module does NOT do:
   - Chroma vector index writes. The build spec calls for a Chroma-backed
@@ -26,6 +29,8 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import pdf_text
 
 
 # The leading guard is a negative lookbehind rather than ``\b``. PDF text
@@ -61,18 +66,29 @@ class PdfIngestRecord:
 
     path: str
     title: str                          # best-effort from first non-empty line
-    body_text: str                      # all extractable text, joined pages
+    body_text: str                      # all extractable text (rag_lib.pdf_text.as_paragraphs)
     doi: str | None = None              # first DOI found in the text / metadata
     n_pages: int = 0
     # The DOI was not on page 1 or in the metadata but further in the body,
     # where it may be a reference's -- the matcher asks more of it then.
     doi_from_body: bool = False
+    # The abstract as printed in the PDF (rag_lib.pdf_text.find_abstract),
+    # None when it was not found for certain.
+    abstract: str | None = None
+    # The first pages as pdfplumber reads them, at least FRONT_CHARS of
+    # it: where the OpenAlex match looks for the title and the authors
+    # (rag_lib.api.services.vault.title_rule / author_rule), read as it
+    # was before the body moved to pdf_text, so matching is unchanged.
+    front_text: str = ""
+
+
+FRONT_CHARS = 6000
 
 
 def ingest_pdf(path: str | Path) -> PdfIngestRecord:
     """Extract title, body, and DOI from a local PDF.
 
-    Uses pdfplumber. Title: the largest-font text block on page 1, with
+    Body and abstract: :mod:`rag_lib.pdf_text`. Title: the largest-font text block on page 1, with
     publisher boilerplate rejected and wrapped lines rejoined — see
     :func:`_title_from_page`, reconciled against the embedded metadata
     title; falls back to the first non-boilerplate line, then to the
@@ -88,18 +104,23 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
             "Install with: pip install -e '.[dev,phase1b]'"
         ) from e
 
-    pages_text: list[str] = []
     meta: dict = {}
     layout_title = ""
+    first_page = ""
     with pdfplumber.open(str(path)) as pdf:
         meta = dict(pdf.metadata or {})
+        front_pages: list[str] = []
         for i, page in enumerate(pdf.pages):
-            pages_text.append(page.extract_text() or "")
+            front_pages.append(page.extract_text() or "")
             if i == 0:
+                first_page = front_pages[0]
                 layout_title = _title_from_page(page)
+            if sum(map(len, front_pages)) >= FRONT_CHARS:
+                break
 
-    body = "\n\n".join(pages_text).strip()
-    first_page = pages_text[0] if pages_text else ""
+    pages = pdf_text.read_pages(path)
+    lines = pdf_text.body_from_pages(pages)
+    body = pdf_text.as_paragraphs(pdf_text.mark_lead(lines))
 
     title = (
         _reconcile_title(layout_title, _meta_title(meta), first_page)
@@ -107,7 +128,11 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
         or path.stem
     )
 
-    doi = _extract_doi(first_page, body, meta)
+    # The DOI further on: the first pages as pdfplumber read them, as
+    # before, then the rest with every line kept (a DOI printed in each
+    # page's footer is dropped from ``body`` with the footers).
+    doi = _extract_doi(first_page, "\n\n".join(front_pages) + "\n\n"
+                       + "\n".join(l for p in pages for l in p), meta)
     front = _find_doi(first_page) or _doi_from_metadata(meta)
 
     return PdfIngestRecord(
@@ -115,8 +140,10 @@ def ingest_pdf(path: str | Path) -> PdfIngestRecord:
         title=title,
         body_text=body,
         doi=doi,
-        n_pages=len(pages_text),
+        n_pages=len(pages),
         doi_from_body=doi is not None and front is None,
+        abstract=pdf_text.find_abstract(lines),
+        front_text="\n\n".join(front_pages).strip(),
     )
 
 

@@ -55,9 +55,13 @@ def _states(filters):
 
 def test_d_apply_then_remove_leaves_a_saved_interests_topics_as_they_were(tmp_path, monkeypatch):
     conn, uid, pid, slug, stored = _saved_interest_whose_seeds_changed(tmp_path, monkeypatch)
-    # The edit page shows the recomputed list (T1 only) -- that is the preview...
+    # The edit page shows the recomputed list -- that is the preview: T1
+    # from the seeds, T2 kept as saved but marked as no seed's any more
+    # (FUNCTIONAL_SPEC T.2-2; it used to drop out of the preview)...
     preview, _new = wizard.preview_topics(conn, user_id=uid, slug=slug)
-    assert set(_states(preview)) == {T1}
+    assert _states(preview) == {T1: True, T2: True}
+    by_id = {t["id"]: t for t in preview["topics"]}
+    assert by_id[T2].get("unmatched") is True and by_id[T2]["count"] == 0 and not by_id[T1].get("unmatched")
     # ...and the stored list is untouched by looking.
     assert _states(profiles_repo.topic_filters(conn, pid)) == {T1: True, T2: True}
 
@@ -79,12 +83,20 @@ def test_d_apply_then_remove_leaves_a_saved_interests_topics_as_they_were(tmp_pa
 
 
 def test_d_re_applying_after_the_profile_changed_drops_its_stale_marks(tmp_path, monkeypatch):
+    """Since FUNCTIONAL_SPEC E.7 the interest keeps the copy of the profile
+    it applied: applying again while applied changes nothing, however the
+    researcher changed. Taking the profile off and applying it again reads
+    the researcher as now -- and drops the old profile's marks."""
     conn, uid, pid, slug, _stored = _saved_interest_whose_seeds_changed(tmp_path, monkeypatch)
-    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    first = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
     # The profile is re-read: it no longer minds T2 and wants T1 instead of T3.
     conn.execute("UPDATE researchers SET document_json = ? WHERE id = (SELECT researcher_id FROM profiles WHERE id = ?)",
                  (json.dumps({"research_interests": [_topic("T10001", "One", weight=0.5, method="declared")]}), pid))
     conn.commit()
+    same = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    assert _states(same) == _states(first) == {T1: True, T2: False, T3: True}
+    assert {t["id"]: t.get("profile") for t in same["topics"]} == {t["id"]: t.get("profile") for t in first["topics"]}
+    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=False)
     again = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
     assert _states(again) == {T1: True, T2: True}          # T2 back as it was, T3 gone with the profile
     by_id = {t["id"]: t for t in again["topics"]}

@@ -326,7 +326,7 @@ def prepare_researcher_import(
 
 def _to_researcher(conn: sqlite3.Connection, row: sqlite3.Row) -> Researcher:
     n_interests = conn.execute(
-        "SELECT COUNT(*) FROM profiles WHERE researcher_id = ?", (int(row["id"]),),
+        "SELECT COUNT(*) FROM profiles WHERE researcher_id = ? AND edit_of IS NULL", (int(row["id"]),),
     ).fetchone()[0]
     last_run = None
     if row["last_run_id"] is not None:
@@ -541,14 +541,17 @@ def delete_researcher(
     # filling lost its "still importing" state and could be committed half
     # done.
     _refuse_if_importing(conn, user_id, researcher_id=researcher_id)
-    interests = [int(p["id"]) for p in researchers_repo.interests_for(conn, researcher_id)]
+    # A saved interest (or a copy of one being edited) keeps what it took
+    # from the researcher -- its seeds, and its topics with the copy of the
+    # profile they were applied from: interests are independent of the
+    # researcher once made (FUNCTIONAL_SPEC E.7). Only a new interest's
+    # draft, still being built from them, loses their profile topics.
+    drafts = [int(p["id"]) for p in researchers_repo.interests_for(conn, researcher_id)
+              if wizard_service.is_new_draft(p)]
     researchers_repo.delete(conn, researcher_id)
-    # Their profile topics, where applied, go with them: the saved list is
-    # what every scan reads, and with the researcher gone nothing else
-    # would rebuild it (the box that offers "Remove" needs the researcher).
     # After the delete, so a delete that fails changes no list; a drop that
     # fails is met by the next aggregation, which finds the researcher gone.
-    for profile_id in interests:
+    for profile_id in drafts:
         wizard_service.drop_profile_topics(conn, profile_id)
 
 
@@ -640,14 +643,16 @@ def attach_seeds(
     source: str = "vault",
     researcher_id: int | None = None,
 ) -> tuple[int, list[str], int | None]:
-    """Add already-stored papers to a draft or a live profile as seeds.
+    """Add already-stored papers to a draft as seeds: a new interest's, or
+    the copy Edit interest changes. A saved interest's seeds change only
+    through that copy (FUNCTIONAL_SPEC E.6 R12): ``wizard.SavedInterest``.
 
     ``source`` and ``researcher_id`` are recorded as where they came from
     (``profiles_repo.SEED_SOURCES``). A ``researcher_id`` that is not one of
     the user's is a ``LookupError``.
 
-    Returns ``(attached, rejected, rescored)``: ``rescored`` is how many
-    stored candidates a live interest's refit re-scored, None for a draft.
+    Returns ``(attached, rejected, rescored)``; ``rescored`` is always None
+    now (a draft is not scored), kept for the response shape.
 
     Only papers the user owns (uploaded, imported with a researcher, a
     seed elsewhere, or a candidate in one of their interests) are
@@ -655,13 +660,15 @@ def attach_seeds(
     ``LookupError`` when the profile does not exist.
 
     Any attached paper without a vector is embedded here: the fit leaves
-    out a seed it cannot place, and a paper taken from the feed has none.
-    A live profile is then re-fitted, so the seeds it scores against are
-    the seeds it shows.
+    out a seed it cannot place.
     """
+    from . import wizard as wizard_service
+
     row = profiles_repo.get_by_slug(conn, user_id, slug)
     if row is None:
         raise LookupError(f"interest '{slug}' not found for current user")
+    if not row["is_draft"]:
+        raise wizard_service.SavedInterest(slug)
     if gather_runs_repo.has_unfinished_import(conn, int(row["id"])):
         # As coherence, the trial and commit: the import is filling the seeds.
         from .wizard import ImportInProgress
@@ -695,20 +702,8 @@ def attach_seeds(
         raise LookupError(f"interest '{slug}' not found for current user") from exc
     if accepted:
         # Over every accepted id, not just the newly attached ones: the
-        # seed row commits before this runs, so if embedding or the refit
-        # failed, a retry found the seed "already attached", did nothing,
-        # and the interest kept scoring against the old centroid. Both
-        # steps are idempotent, so running them again is the repair.
-        from . import wizard as wizard_service
-
+        # seed row commits before this runs, so if embedding failed, a
+        # retry found the seed "already attached" and did nothing. It is
+        # idempotent, so running it again is the repair.
         wizard_service.embed_missing(conn, row["embedding_model"], accepted)
-        if not row["is_draft"]:
-            try:
-                fit = wizard_service.refit_profile(conn, user_id=user_id, slug=slug)
-            except wizard_service.ScanRunning as exc:
-                # The seeds are attached; the running scan's rescore is on
-                # the old centroid, and the next refit picks them up.
-                log.warning("researchers.add_seeds.refit_skipped", slug=slug, reason=str(exc)[:160])
-                return attached, rejected, None
-            return attached, rejected, fit.get("n_rescored")
     return attached, rejected, None

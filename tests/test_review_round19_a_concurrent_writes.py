@@ -18,6 +18,7 @@ import pytest
 
 from rag_lib.db import connect as _real_connect
 from rag_lib.db.repos.profiles import bar
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
     _go_live, _ok, _q, _request, _scan, _upload, app, env,
 )
@@ -316,21 +317,198 @@ def test_commit_vs_seed_change_on_the_draft(app, env, traced, tmp_path):
     assert not bad, "\n".join(bad)
 
 
-def test_refit_in_another_tab_puts_a_removed_seed_back_into_the_fit(app, env, world, traced):
-    """Tab 1 presses Refit; while it fits, tab 2 removes a seed (answered 200).
-    Tab 1's fit, made from the old seeds, is written last: the removed
-    paper is still in the centroid the feed is scored with, and n_seed
-    counts it."""
-    calls = _calls(world)
-    out = {}
-    traced.update(n=0, at=1, fired=False, armed=True,
-                  hook=lambda: out.update(b=_send(app, calls["rm0"], "x")))
-    ra = _send(app, calls["refit"], "a")
-    traced["armed"] = False
-    traced["thread"].join()
-    assert ra.status_code == 200 and out["b"].status_code == 200
-    st = _state(world)
+def _scan_seeds(w):
+    """The seeds the interest's last successful scan recorded it scored with."""
+    from rag_lib.db.repos import gather_runs as gather_runs_repo
+
+    c = _real_connect(_db())
+    try:
+        last = gather_runs_repo.last_scan(c, w["pid"])
+    finally:
+        c.close()
+    return sorted(last[1]) if last and last[1] is not None else None
+
+
+def _copy_open(w):
+    """Whether the copy the fixture opened (by id: a reopened copy may get
+    its slug) is still there."""
+    c = _real_connect(_db())
+    try:
+        return c.execute("SELECT 1 FROM profiles WHERE id = ?", (w["copy_id"],)).fetchone() is not None
+    finally:
+        c.close()
+
+
+def _n_copies(w):
+    c = _real_connect(_db())
+    try:
+        return c.execute("SELECT COUNT(*) FROM profiles WHERE edit_of = ?", (w["pid"],)).fetchone()[0]
+    finally:
+        c.close()
+
+
+@pytest.fixture()
+def editing(app, env, world, tmp_path):
+    """``world`` with Edit interest open on the live interest (spec E): the
+    copy has seed 0 removed, ``extra`` added and threshold 0.2."""
+    L = world["live"]
+    copy = _ok(_request(app, "POST", f"/api/profiles/{L}/edit"))["slug"]
+    _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": world["seeds"][0]}))
+    _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [world["extra"]]}))
+    _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": 0.2}))
+    copy_id = _q(env, "SELECT id FROM profiles WHERE slug = ?", copy)[0][0]
+    snap = tmp_path / "editing.db"
+    _copy(_db(), snap)
+    return dict(world, copy=copy, copy_id=copy_id, esnap=snap)
+
+
+def _edit_calls(w):
+    L, C, s1, c0 = w["live"], w["copy"], w["seeds"][-1], w["cards"][0]
+    return {
+        "save_edit": ("POST", f"/api/profiles/draft/{C}/save-edit", {}),
+        "discard": ("DELETE", f"/api/profiles/draft/{C}", {}),
+        "reopen": ("POST", f"/api/profiles/{L}/edit", {}),
+        "copy_rm1": ("DELETE", f"/api/profiles/{C}/seeds", {"params": {"openalex_id": s1}}),
+        "copy_topics1": ("PUT", f"/api/profiles/{C}/topics", {"json": {"selected_topic_ids": w["tids"][:1]}}),
+        "copy_upload": ("UPLOAD", C, {}),
+        "scan": ("POST", f"/api/profiles/{L}/gather-now?days=7", {}),
+        "backfill": ("POST", f"/api/profiles/{L}/backfill", {"json": {"year_from": 2019, "year_to": None}}),
+        "save": ("POST", "/api/radar/cards/save", {"json": {"card_id": c0, "profile": L, "on": True}}),
+        "dismiss": ("POST", "/api/radar/cards/dismiss", {"json": {"card_id": c0, "profile": L, "on": True}}),
+    }
+
+
+def _edit_invariants(w, st):
+    """Spec E: saving does not refit, and no save lands under a scan -- so
+    the fit is the snapshot's or the current seeds', and the last scan's
+    recorded seeds are the ones it fitted on."""
+    bad = [x for x in _invariants(st) if not x.startswith("fit made from")]
+    fit = _fit_seeds(st["p"])
+    if fit is not None and fit not in (sorted(w["seeds"]), st["seeds"]):
+        bad.append(f"fit made from {fit}, neither the old seeds nor the interest's {st['seeds']}")
+    scanned = _scan_seeds(w)
+    if scanned is not None and fit is not None and scanned != fit:
+        bad.append(f"the last scan records seeds {scanned} but the fit is from {fit}")
+    if _n_copies(w) > 1:
+        bad.append(f"{_n_copies(w)} copies open")
+    return bad
+
+
+def _edit_effect(name, w, st):
+    p = st["p"]
+    if name == "save_edit":
+        if w["seeds"][0] in st["seeds"] or w["extra"] not in st["seeds"]:
+            return f"saved seeds lost: {st['seeds']}"
+        if abs(p["threshold"] - bar(0.2)) > 1e-9:
+            return f"saved threshold lost: {p['threshold']}"
+        if _copy_open(w):
+            return "the copy is still there after saving"
+    if name == "discard" and _copy_open(w):
+        return "the copy is still there after discarding"
+    if name == "save" and (st["card"] is None or st["card"]["saved_at"] is None):
+        return "card not saved"
+    if name == "dismiss" and (st["card"] is None or st["card"]["dismissed_at"] is None):
+        return "card not dismissed"
+    return None
+
+
+# B legitimately undoes A, A running last: A discards or reopens (which
+# discards) the copy B changed; save/dismiss of one card.
+EDIT_OVERRIDES = {
+    ("discard", "copy_rm1"), ("discard", "copy_topics1"), ("discard", "copy_upload"),
+    ("reopen", "copy_rm1"), ("reopen", "copy_topics1"), ("reopen", "copy_upload"),
+    ("save", "dismiss"), ("dismiss", "save"),
+}
+
+
+def test_two_tabs_while_one_edits_the_interest(app, env, editing, traced):
+    """Spec E's race surface: a copy is open in Edit interest; one tab saves,
+    discards, reopens or changes it while another scans, backfills, triages
+    or changes the copy. No save lands under a scan (E.6 R11), no scan runs
+    while the copy is open (E.7 R9), and saving does not refit."""
+    w = editing
+    calls = _edit_calls(w)
+    bad = []
+    for a in calls:
+        for b in calls:
+            for at in range(1, MAX_TX + 1):
+                _copy(w["esnap"], _db())
+                out = {}
+
+                def hook(b=b, at=at):
+                    out["b"] = _send(app, calls[b], f"b{at}")
+                traced.update(n=0, at=at, fired=False, armed=True, hook=hook)
+                ra = _send(app, calls[a], f"a{at}")
+                traced["armed"] = False
+                if not traced["fired"]:
+                    break
+                traced["thread"].join()
+                rb = out["b"]
+                st = _state(w)
+                label = f"A={a} B={b} (B before A's tx {at}) A->{ra.status_code} B->{rb.status_code}"
+                probs = [f"{nm} {r.status_code} {r.text[:200]}" for nm, r in (("A", ra), ("B", rb)) if r.status_code >= 500]
+                probs += _edit_invariants(w, st)
+                if 200 <= ra.status_code < 300:
+                    e = _edit_effect(a, w, st)
+                    if e:
+                        probs.append(f"A's effect lost: {e}")
+                if 200 <= rb.status_code < 300 and (a, b) not in EDIT_OVERRIDES and a != b:
+                    e = _edit_effect(b, w, st)
+                    if e:
+                        probs.append(f"B's effect lost: {e}")
+                # The copy open: the scan is refused, unless B saved or discarded it first.
+                if a in ("scan", "backfill") and 200 <= ra.status_code < 300 and not (
+                        b in ("save_edit", "discard") and 200 <= rb.status_code < 300):
+                    probs.append(f"A {a} ran while the copy was open")
+                if probs:
+                    bad.append(f"{label}: " + "; ".join(probs))
+    print("\n".join(bad))
+    assert not bad, f"{len(bad)} bad interleavings:\n" + "\n".join(bad)
+
+
+def test_a_copy_saved_while_a_scan_refits_is_refused(app, env, world, traced):
+    """Was: tab 1 presses Refit; while it fits, tab 2 removes a seed
+    (answered 200) and tab 1's fit, made from the old seeds, is written
+    last. Spec E: a saved interest is refitted only by a scan and its seeds
+    change only when a copy is saved, which is refused while a scan runs.
+    So: tab 1 scans (refitting first, the fit being stale); before each of
+    its transactions tab 2 saves a copy that removes a seed. Whichever
+    lands, the fit is the interest's seeds and the scan records them."""
+    L = world["live"]
     removed = world["seeds"][0]
-    assert removed not in st["seeds"]
-    assert removed not in (_fit_seeds(st["p"]) or []), "removed seed is still in the stored fit"
-    assert st["p"]["n_seed"] == len(st["seeds"])
+    # Stale fit: ``extra`` saved as a seed, not yet fitted.
+    with edit_saved(lambda m, p, **k: _request(app, m, p, **k), L) as copy:
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [world["extra"]]}))
+    snap = env.parent / "race.db"
+    _copy(_db(), snap)
+    outcomes = set()
+    for at in range(1, MAX_TX + 1):
+        _copy(snap, _db())
+        out = {}
+
+        def hook():
+            # Tab 2: Edit interest (it opens under a running scan), remove a seed, save.
+            copy = _ok(_request(app, "POST", f"/api/profiles/{L}/edit"))["slug"]
+            _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": removed}))
+            out["b"] = _request(app, "POST", f"/api/profiles/draft/{copy}/save-edit")
+        traced.update(n=0, at=at, fired=False, armed=True, hook=hook)
+        ra = _request(app, "POST", f"/api/profiles/{L}/gather-now?days=7")
+        traced["armed"] = False
+        if not traced["fired"]:
+            break
+        traced["thread"].join()
+        rb = out["b"]
+        assert ra.status_code == 200, (at, ra.text)
+        assert rb.status_code in (200, 409), (at, rb.status_code, rb.text)
+        outcomes.add(rb.status_code)
+        st = _state(world)
+        if rb.status_code == 200:
+            assert removed not in st["seeds"], at
+        else:
+            assert "scan" in rb.text and removed in st["seeds"], (at, rb.text)   # nothing written
+        fit = _fit_seeds(st["p"])
+        assert fit == st["seeds"], (at, rb.status_code, "the fit is not the interest's seeds")
+        assert _scan_seeds(world) == fit, (at, rb.status_code, "the scan records other seeds than it fitted")
+        assert st["p"]["n_seed"] == len(st["seeds"])
+        assert not st["open_runs"]
+    assert 409 in outcomes, "no save landed under the running scan: the race was not exercised"

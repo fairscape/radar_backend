@@ -20,6 +20,7 @@ from rag_lib.db.repos import profiles as profiles_repo
 from rag_lib.db.repos import users as users_repo
 from rag_lib.scheduler import jobs as scheduler_jobs
 from rag_lib.vault import PdfIngestRecord
+from tests.edit_helpers import edit_saved
 from tests.fixture_gatherer import FixtureGatherer
 from tests.test_api_profiles import _seed_db
 from tests.test_review_round12_journeys import InlineScheduler
@@ -109,6 +110,12 @@ def _upload(app, content: bytes, filename: str, slug: str | None = None, headers
     return _request(app, "POST", "/api/vault/upload", files=files, data=data, headers=headers or A)
 
 
+def _edit(app, slug=SLUG, **kw):
+    """Edit interest as A: a saved interest changes only on a copy, saved
+    in one go (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda m, p, **k: _request(app, m, p, headers=A, **k), slug, **kw)
+
+
 def _q(env, sql, *params):
     conn = connect(env)
     try:
@@ -139,13 +146,14 @@ def test_probe_feed_year_filters_and_years_patch(app, env):
     conn.commit(); conn.close()
     d = _ok(_request(app, "GET", "/api/radar/daily?year_from=2030", headers=A))
     print("year_from=2030 ->", [c["id"] for c in d["cards"]])
-    # Years PATCH validation.
-    r = _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2030, "year_to": None}}, headers=A)
-    print("years 2030:", r.status_code, r.text)
-    r = _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A)
-    print("years reversed:", r.status_code, r.text)
-    r = _request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": None, "year_to": 2020}}, headers=A)
-    print("years to-only:", r.status_code, r.text[:200])
+    # Years PATCH validation (in Edit interest, spec E).
+    with _edit(app) as copy:
+        r = _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2030, "year_to": None}}, headers=A)
+        print("years 2030:", r.status_code, r.text)
+        r = _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2020, "year_to": 2010}}, headers=A)
+        print("years reversed:", r.status_code, r.text)
+        r = _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": 2020}}, headers=A)
+        print("years to-only:", r.status_code, r.text[:200])
     d = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("feed after to=2020:", len(d["cards"]), [c["id"] for c in d["cards"]][:5])
     dr = _ok(_request(app, "POST", f"/api/profiles/{SLUG}/dry-run", headers=A))
@@ -153,7 +161,8 @@ def test_probe_feed_year_filters_and_years_patch(app, env):
     p = _ok(_request(app, "GET", f"/api/profiles/{SLUG}", headers=A))
     print("profile years:", p["yearFrom"], p["yearTo"])
     # clear
-    _ok(_request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": None, "year_to": None}}, headers=A))
+    with _edit(app) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": None}}, headers=A))
     d = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("feed after clear:", len(d["cards"]))
 
@@ -172,7 +181,8 @@ def test_probe_backfill(app, env):
     d = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("feed fetchedAt/scored:", d["fetchedAt"], d["candidatesScored"], len(d["cards"]))
     # Now with years saved to 2001-2002: feed should restrict.
-    _ok(_request(app, "PATCH", f"/api/profiles/{SLUG}", json={"years": {"year_from": 2001, "year_to": 2002}}, headers=A))
+    with _edit(app) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2001, "year_to": 2002}}, headers=A))
     d = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("feed 2001-2002:", [(c["id"], c["date"], c["bucket"], c["score"]) for c in d["cards"]])
     rows = _q(env, "SELECT pc.openalex_id, p.year, pc.score_pct, pc.score_blended FROM profile_candidates pc JOIN papers p USING (openalex_id) WHERE pc.profile_id = 1 AND p.year < 2010")
@@ -182,8 +192,12 @@ def test_probe_backfill(app, env):
 def test_probe_feed_add_to_seeds(app, env):
     daily = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     cid = daily["cards"][0]["id"]
+    # Spec E (R1): the feed's "add as seed" is gone; the paper is added in Edit interest.
     r = _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": [cid]}, headers=A)
-    print("add seed:", r.status_code, r.text[:300])
+    assert r.status_code == 409, r.text
+    with _edit(app) as copy:
+        r = _request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [cid]}, headers=A)
+        print("add seed:", r.status_code, r.text[:300])
     d2 = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("still in feed?", cid in [c["id"] for c in d2["cards"]])
     docs = _ok(_request(app, "GET", "/api/vault/docs?tag=" + SLUG, headers=A))
@@ -191,15 +205,17 @@ def test_probe_feed_add_to_seeds(app, env):
     det = _ok(_request(app, "GET", f"/api/profiles/{SLUG}/detail", headers=A))
     print("seeds:", det["profile"]["seeds"], [s["id"] for s in det["seeds"]][-2:])
     # And remove it again: does it come back to the feed?
-    r = _request(app, "DELETE", f"/api/profiles/{SLUG}/seeds?openalex_id={cid}", headers=A)
-    print("remove seed:", r.status_code, r.text[:300])
+    with _edit(app) as copy:
+        r = _request(app, "DELETE", f"/api/profiles/{copy}/seeds?openalex_id={cid}", headers=A)
+        print("remove seed:", r.status_code, r.text[:300])
     d3 = _ok(_request(app, "GET", f"/api/radar/daily?profile={SLUG}", headers=A))
     print("back in feed?", cid in [c["id"] for c in d3["cards"]])
     rows = _q(env, "SELECT openalex_id, score, score_raw, score_pct, score_blended FROM profile_candidates WHERE openalex_id = ?", cid)
     print("row:", rows)
-    # B cannot seed A's paper
+    # B cannot seed A's paper, nor open A's interest for editing
     r = _request(app, "POST", f"/api/profiles/{SLUG}/seeds", json={"openalex_ids": [cid]}, headers=B)
     print("B add seed:", r.status_code, r.text[:200])
+    assert _request(app, "POST", f"/api/profiles/{SLUG}/edit", headers=B).status_code == 404
 
 
 def test_probe_vault(app, env):

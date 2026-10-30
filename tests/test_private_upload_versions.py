@@ -29,8 +29,10 @@ from rag_lib.db.repos import (
     users as users_repo,
     versions as versions_repo,
 )
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_isolation import A, B, _request, world  # noqa: F401 -- fixture
 from tests.test_researchers import env  # noqa: F401 -- fixture
+from tests.test_db_migrate import EXPECTED_VERSIONS
 
 W = "https://openalex.org/W77"
 TOPIC = {"id": "https://openalex.org/T11", "display_name": "Public topic", "score": 0.9}
@@ -59,7 +61,7 @@ def pdfs(world, monkeypatch):
 
     content_calls = []
 
-    def content(title, body, *, settings):
+    def content(title, abstract, body, *, settings):
         content_calls.append(body)
         return json.dumps({"source": "pdf_content", "topics": [{"id": "T-content", "display_name": "From text"}]})
 
@@ -92,6 +94,13 @@ def _upload(world, data: bytes, headers, slug=None):
     r = _post(world, data, headers, slug)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def _upload_saved(world, data: bytes, headers, slug):
+    """Upload into saved interest ``slug``: only through Edit interest
+    (spec E), so into its copy, saved back on the way out."""
+    with edit_saved(lambda m, p, **kw: _request(world["app"], m, p, headers=headers, **kw), slug) as copy:
+        return _upload(world, data, headers, slug=copy)
 
 
 def _row(env, oid):
@@ -144,7 +153,7 @@ def test_a_matched_upload_keeps_openalex_title_and_topics(pdfs):
 
 def test_a_revised_file_is_a_new_version_and_the_old_one_stays_a_seed(pdfs):
     env, live = pdfs["env"], pdfs["live"]
-    v1 = _upload(pdfs, b"matched draft one", A, slug=live)
+    v1 = _upload_saved(pdfs, b"matched draft one", A, live)
     v2 = _upload(pdfs, b"matched draft two", A)
     assert v2["id"] != v1["id"] and v2["canonicalId"] == v1["canonicalId"] == W
     assert "draft one" in _row(env, v1["id"])["body_text"]
@@ -175,7 +184,7 @@ def test_the_same_bytes_again_are_a_duplicate_unless_the_file_is_gone(pdfs):
 
 def test_a_seeded_version_keeps_its_public_work_out_of_the_feed(pdfs):
     env, live_id = pdfs["env"], pdfs["live_id"]
-    v = _upload(pdfs, b"matched alice", A, slug=pdfs["live"])
+    v = _upload_saved(pdfs, b"matched alice", A, pdfs["live"])
     conn = connect(env)
     try:
         ids, _ = profiles_repo.seed_keys(conn, live_id)
@@ -199,7 +208,7 @@ def test_an_upload_is_a_seed_beside_its_works_public_record(pdfs):
         assert profiles_repo.attach_seed(conn, live_id, W) == 1
     finally:
         conn.close()
-    v = _upload(pdfs, b"matched alice", A, slug=pdfs["live"])
+    v = _upload_saved(pdfs, b"matched alice", A, pdfs["live"])
     conn = connect(env)
     try:
         seeds = profiles_repo.list_seed_openalex_ids(conn, live_id)
@@ -234,8 +243,16 @@ def test_another_users_version_cannot_be_used(pdfs):
         assert papers_repo.get_by_doi(conn, "10.1/w77") is None
     finally:
         conn.close()
-    r = _request(pdfs["app"], "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [a["id"]]}, headers=B)
-    assert r.status_code in (200, 400) and a["id"] in r.json().get("rejected", [a["id"]])
+    # B's interest is saved: seeds go through Edit interest (spec E). It
+    # has no seeds of its own, so the copy cannot be saved; discard it.
+    with edit_saved(lambda m, p, **kw: _request(pdfs["app"], m, p, headers=B, **kw), slug, save=False) as copy:
+        r = _request(pdfs["app"], "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [a["id"]]}, headers=B)
+        assert r.status_code in (200, 400) and a["id"] in r.json().get("rejected", [a["id"]])
+    conn = connect(env)
+    try:
+        assert a["id"] not in profiles_repo.list_seed_openalex_ids(conn, pid)
+    finally:
+        conn.close()
 
 
 def test_the_vault_lists_a_work_once(pdfs):
@@ -341,7 +358,7 @@ def test_0029_moves_each_upload_to_its_own_version(tmp_path):
     conn.close()
 
     conn = connect(db)
-    assert apply_migrations(conn) == ["0029_private_upload_versions", "0030_draft_owned"]
+    assert apply_migrations(conn) == EXPECTED_VERSIONS[EXPECTED_VERSIONS.index("0029_private_upload_versions"):]
     va, va2, vb = (versions_repo.version_id(uid["a"], "hA"), versions_repo.version_id(uid["a"], "hA2"),
                    versions_repo.version_id(uid["b"], "hB"))
     try:

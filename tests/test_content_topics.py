@@ -96,7 +96,7 @@ def test_a_failing_embedder_leaves_it_for_later(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("ollama down")
     monkeypatch.setattr(content_topics, "topics_from_text", boom)
-    assert content_topics.try_topics_json("t", "b", settings=SimpleNamespace()) is None
+    assert content_topics.try_topics_json("t", None, "b", settings=SimpleNamespace()) is None
 
 
 # --- into the interest's topics ---------------------------------------------

@@ -17,6 +17,7 @@ import sqlite3
 import pytest
 
 from rag_lib.db import connect
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
     _go_live, _import_researcher, _ok, _q, _request, _scan, _upload, app, env,
 )
@@ -47,7 +48,15 @@ def world(app, env, tmp_path):
     card = _q(env, "SELECT pc.openalex_id FROM profile_candidates pc JOIN profiles p ON p.id = pc.profile_id WHERE p.slug = ? LIMIT 1", live)[0][0]
     snap = tmp_path / "snap.db"
     _copy(_db_path(env), snap)
-    return dict(live=live, draft=draft, rdraft=rdraft, rid=rid, seeds=seeds, card=card, snap=snap)
+    # The same world with Live One open in Edit interest: every change to a
+    # saved interest now goes through its copy (spec E), so the sweep runs
+    # the copy's routes too, from this snapshot. The DB is put back after.
+    copy = _ok(_request(app, "POST", f"/api/profiles/{live}/edit"))["slug"]
+    snap_edit = tmp_path / "snap_edit.db"
+    _copy(_db_path(env), snap_edit)
+    _copy(snap, _db_path(env))
+    return dict(live=live, draft=draft, rdraft=rdraft, rid=rid, seeds=seeds, card=card, snap=snap,
+                copy=copy, snap_edit=snap_edit)
 
 
 def _calls(w):
@@ -87,6 +96,26 @@ def _calls(w):
     ]
 
 
+def _edit_calls(w):
+    """The copy's routes (spec E), each run once with the copy deleted (the
+    other tab's Discard) and once with the interest it copies deleted."""
+    live, copy, s0 = w["live"], w["copy"], w["seeds"][0]
+    calls = [
+        ("PATCH", f"/api/profiles/{copy}", {"json": {"threshold": 0.2}}),
+        ("PATCH", f"/api/profiles/{copy}", {"json": {"years": {"year_from": 2019, "year_to": None}}}),
+        ("POST", f"/api/profiles/{copy}/recompute-coherence", {}),
+        ("POST", f"/api/profiles/{copy}/recompute-topics", {}),
+        ("PUT", f"/api/profiles/{copy}/researcher-topics", {"json": {"enabled": True}}),
+        ("PUT", f"/api/profiles/{copy}/researcher-topics", {"json": {"enabled": False}}),
+        ("POST", f"/api/profiles/{copy}/seeds", {"json": {"openalex_ids": [s0]}}),
+        ("DELETE", f"/api/profiles/{copy}/seeds", {"params": {"openalex_id": s0}}),
+        ("UPLOAD", copy, {}),
+        ("POST", f"/api/profiles/draft/{copy}/save-edit", {}),
+        ("DELETE", f"/api/profiles/draft/{copy}", {}),
+    ]
+    return [("profile", key, m, p, kw) for m, p, kw in calls for key in (copy, live)]
+
+
 def _kill(kind, key):
     """What another tab's DELETE does, through the same service (with its
     refusals: a researcher mid-import, an interest mid-scan). Returns
@@ -98,9 +127,13 @@ def _kill(kind, key):
     c = connect(os.environ["RADAR_DB_PATH"])
     try:
         if kind == "profile":
-            row = c.execute("SELECT is_draft FROM profiles WHERE slug = ? AND user_id = 1", (key,)).fetchone()
+            row = c.execute("SELECT is_draft, edit_of FROM profiles WHERE slug = ? AND user_id = 1", (key,)).fetchone()
             if row is None:
                 return False
+            if row["edit_of"] is not None:
+                from rag_lib.api.services import edit_copy as edit_copy_service
+                edit_copy_service.discard_copy(c, user_id=1, slug=key)
+                return True
             if row["is_draft"]:
                 return bool(wizard_service.delete_draft(c, user_id=1, slug=key))
             return profiles_service.delete_profile(c, 1, key) is not None
@@ -139,9 +172,10 @@ def test_target_deleted_before_each_transaction(app, env, world, monkeypatch):
 
     app.dependency_overrides[real_get_db] = traced_get_db
     bad = []
-    for kind, key, method, path, kw in _calls(world):
+    runs = [(world["snap"], c) for c in _calls(world)] + [(world["snap_edit"], c) for c in _edit_calls(world)]
+    for snap, (kind, key, method, path, kw) in runs:
         for at in range(1, MAX_TX + 1):
-            _copy(world["snap"], _db_path(env))
+            _copy(snap, _db_path(env))
             before = {r[0] for r in _q(env, "SELECT slug FROM profiles")}
             state.update(n=0, at=at, fired=False, deleted=False, kill=lambda kind=kind, key=key: _kill(kind, key))
             if method == "UPLOAD":
@@ -152,7 +186,7 @@ def test_target_deleted_before_each_transaction(app, env, world, monkeypatch):
                 break  # the request has fewer transactions than ``at``
             open_runs = _q(env, "SELECT COUNT(*) FROM gather_runs WHERE finished_at IS NULL")[0][0]
             new = {r[0] for r in _q(env, "SELECT slug FROM profiles")} - before
-            label = f"{method} {path} (target deleted before transaction {at})"
+            label = f"{method} {path} ({key} deleted before transaction {at})"
             if r.status_code >= 500:
                 bad.append(f"{label}: {r.status_code} {r.text[:150]}")
             if open_runs:
@@ -170,12 +204,16 @@ def test_backstop_turns_a_missed_foreign_key_failure_into_404(app, env, world, m
 
     def gone(*a, **k):
         raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
-    monkeypatch.setattr(wizard_service, "refit_profile", gone)
-    r = _request(app, "POST", f"/api/profiles/{world['live']}/refit")
-    assert r.status_code == 404, r.text
-
     def dup(*a, **k):
         raise sqlite3.IntegrityError("UNIQUE constraint failed: profiles.slug")
-    monkeypatch.setattr(wizard_service, "refit_profile", dup)
-    r = _request(app, "POST", f"/api/profiles/{world['live']}/refit")
-    assert r.status_code == 409, r.text
+
+    # Refit is a change: on a saved interest only its Edit-interest copy
+    # takes it (spec E).
+    with edit_saved(lambda m, p, **kw: _request(app, m, p, **kw), world["live"], save=False) as copy:
+        monkeypatch.setattr(wizard_service, "refit_profile", gone)
+        r = _request(app, "POST", f"/api/profiles/{copy}/refit")
+        assert r.status_code == 404, r.text
+
+        monkeypatch.setattr(wizard_service, "refit_profile", dup)
+        r = _request(app, "POST", f"/api/profiles/{copy}/refit")
+        assert r.status_code == 409, r.text

@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict
 from threading import Lock
 
 from .semantic_types import is_relevant, get_type_name
+from .text import umls_input_text
 
 log = logging.getLogger(__name__)
 
@@ -255,7 +256,8 @@ def _main() -> int:
     print(f"min conf     : {settings.RADAR_UMLS_MIN_CONFIDENCE}")
     print(f"max concepts : {settings.RADAR_UMLS_MAX_CONCEPTS}")
     print(f"embed model  : {settings.RADAR_UMLS_EMBEDDING_MODEL}")
-    print(f"min topic sim: {settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY}")
+    print(f"topic conf   : {settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE}  "
+          f"per seed {settings.RADAR_UMLS_TOPICS_PER_PAPER}")
     print(f"max additions: {settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}")
     print(f"cache dir    : {settings.RADAR_UMLS_CACHE_DIR}\n")
 
@@ -267,9 +269,7 @@ def _main() -> int:
         # Same text the upload path picks: the title leads, because an
         # abstract that only ever writes "T2DM" gives the linker nothing
         # to expand.
-        head = (row["title"] or "").strip()
-        body = (row["abstract"] or "").strip() or (row["body_text"] or "")[:20_000]
-        text = f"{head}\n\n{body}" if head and body else (head or body)
+        text = umls_input_text(row["title"], row["abstract"], row["body_text"])
 
         t0 = time.monotonic()
         fresh = extract_umls_concepts(
@@ -321,7 +321,6 @@ def _main() -> int:
         t1 = time.monotonic()
         mapped = map_concepts_to_topics(
             fresh,
-            min_similarity=settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY,
             embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
             cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
         )
@@ -389,6 +388,8 @@ def _main() -> int:
     merged = merge_umls_topics(
         base,
         per_paper,
+        min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
+        per_paper=settings.RADAR_UMLS_TOPICS_PER_PAPER,
         max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
         cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
     )
@@ -502,16 +503,14 @@ def _main_paper(argv: list[str]) -> int:
         print(f"               columns read: title, abstract, body_text, "
               f"topics_json  (no umls_* columns, no profiles)")
     elif pdf:
-        # rag_lib.vault is stdlib + pdfplumber; it does not touch the DB.
-        # Note what it does NOT give us: an abstract. On the upload path
-        # that field is filled from OpenAlex enrichment, not from the PDF,
-        # so a paper handed over as a bare file falls through to the body
-        # branch below unless --abstract supplies one. That is a real
-        # difference from production and is printed as such.
+        # rag_lib.vault does not touch the DB. The abstract it finds in the
+        # PDF is what the upload stores when OpenAlex has none; one from
+        # OpenAlex is not looked up here, so --abstract supplies it.
         from ..vault import ingest_pdf
 
         rec = ingest_pdf(pdf)
         title = title or rec.title
+        abstract = abstract or (rec.abstract or "")
         body = rec.body_text
         print(f"source       : {pdf}")
         print(f"               {rec.n_pages} pages, {len(body):,} chars, doi={rec.doi}")
@@ -533,7 +532,7 @@ def _main_paper(argv: list[str]) -> int:
               "         --pdf FILE | --text FILE | --title T --abstract A\n"
               "       optional: --min-confidence F  --max-concepts N  "
               "--max-additions N\n"
-              "                 --min-topic-similarity F  --spacy-model M  "
+              "                 --topic-confidence F  --per-paper N  --spacy-model M  "
               "--cache-dir D")
         return 2
     else:
@@ -568,10 +567,9 @@ def _main_paper(argv: list[str]) -> int:
 
         text, rule = _umls_input_text(title, abstract, body), "vault._umls_input_text"
     except Exception as exc:  # noqa: BLE001
-        head = (title or "").strip()
-        tail = (abstract or "").strip() or (body or "")[:20_000]
-        text = f"{head}\n\n{tail}" if head and tail else (head or tail)
-        rule = f"local copy — could not import the real one ({type(exc).__name__})"
+        # the same function, reached without the API package
+        text = umls_input_text(title, abstract, body)
+        rule = f"rag_lib.umls.text.umls_input_text (the API package did not import: {type(exc).__name__})"
 
     print(f"title        : {title[:66] or '(none)'}")
     print(f"abstract     : {len(abstract):,} chars"
@@ -702,44 +700,35 @@ def _main_paper(argv: list[str]) -> int:
     # Stage 2 — concepts to OpenAlex topics
     # -----------------------------------------------------------------
     #
-    # Concept names are embedded and matched against the precomputed topic
-    # index. Nothing is capped here, so the count below is every topic that
-    # cleared min_similarity for any concept — which is worth seeing raw,
-    # because the number tends to be far larger than the handful the wizard
-    # ends up offering.
+    # Each concept's name is embedded and its one nearest topic in the
+    # precomputed index taken, however near: the topics are chosen on the
+    # concepts' confidence in stage 3, not on this similarity.
     from .topic_mapper import map_concepts_to_topics, merge_umls_topics
 
     try:
         emb = _flag("--embedding-model") or s.RADAR_UMLS_EMBEDDING_MODEL
-        min_sim = float(_flag("--min-topic-similarity")
-                        or s.RADAR_UMLS_MIN_TOPIC_SIMILARITY)
+        min_conf_t = float(_flag("--topic-confidence") or s.RADAR_UMLS_TOPIC_MIN_CONFIDENCE)
+        per_seed = int(_flag("--per-paper") or s.RADAR_UMLS_TOPICS_PER_PAPER)
         max_add = int(_flag("--max-additions") or s.RADAR_UMLS_MAX_TOPIC_ADDITIONS)
     except NameError:  # settings never loaded
         emb = _flag("--embedding-model") or "mxbai-embed-large"
-        min_sim = float(_flag("--min-topic-similarity") or 0.40)
-        max_add = int(_flag("--max-additions") or 10)
+        min_conf_t = float(_flag("--topic-confidence") or 0.9)
+        per_seed = int(_flag("--per-paper") or 5)
+        max_add = int(_flag("--max-additions") or 20)
 
     print("\n" + "=" * 96)
-    print(f"stage 2 — mapping {len(result)} concepts to OpenAlex topics "
-          f"(embedder {emb}, min similarity {min_sim})")
+    print(f"stage 2 — the nearest OpenAlex topic of each of {len(result)} concepts (embedder {emb})")
     print("=" * 96)
     t1 = time.monotonic()
     try:
-        mapped = map_concepts_to_topics(
-            result, min_similarity=min_sim, embedding_model=emb, cache_dir=cache,
-        )
+        mapped = map_concepts_to_topics(result, embedding_model=emb, cache_dir=cache)
     except Exception as exc:  # noqa: BLE001 — ollama down, index missing, ...
         print(f"  could not map: {type(exc).__name__}: {str(exc)[:200]}")
         print("  (the embedder runs through ollama — is it up?)")
         return 1
-    print(f"  {len(mapped)} distinct topics matched  ({time.monotonic() - t1:.1f}s)")
-    if mapped:
-        sims = [m.similarity for m in mapped]
-        print(f"  similarity range {min(sims):.3f} - {max(sims):.3f}"
-              f"   (min_similarity={min_sim} removed "
-              f"{'nothing' if min(sims) > min_sim else 'some'})")
+    print(f"  {len(mapped)} concepts mapped  ({time.monotonic() - t1:.1f}s)")
     for m in mapped:
-        print(f"  {m.similarity:.4f}  {m.display_name[:46]:48s}<- {m.source_name[:34]}")
+        print(f"  conf {m.confidence:.4f}  sim {m.similarity:.4f}  {m.source_name[:34]:36s}-> {m.display_name[:46]}")
 
     # -----------------------------------------------------------------
     # Stage 3 — what the wizard would offer
@@ -747,9 +736,9 @@ def _main_paper(argv: list[str]) -> int:
     #
     # The base is this paper's own OpenAlex topic assignment, aggregated
     # exactly as Profile.aggregate_topic_filters does for a seed corpus of
-    # one. That matters: merge_umls_topics drops candidates that duplicate
-    # something already in the base, so without it the accepted list would
-    # be wrong in the optimistic direction.
+    # one. That matters: merge_umls_topics drops topics the base already
+    # has, so without it the accepted list would be wrong in the
+    # optimistic direction.
     from ..paper import Paper
     from ..profile import Profile
 
@@ -764,18 +753,20 @@ def _main_paper(argv: list[str]) -> int:
                 for t in base.get("topics", []) if t.get("id")]
 
     print("\n" + "=" * 96)
-    print(f"stage 3 — merging into the topic list (max_additions={max_add})")
+    print(f"stage 3 — choosing the topics (confidence >= {min_conf_t}, {per_seed} a seed, "
+          f"at most {max_add}; added switched off)")
     print("=" * 96)
     if not topics_json:
         print("  NOTE: no topics_json for this paper, so the OpenAlex base is")
-        print("        empty and nothing can be rejected as a duplicate. On a")
+        print("        empty and nothing can be rejected as already there. On a")
         print("        real profile the base is non-empty and this list shrinks.")
     print(f"  base from OpenAlex ({len(existing)}):")
     for _, name in existing:
         print(f"    {name[:66]}")
 
     merged = merge_umls_topics(
-        base, [mapped], max_additions=max_add, cache_dir=cache,
+        base, [mapped], min_confidence=min_conf_t, per_paper=per_seed,
+        max_additions=max_add, cache_dir=cache,
     )
     offered = [t for t in (merged.get("topics") or []) if t.get("source") == "umls"]
 
@@ -789,30 +780,35 @@ def _main_paper(argv: list[str]) -> int:
     except Exception:  # noqa: BLE001
         index = None
 
-    print(f"\n  every candidate, ranked as merge_umls_topics ranks them:")
+    print(f"\n  every concept, by confidence:")
     accepted: list[str] = []
     acc_names: set = set()
     seen_ids = {i for i, _ in existing}
     seen_names = {n.lower() for _, n in existing if n}
-    cands = [m for m in mapped
-             if m.topic_id not in seen_ids and m.display_name.lower() not in seen_names]
-    for m in sorted(cands, key=lambda x: x.similarity, reverse=True):
-        dup = next(((en, _embedding_similarity(index, m.topic_id, eid))
-                    for eid, en in existing
-                    if _is_near_duplicate(index, m.topic_id, m.display_name, eid, en)),
-                   None)
-        if dup:
-            why = f"DROP  near-duplicate of '{dup[0][:30]}'" + (
+    for m in sorted(mapped, key=lambda x: (-(x.confidence or 0), x.display_name.lower(), x.topic_id)):
+        dup = None
+        if (m.confidence or 0) >= min_conf_t and m.topic_id not in seen_ids \
+                and m.display_name.lower() not in seen_names:
+            dup = next(((en, _embedding_similarity(index, m.topic_id, eid))
+                        for eid, en in existing
+                        if _is_near_duplicate(index, m.topic_id, m.display_name, eid, en)),
+                       None)
+        if (m.confidence or 0) < min_conf_t:
+            why = f"skip  confidence under {min_conf_t}"
+        elif m.topic_id in seen_ids or m.display_name.lower() in seen_names:
+            why = "skip  the paper's own topic"
+        elif dup:
+            why = f"skip  near-duplicate of '{dup[0][:30]}'" + (
                 f" cos={dup[1]:.3f}" if dup[1] is not None else "")
         elif m.display_name.lower() in acc_names:
-            why = "DROP  name already accepted"
-        elif len(accepted) >= max_add:
-            why = "cut   (max_additions reached)"
+            why = "skip  topic already given by a surer concept"
+        elif len(accepted) >= min(per_seed, max_add):
+            why = f"cut   ({min(per_seed, max_add)} taken)"
         else:
             accepted.append(m.topic_id)
             acc_names.add(m.display_name.lower())
-            why = "OFFER"
-        print(f"    {m.similarity:.4f}  {m.display_name[:44]:46s}{why}")
+            why = "OFFER (off)"
+        print(f"    {m.confidence:.4f}  {m.source_name[:30]:32s}-> {m.display_name[:40]:42s}{why}")
 
     if {t["id"] for t in offered} != set(accepted):
         print("\n  MISMATCH — this walkthrough disagrees with merge_umls_topics();"
@@ -825,7 +821,7 @@ def _main_paper(argv: list[str]) -> int:
     for _, name in existing:
         print(f"  openalex  {name[:60]}")
     for t in offered:
-        print(f"  umls      {t.get('display_name', '')[:60]}")
+        print(f"  umls      {t.get('display_name', '')[:60]}  <- {t.get('concept', '')[:30]} (off)")
     if not offered:
         print("  (UMLS added nothing)")
     return 0

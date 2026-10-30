@@ -1,10 +1,10 @@
-"""merge_umls_topics — ranking and near-duplicate rejection.
+"""merge_umls_topics — which UMLS topics an interest gets (FUNCTIONAL_SPEC U.2).
 
 The merge decides which UMLS-derived topics get appended to a profile's
-``topic_filters``, and those topics feed the OpenAlex gatherer's tier-2
-query. A bad pick doesn't just look wrong in the UI — it actively pulls
-off-topic papers into the candidate pool, so the selection rules are
-worth pinning down.
+``topic_filters``; switched on, they feed the OpenAlex gatherer's query,
+and a bad pick pulls off-topic papers into the candidate pool. They are
+chosen on the concepts' confidence alone: from each seed its concepts of
+0.9 or more, five of them, at most twenty for the interest; added off.
 """
 
 from __future__ import annotations
@@ -16,13 +16,14 @@ from rag_lib.umls import topic_mapper
 from rag_lib.umls.topic_mapper import MappedTopic, merge_umls_topics
 
 
-def _mt(tid: str, name: str, sim: float) -> MappedTopic:
+def _mt(tid: str, name: str, conf: float, concept: str = "concept", sim: float = 0.5) -> MappedTopic:
     return MappedTopic(
-        topic_id=tid,
+        topic_id=tid if tid.startswith("https://") else f"https://openalex.org/{tid}",
         display_name=name,
         similarity=sim,
         source_cui="C0000000",
-        source_name="concept",
+        source_name=concept,
+        confidence=conf,
     )
 
 
@@ -53,45 +54,108 @@ def _umls_ids(filters: dict) -> list[str]:
     return [t["display_name"] for t in filters["topics"] if t.get("source") == "umls"]
 
 
+def _umls(filters: dict) -> list[dict]:
+    return [t for t in filters["topics"] if t.get("source") == "umls"]
+
+
 # ---------------------------------------------------------------------------
-# Ranking
+# Choosing (U-1 .. U-5, U-8)
 # ---------------------------------------------------------------------------
 
 
-def test_similarity_outranks_paper_count():
-    """A high-confidence match beats a generic term seen in every paper.
-
-    With a handful of seeds the count is a coarse 1/2/3 with almost no
-    discriminating power, so ranking on it first let a term that merely
-    appeared in each paper's reference list win a slot over a strong
-    domain match.
-    """
-    generic = _mt("https://openalex.org/T900", "Proteins in Food Systems", 0.42)
-    precise = _mt("https://openalex.org/T901", "Retinal Diseases and Treatments", 0.89)
-
-    # generic appears in all three papers, precise in only one
-    per_paper = [[generic, precise], [generic], [generic]]
-
-    out = merge_umls_topics(_base("Diabetes Management"), per_paper, max_additions=1)
-    assert _umls_ids(out) == ["Retinal Diseases and Treatments"]
+def test_u1_only_sure_concepts_five_a_seed_by_confidence():
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c) for i, c in
+             enumerate([0.95, 0.89, 1.0, 0.92, 0.7, 0.99, 0.9, 0.91, 0.96])]
+    out = merge_umls_topics(_base("Base"), [paper])
+    # 0.89 and 0.7 are under 0.9; of the seven left, the five surest
+    assert _umls_ids(out) == ["Topic 2", "Topic 5", "Topic 8", "Topic 0", "Topic 3"]
 
 
-def test_count_breaks_ties_on_equal_similarity():
-    a = _mt("https://openalex.org/T900", "Alpha", 0.80)
-    b = _mt("https://openalex.org/T901", "Beta", 0.80)
-    per_paper = [[a, b], [b]]  # b seen twice
+def test_u1_settings_are_honoured():
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c) for i, c in enumerate([0.95, 0.85, 0.8])]
+    out = merge_umls_topics(_base("Base"), [paper], min_confidence=0.8, per_paper=2)
+    assert _umls_ids(out) == ["Topic 0", "Topic 1"]
 
-    out = merge_umls_topics(_base("Base"), per_paper, max_additions=1)
-    assert _umls_ids(out) == ["Beta"]
+
+def test_u2_a_concept_whose_topic_the_interest_has_is_skipped_and_the_next_takes_its_place():
+    base = _base("Microglia and Neuroinflammation")
+    paper = [_mt(base["topics"][0]["id"], "Microglia and Neuroinflammation", 1.0, "Microglia")] + \
+        [_mt(f"T9{i:02d}", f"Topic {i}", 0.99 - i / 100) for i in range(6)]
+    out = merge_umls_topics(base, [paper])
+    assert _umls_ids(out) == [f"Topic {i}" for i in range(5)]
+
+
+def test_u3_two_concepts_one_topic_count_once_and_the_surer_concept_stays():
+    paper = [_mt("T900", "Immune Response", 0.99, "Immune response"),
+             _mt("T900", "Immune Response", 0.95, "Inflammation"),
+             *[_mt(f"T91{i}", f"Topic {i}", 0.94 - i / 100) for i in range(5)]]
+    out = merge_umls_topics(_base("Base"), [paper])
+    topics = _umls(out)
+    assert [t["display_name"] for t in topics] == ["Immune Response", *[f"Topic {i}" for i in range(4)]]
+    assert topics[0]["concept"] == "Immune response" and topics[0]["confidence"] == 0.99
+
+
+def test_u4_two_seeds_choosing_one_topic_list_it_once_with_the_best_confidence():
+    a = [_mt("T900", "Shared", 0.93, "from a")]
+    b = [_mt("T900", "Shared", 0.98, "from b"), _mt("T901", "Only b", 0.95)]
+    topics = _umls(merge_umls_topics(_base("Base"), [a, b]))
+    assert [t["display_name"] for t in topics] == ["Shared", "Only b"]
+    assert topics[0]["concept"] == "from b" and topics[0]["count"] == 2 and topics[0]["papers"] == [0, 1]
+    assert topics[1]["papers"] == [1]
+
+
+def test_u4_identically_named_topics_under_two_ids_are_one():
+    """OpenAlex carries "Medical research and treatments" and "Medical
+    Research and Treatments" under different ids; one is enough."""
+    a = [_mt("T900", "Medical research and treatments", 0.95)]
+    b = [_mt("T901", "Medical Research and Treatments", 0.99)]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [a, b])) == ["Medical Research and Treatments"]
+
+
+def test_u5_six_seeds_of_five_topics_keep_the_twenty_surest():
+    seeds = [[_mt(f"T{s}{i}", f"S{s} T{i}", round(0.9 + (s * 5 + i) / 400, 4)) for i in range(5)]
+             for s in range(6)]
+    out = _umls(merge_umls_topics(_base("Base"), seeds))
+    assert len(out) == 20
+    every = sorted((t for p in seeds for t in p), key=lambda m: -m.confidence)
+    assert [t["display_name"] for t in out] == [m.display_name for m in every[:20]]
 
 
 def test_max_additions_is_respected():
-    per_paper = [[
-        _mt(f"https://openalex.org/T{900 + i}", f"Topic {i}", 0.9 - i / 100)
-        for i in range(10)
-    ]]
-    out = merge_umls_topics(_base("Base"), per_paper, max_additions=3)
-    assert len(_umls_ids(out)) == 3
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", 0.99 - i / 100) for i in range(5)]
+    assert len(_umls_ids(merge_umls_topics(_base("Base"), [paper], max_additions=3))) == 3
+
+
+def test_u6_added_topics_are_off_and_say_where_they_came_from():
+    out = _umls(merge_umls_topics(_base("Base"), [[_mt("T900", "Topic", 0.97, "Adaptive Immunity")]]))
+    assert out == [{"id": "https://openalex.org/T900", "display_name": "Topic", "count": 1, "source": "umls",
+                    "on": False, "concept": "Adaptive Immunity", "confidence": 0.97, "papers": [0]}]
+
+
+def test_u8_a_seed_without_a_sure_concept_adds_nothing():
+    base = _base("Base")
+    out = merge_umls_topics(base, [[_mt("T900", "Topic", 0.89)], [_mt("T901", "Other", 0.5)]])
+    assert out == base
+
+
+def test_a_mapping_without_confidence_adds_nothing():
+    old = MappedTopic(topic_id="https://openalex.org/T900", display_name="Old", similarity=0.9,
+                      source_cui="C1", source_name="old")
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[old]])) == []
+
+
+def test_similarity_does_not_choose():
+    """A concept mapped to a topic far from its name still counts on its
+    confidence; the similarity is not a threshold or a rank."""
+    near = _mt("T900", "Near", 0.91, sim=0.95)
+    far = _mt("T901", "Far", 0.99, sim=0.10)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1)) == ["Far"]
+
+
+def test_stale_mapping_is_recognised():
+    assert topic_mapper.stale_mapping([{"topic_id": "T1", "similarity": 0.5}])
+    assert not topic_mapper.stale_mapping([_mt("T1", "x", 0.9).to_dict()])
+    assert not topic_mapper.stale_mapping([])
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +186,8 @@ def test_word_overlap_misses_synonyms_without_the_index():
     scores 0.33 and both slip through.
     """
     per_paper = [[
-        _mt("https://openalex.org/T900", "Renal Diseases and Glomerulopathies", 0.86),
-        _mt("https://openalex.org/T901", "Renal and Vascular Pathologies", 0.85),
+        _mt("https://openalex.org/T900", "Renal Diseases and Glomerulopathies", 0.96),
+        _mt("https://openalex.org/T901", "Renal and Vascular Pathologies", 0.95),
     ]]
     out = merge_umls_topics(_base("Base"), per_paper, max_additions=4)
     assert len(_umls_ids(out)) == 2
@@ -143,8 +207,8 @@ def test_candidates_are_not_deduplicated_against_each_other_by_cosine(monkeypatc
     "Diabetes and associated disorders") and "Diabetes Treatment and
     Management" (0.815) — distinct topics that retrieve distinct papers.
 
-    The candidates are a list the user prunes in the wizard, so a
-    redundant neighbour costs one toggle while a discarded one can never
+    The topics are a list the user switches on in the wizard, so a
+    redundant neighbour costs one look while a discarded one can never
     be chosen at all.
     """
     renal_a = "https://openalex.org/T900"
@@ -156,8 +220,8 @@ def test_candidates_are_not_deduplicated_against_each_other_by_cosine(monkeypatc
     monkeypatch.setattr(topic_mapper, "get_topic_index", lambda _d: index)
 
     per_paper = [[
-        _mt(renal_a, "Renal Diseases and Glomerulopathies", 0.86),
-        _mt(renal_b, "Renal and Vascular Pathologies", 0.85),
+        _mt(renal_a, "Renal Diseases and Glomerulopathies", 0.96),
+        _mt(renal_b, "Renal and Vascular Pathologies", 0.95),
     ]]
     out = merge_umls_topics(
         _base("Base"), per_paper, max_additions=4, cache_dir="/nonexistent",
@@ -191,22 +255,6 @@ def test_a_candidate_matching_an_existing_topic_is_still_dropped(monkeypatch):
     assert _umls_ids(out) == []
 
 
-def test_identically_named_candidates_still_collapse():
-    """OpenAlex carries "Medical research and treatments" and "Medical
-    Research and Treatments" under different ids; one is enough. Checked
-    before the cut, so the collision does not consume a slot."""
-    per_paper = [[
-        _mt("https://openalex.org/T900", "Medical research and treatments", 0.9),
-        _mt("https://openalex.org/T901", "Medical Research and Treatments", 0.88),
-        _mt("https://openalex.org/T902", "Diabetes Treatment and Management", 0.7),
-    ]]
-    out = merge_umls_topics(_base("Base"), per_paper, max_additions=2)
-    assert _umls_ids(out) == [
-        "Medical research and treatments",
-        "Diabetes Treatment and Management",
-    ]
-
-
 def test_cosine_dedup_rejects_candidate_close_to_existing_topic(monkeypatch):
     """A UMLS topic that merely renames an existing one is not added."""
     base = _base("Renal and Vascular Pathologies")
@@ -218,7 +266,7 @@ def test_cosine_dedup_rejects_candidate_close_to_existing_topic(monkeypatch):
     })
     monkeypatch.setattr(topic_mapper, "get_topic_index", lambda _d: index)
 
-    per_paper = [[_mt(candidate_id, "Renal Diseases and Glomerulopathies", 0.86)]]
+    per_paper = [[_mt(candidate_id, "Renal Diseases and Glomerulopathies", 0.96)]]
     out = merge_umls_topics(
         base, per_paper, max_additions=4, cache_dir="/nonexistent",
     )
@@ -230,7 +278,7 @@ def test_distinct_topics_survive_cosine_dedup(monkeypatch):
     index = _FakeIndex({a: [1.0, 0.0, 0.0], b: [0.0, 1.0, 0.0]})  # orthogonal
     monkeypatch.setattr(topic_mapper, "get_topic_index", lambda _d: index)
 
-    per_paper = [[_mt(a, "Retinal Diseases", 0.9), _mt(b, "Heart Rate", 0.88)]]
+    per_paper = [[_mt(a, "Retinal Diseases", 0.99), _mt(b, "Heart Rate", 0.98)]]
     out = merge_umls_topics(
         _base("Base"), per_paper, max_additions=4, cache_dir="/nonexistent",
     )
@@ -325,3 +373,21 @@ def test_an_old_index_without_meta_is_refused_on_dimension(tmp_path, fresh_index
     _write_index(tmp_path, 768, None)
     with pytest.raises(TopicIndexMismatch, match="768-d"):
         topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
+
+
+def test_each_concept_gets_its_one_nearest_topic_however_far(tmp_path, fresh_index):
+    from rag_lib.umls.extractor import UmlsConcept
+
+    _write_index(tmp_path, 1024, "model-1024")
+    concepts = [UmlsConcept(cui="C1", name="a", tui="T1", semantic_type="x", confidence=0.95),
+                UmlsConcept(cui="C2", name="b", tui="T1", semantic_type="x", confidence=0.72)]
+    out = topic_mapper.map_concepts_to_topics(concepts, embedding_model="model-1024", cache_dir=str(tmp_path))
+    assert [(m.source_cui, m.confidence) for m in out] == [("C1", 0.95), ("C2", 0.72)]
+    assert all(m.topic_id == "https://openalex.org/T0" for m in out)    # one topic each, kept twice
+
+
+def test_a_topic_the_profile_wants_is_already_the_interests():
+    wanted = [{"id": "https://openalex.org/T900", "display_name": "Wanted"}]
+    paper = [_mt("T900", "Wanted", 0.99)] + [_mt(f"T9{i}{i}", f"Topic {i}", 0.98 - i / 100) for i in range(1, 6)]
+    out = merge_umls_topics(_base("Base"), [paper], also_have=wanted)
+    assert _umls_ids(out) == [f"Topic {i}" for i in range(1, 6)]

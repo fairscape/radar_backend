@@ -8,6 +8,8 @@ gets its body text, and its concepts must be re-extracted from it.
 
 from __future__ import annotations
 
+from ..pdf_text import paper_text
+
 # Body text cap; see rag_lib/api/services/vault.py for why there is one.
 UMLS_TEXT_LIMIT = 20_000
 
@@ -31,7 +33,7 @@ def umls_input_text(
     so no ranking or threshold further along can bring it back.
     """
     head = (title or "").strip()
-    if abstract and abstract.strip():
-        return f"{head}\n\n{abstract}" if head else abstract
-    body = (body_text or "")[:UMLS_TEXT_LIMIT]
+    # Without an abstract, the body from where its reading starts (past
+    # the journal name, authors and affiliations of a PDF).
+    body = paper_text(abstract, body_text, UMLS_TEXT_LIMIT)
     return f"{head}\n\n{body}" if head and body else (head or body)

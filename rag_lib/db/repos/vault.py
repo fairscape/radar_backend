@@ -38,7 +38,7 @@ _VAULT_COLS = """
   p.openalex_id, p.doi, p.title, p.abstract, p.year, p.venue,
   p.publication_date, p.source, p.local_path, p.body_text,
   p.first_seen_at, p.n_pages, p.authors_json,
-  p.uploaded_by_user_id, p.file_hash
+  p.uploaded_by_user_id, p.file_hash, p.abstract_source
 """
 # When this user added the paper: their own upload, else when Radar first
 # saw it. papers.first_seen_at alone is the first uploader's time, which
@@ -214,7 +214,7 @@ def tag_counts_for_user(
           FROM profile_seeds ps
           JOIN profiles pr ON pr.id = ps.profile_id
           JOIN papers   p  ON p.openalex_id = ps.openalex_id
-          WHERE pr.user_id = ?
+          WHERE pr.user_id = ? AND pr.edit_of IS NULL   -- not a copy being edited
           UNION
           SELECT pr.slug AS slug, pc.openalex_id AS openalex_id
           FROM profile_candidates pc
@@ -268,7 +268,7 @@ def _tags(conn: sqlite3.Connection, user_id: int, openalex_id: str) -> list[str]
           SELECT pr.slug AS slug
           FROM profile_seeds ps
           JOIN profiles pr ON pr.id = ps.profile_id
-          WHERE pr.user_id = ? AND ps.openalex_id = ?
+          WHERE pr.user_id = ? AND ps.openalex_id = ? AND pr.edit_of IS NULL   -- not a copy being edited
           UNION
           SELECT pr.slug AS slug
           FROM profile_candidates pc

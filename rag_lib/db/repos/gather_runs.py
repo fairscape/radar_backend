@@ -8,6 +8,7 @@ failed so the audit trail captures both outcomes.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from ...redact import public_error
@@ -48,6 +49,8 @@ def finish(
     error: str | None = None,
     tier_used: str | None = None,
     result_json: str | None = None,
+    topic_ids: list[str] | None = None,
+    seed_ids: list[str] | None = None,
 ) -> None:
     """Close out a gather_runs row.
 
@@ -57,6 +60,10 @@ def finish(
     + raw scores blob. ``COALESCE`` keeps any prior value if the caller
     doesn't supply one (so finishing with an error doesn't blank a
     partial result the job had time to write).
+
+    ``topic_ids`` / ``seed_ids``: the topics a scan that succeeded searched
+    and the seeds the interest had then (migration 0032); compared with the
+    ones now (``wizard.scan_outdated``).
     """
     conn.execute(
         """
@@ -69,13 +76,17 @@ def finish(
           error        = ?,
           tier_used    = COALESCE(?, tier_used),
           result_json  = COALESCE(?, result_json),
+          topic_ids_json = COALESCE(?, topic_ids_json),
+          seed_ids_json = COALESCE(?, seed_ids_json),
           current_step = 'done'
         WHERE id = ?
         """,
         (n_fetched, n_new, n_redup, api_calls,
          # Shown to the user as the run's error; see rag_lib/redact.py.
          public_error(error) if error is not None else None,
-         tier_used, result_json, run_id),
+         tier_used, result_json,
+         json.dumps(sorted(topic_ids)) if topic_ids is not None else None,
+         json.dumps(sorted(seed_ids)) if seed_ids is not None else None, run_id),
     )
     conn.commit()
 
@@ -334,6 +345,21 @@ def close_interrupted(conn: sqlite3.Connection) -> int:
 # A scan that has not reported progress for this long is taken to be dead
 # (the process stopped under it), not running.
 SCAN_STALE_MINUTES = 120
+
+
+def last_scan(conn: sqlite3.Connection, profile_id: int) -> tuple[list[str], list[str] | None] | None:
+    """``(topics, seeds)`` the interest's last scan that succeeded searched
+    with, or None when no such scan recorded them (none yet, or all before
+    migration 0032). ``seeds`` is None for a scan that recorded only its
+    topics."""
+    row = conn.execute(
+        "SELECT topic_ids_json, seed_ids_json FROM gather_runs WHERE profile_id = ? AND finished_at IS NOT NULL"
+        " AND error IS NULL AND topic_ids_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (profile_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0]), (json.loads(row[1]) if row[1] is not None else None)
 
 
 def running_scan(conn: sqlite3.Connection, profile_id: int) -> sqlite3.Row | None:

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
     B, _feed, _go_live, _import_researcher, _ok, _one, _q, _request, _scan, _upload, app, env,
 )
+
+
+def _edit(app, slug, **kw):
+    """Edit interest: a saved interest changes only on a copy, saved in one
+    go (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug, **kw)
 
 
 def _pid(env, slug):
@@ -90,8 +97,11 @@ def test_topics_saved_then_dryrun_other_then_commit_third(app, env):
         assert y is None or 2018 <= y <= 2022, card["date"]
     runs = _ok(_request(app, "GET", f"/api/profiles/{slug}/runs"))
     print("RUNS", [(r["tier_used"], r["n_fetched"], r["n_new"]) for r in runs])
-    # Years cleared on edit.
-    p = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"years": {"year_from": None, "year_to": None}}))
+    # Years cleared on edit (in Edit interest, spec E).
+    with _edit(app, slug) as copy:
+        p = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": None, "year_to": None}}))
+        assert p["yearFrom"] is None and p["yearTo"] is None
+    p = _ok(_request(app, "GET", f"/api/profiles/{slug}"))
     assert p["yearFrom"] is None and p["yearTo"] is None
     feed2 = _feed(app, slug)
     assert len(feed2["cards"]) >= len(feed["cards"])
@@ -194,9 +204,11 @@ def test_threshold_edit_feed_matches_histogram(app, env):
     feed0 = _feed(app, slug)
     assert len(feed0["cards"]) == sum(1 for x in scores if x >= 0.0)
     thr = scores[len(scores) // 2]
-    p = _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": thr}))
+    with _edit(app, slug) as copy:                      # spec E: on the copy, saved
+        p = _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": thr}))
     # Stored on the 3-place grid (calibration.bar), which the feed then uses.
     assert p["threshold"] == round(thr, 3)
+    assert _ok(_request(app, "GET", f"/api/profiles/{slug}"))["threshold"] == p["threshold"]
     thr = p["threshold"]
     feed1 = _feed(app, slug)
     expect = sum(1 for s in scores if s >= thr)
@@ -220,37 +232,54 @@ def test_threshold_edit_feed_matches_histogram(app, env):
 
 
 def test_live_seed_edit_rescores_feed(app, env):
+    """Spec E: seeds change in Edit interest; saving keeps every score as it
+    was (E.4 Q5) and the next scan refits and rescores."""
+    import json
+
+    def fit_ids():
+        return sorted(json.loads(_one(env, "SELECT selector_config_json FROM profiles WHERE slug=?", slug)[0])["fit_seed_ids"])
+
     slug, rid = _go_live(app, env, name="Seeds Live", threshold=0.0)
     _scan(app, slug)
     f0 = {c["id"]: c["similarity"] for c in _feed(app, slug)["cards"]}
     detail = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     seeds = [s["id"] for s in detail["seeds"]]
     assert detail["profile"]["seeds"] == len(seeds)
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": seeds[0]}))
+    with _edit(app, slug) as copy:
+        _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": seeds[0]}))
     d2 = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     assert d2["profile"]["seeds"] == len(d2["seeds"]) == len(seeds) - 1
     lst = {p["key"]: p for p in _ok(_request(app, "GET", "/api/profiles"))}
     assert lst[slug]["seeds"] == len(seeds) - 1
+    # Saved, not scanned: the feed keeps its scores and the old fit.
+    assert {c["id"]: c["similarity"] for c in _feed(app, slug)["cards"]} == f0
+    assert fit_ids() == sorted(seeds)
+    _scan(app, slug)
+    assert fit_ids() == sorted(seeds[1:])
     f1 = {c["id"]: c["similarity"] for c in _feed(app, slug)["cards"]}
     print("SIM", f0, f1)
     assert f0 != f1
     # The removed seed comes back.
-    added = _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [seeds[0]]}))
+    with _edit(app, slug) as copy:
+        added = _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [seeds[0]]}))
     print("ADDED", added)
     assert added["attached"] == 1
+    _scan(app, slug)
     f2 = {c["id"]: c["similarity"] for c in _feed(app, slug)["cards"]}
     for k in f0:
         if f0[k] is not None and k in f2:
             assert abs(f0[k] - f2[k]) < 1e-3, (k, f0[k], f2[k])
-    # Upload a seed to a live interest.
-    up = _ok(_upload(app, b"live-upload", "lu.pdf", slug))
+    # Upload a seed into the copy of a live interest.
+    with _edit(app, slug) as copy:
+        up = _ok(_upload(app, b"live-upload", "lu.pdf", copy))
     d3 = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     assert up["id"] in {s["id"] for s in d3["seeds"]}
     assert d3["profile"]["seeds"] == len(d3["seeds"]) == len(seeds) + 1
-    import json
-    cfg = json.loads(_one(env, "SELECT selector_config_json FROM profiles WHERE slug=?", slug)[0])
-    assert sorted(cfg["fit_seed_ids"]) == sorted(s["id"] for s in d3["seeds"])
-    # The feed never shows a seed.
+    assert fit_ids() == sorted(seeds)                   # until the scan
+    # The feed never shows a seed, scanned or not.
+    assert not ({c["id"] for c in _feed(app, slug)["cards"]} & {s["id"] for s in d3["seeds"]})
+    _scan(app, slug)
+    assert fit_ids() == sorted(s["id"] for s in d3["seeds"])
     feed = _feed(app, slug)
     assert not ({c["id"] for c in feed["cards"]} & {s["id"] for s in d3["seeds"]})
 
@@ -354,7 +383,11 @@ def test_forget_researcher_with_live_and_draft_interests(app, env):
     slug, rid = _go_live(app, env, name="Forget Live")
     papers = _ok(_request(app, "GET", f"/api/researchers/{rid}"))["papers"]
     d = _ok(_request(app, "POST", f"/api/researchers/{rid}/interests", json={"name": "Forget Draft", "openalex_ids": [papers[0]["id"]]}))["draft"]["slug"]
-    _ok(_request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}))
+    with _edit(app, slug) as copy:                      # spec E: on the copy, saved
+        _ok(_request(app, "PUT", f"/api/profiles/{copy}/researcher-topics", json={"enabled": True}))
+    live_before = [(t["id"], t["on"], t.get("profile"), t.get("source"))
+                   for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))["topics"]]
+    assert any(t[2] for t in live_before)               # the profile's topics are applied
     _ok(_request(app, "GET", f"/api/profiles/draft/{d}/topics"))
     _ok(_request(app, "PUT", f"/api/profiles/{d}/researcher-topics", json={"enabled": True}))
     _ok(_request(app, "DELETE", f"/api/researchers/{rid}"))
@@ -364,7 +397,10 @@ def test_forget_researcher_with_live_and_draft_interests(app, env):
     assert v1["researcher_id"] is None and v2["researcher_id"] is None
     det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     print("LIVE TOPICS", [(t["id"], t["on"], t.get("profile"), t.get("source")) for t in det["topics"]])
-    assert not any(t.get("profile") for t in det["topics"])
+    # Spec E.7 (X-15): a saved interest keeps its topics, profile marks and
+    # all, when the researcher is forgotten; only a new interest's draft
+    # loses the profile's topics.
+    assert [(t["id"], t["on"], t.get("profile"), t.get("source")) for t in det["topics"]] == live_before
     dt = _ok(_request(app, "GET", f"/api/profiles/draft/{d}/topics"))
     print("DRAFT TOPICS", [(t["id"], t["on"], t.get("profile"), t.get("source")) for t in dt])
     assert not any(t.get("profile") for t in dt)
@@ -406,30 +442,40 @@ def test_edit_topics_after_seed_changes(app, env):
     prev = _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))
     assert [(t["id"], t["on"], t["new"]) for t in sorted(prev, key=lambda t: t["id"])] == \
         [(t["id"], t["on"], False) for t in sorted(det["topics"], key=lambda t: t["id"])]
-    # A new seed with a new topic.
-    up = _ok(_upload(app, b"new-topic-seed", "nt.pdf", slug))
-    _set_paper_topics(env, up["id"], ["T30000"])
-    prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))}
-    print("PREV", {k: (v["on"], v["new"]) for k, v in prev.items()})
-    assert prev["T30000"]["new"] is True and prev["T30000"]["on"] is False
-    det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
-    assert "T30000" not in {t["id"] for t in det["topics"]}   # preview wrote nothing
-    saved = _ok(_request(app, "PUT", f"/api/profiles/{slug}/topics", json={"selected_topic_ids": keep + ["T30000"]}))
-    assert {t["id"] for t in saved if t["on"]} == set(keep) | {"T30000"}
+    # A new seed with a new topic, in Edit interest (spec E): the copy's
+    # preview shows it new and off; the interest is untouched until saved.
+    with _edit(app, slug) as copy:
+        up = _ok(_upload(app, b"new-topic-seed", "nt.pdf", copy))
+        _set_paper_topics(env, up["id"], ["T30000"])
+        prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{copy}/topics/preview"))}
+        print("PREV", {k: (v["on"], v["new"]) for k, v in prev.items()})
+        assert prev["T30000"]["new"] is True and prev["T30000"]["on"] is False
+        det = _ok(_request(app, "GET", f"/api/profiles/{copy}/detail"))
+        assert "T30000" not in {t["id"] for t in det["topics"]}   # preview wrote nothing
+        saved = _ok(_request(app, "PUT", f"/api/profiles/{copy}/topics", json={"selected_topic_ids": keep + ["T30000"]}))
+        assert {t["id"] for t in saved if t["on"]} == set(keep) | {"T30000"}
+        det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
+        assert {t["id"] for t in det["topics"] if t["on"]} == set(keep)   # not yet saved
     det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     assert {t["id"] for t in det["topics"] if t["on"]} == set(keep) | {"T30000"}
     prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))}
     assert not any(t["new"] for t in prev.values())
-    # The new seed goes again: its topic leaves the list.
-    _ok(_request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": up["id"]}))
-    prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))}
-    print("PREV2", {k: (v["on"], v["new"]) for k, v in prev.items()})
+    # The new seed goes again: its topic stays on, marked as not matching
+    # the seeds (E.2-3 as revised: only the user switches topics).
+    with _edit(app, slug) as copy:
+        _ok(_request(app, "DELETE", f"/api/profiles/{copy}/seeds", params={"openalex_id": up["id"]}))
+        prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{copy}/topics/preview"))}
+        print("PREV2", {k: (v["on"], v["new"], v.get("unmatched")) for k, v in prev.items()})
+        assert prev["T30000"]["on"] is True and prev["T30000"].get("unmatched") is True
     det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     print("DET2", [(t["id"], t["on"]) for t in det["topics"]])
-    # Re-adding the seed: the topic was switched on by the user; does it come back on?
-    _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [up["id"]]}))
-    prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{slug}/topics/preview"))}
-    print("PREV3", {k: (v["on"], v["new"]) for k, v in prev.items()})
+    assert {t["id"]: t["on"] for t in det["topics"]}.get("T30000") is True
+    # Re-adding the seed leaves the switch as it is and clears the mark.
+    with _edit(app, slug) as copy:
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [up["id"]]}))
+        prev = {t["id"]: t for t in _ok(_request(app, "GET", f"/api/profiles/{copy}/topics/preview"))}
+        print("PREV3", {k: (v["on"], v["new"]) for k, v in prev.items()})
+        assert prev["T30000"]["on"] is True and not prev["T30000"].get("unmatched")
     # Scan and topic-yield.
     _scan(app, slug)
     ty = _ok(_request(app, "GET", f"/api/profiles/{slug}/topic-yield"))

@@ -7,9 +7,21 @@ them (or one of them with the rule it claims to apply).
 from __future__ import annotations
 
 from rag_lib.db import connect
+from tests.edit_helpers import edit_saved
 from tests.test_review_round12_journeys import (  # noqa: F401
     env, app, _feed, _go_live, _ok, _one, _q, _request, _scan, _upload,
 )
+
+
+def _edit(app, slug):
+    """Edit interest: a saved interest changes only on a copy, saved in one
+    go (FUNCTIONAL_SPEC E)."""
+    return edit_saved(lambda m, p, **k: _request(app, m, p, **k), slug)
+
+
+def _set_threshold(app, slug, t):
+    with _edit(app, slug) as copy:
+        _ok(_request(app, "PATCH", f"/api/profiles/{copy}", json={"threshold": t}))
 
 
 def _exec(env, sql, *params):
@@ -31,7 +43,7 @@ def test_below_the_bar_paper_reads_as_at_the_bar(app, env):
     +0.000), and the Threshold tab counts it as passing (score >= value)."""
     slug, _ = _go_live(app, env, name="Edge", threshold=0.0)
     _scan(app, slug)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 0.5}))
+    _set_threshold(app, slug, 0.5)
     pid = _pid(env, slug)
     _exec(env, "UPDATE profile_candidates SET score_raw = 0.8 WHERE profile_id = ?", pid)
     oa = _q(env, "SELECT openalex_id FROM profile_candidates WHERE profile_id = ? LIMIT 1", pid)[0][0]
@@ -49,7 +61,7 @@ def test_below_the_bar_paper_reads_as_at_the_bar(app, env):
 def test_threshold_tab_counts_a_failing_paper_as_passing(app, env):
     slug, _ = _go_live(app, env, name="Edge2", threshold=0.0)
     _scan(app, slug)
-    _ok(_request(app, "PATCH", f"/api/profiles/{slug}", json={"threshold": 0.5}))
+    _set_threshold(app, slug, 0.5)
     pid = _pid(env, slug)
     _exec(env, "UPDATE profile_candidates SET score_raw = 0.8 WHERE profile_id = ?", pid)
     oa = _q(env, "SELECT openalex_id FROM profile_candidates WHERE profile_id = ? LIMIT 1", pid)[0][0]
@@ -69,7 +81,9 @@ def test_dismissed_paper_made_a_seed_still_counts_as_dismissed(app, env):
     _scan(app, slug)
     card = _feed(app, slug)["cards"][0]
     _ok(_request(app, "POST", "/api/radar/cards/dismiss", json={"card_id": card["id"], "profile": slug, "on": True}))
-    _ok(_request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [card["id"]]}))
+    # Made a seed in Edit interest (spec E: the feed's "add as seed" is gone).
+    with _edit(app, slug) as copy:
+        _ok(_request(app, "POST", f"/api/profiles/{copy}/seeds", json={"openalex_ids": [card["id"]]}))
 
     prof = next(p for p in _ok(_request(app, "GET", "/api/profiles")) if p["key"] == slug)
     feed = _feed(app, slug)["cards"] + _feed(app, slug, bucket="low")["cards"]
@@ -91,8 +105,8 @@ def test_below_the_bar_across_interests_is_not_closest_to_the_bar_first(app, env
     _ok(_request(app, "POST", "/api/profiles", json={"slug": b, "threshold": 0.0, "selected_topic_ids": []}))
     _scan(app, a)
     _scan(app, b)
-    _ok(_request(app, "PATCH", f"/api/profiles/{a}", json={"threshold": 0.9}))
-    _ok(_request(app, "PATCH", f"/api/profiles/{b}", json={"threshold": 0.5}))
+    _set_threshold(app, a, 0.9)
+    _set_threshold(app, b, 0.5)
     pa, pb = _pid(env, a), _pid(env, b)
     _exec(env, "UPDATE profile_candidates SET score_raw = 0.95 WHERE profile_id = ?", pa)
     _exec(env, "UPDATE profile_candidates SET score_raw = 0.95 WHERE profile_id = ?", pb)

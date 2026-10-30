@@ -51,12 +51,25 @@ def test_remove_overrides_a_switch_the_user_made_after_the_apply(tmp_path, monke
 
 
 def test_a_topic_the_profile_newly_rejects_stays_on(tmp_path, monkeypatch):
+    """The owner newly says no to a topic a seed lists. Since FUNCTIONAL_SPEC
+    E.7 a re-import does not reach the interest, which keeps the copy of the
+    profile it applied; the new "no" arrives when the user takes the profile
+    off and applies it again. Then: kept on by default, the user decides."""
     doc = {"research_interests": [_topic("T10003", "Three", weight=0.5, method="declared")]}
     conn, uid, pid, slug, rid = _saved(tmp_path, monkeypatch, doc)
     wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
+    stored = profiles_repo.topic_filters(conn, pid)
     # The researcher is re-imported: the owner now says no to T2.
     doc2 = {"research_interests": doc["research_interests"] + [_topic("T10002", "Two", weight=-0.5, method="declared")]}
     researchers_repo.upsert(conn, user_id=uid, source="prosopia", key="p", name="P", document_json=json.dumps(doc2))
+    view = wizard.researcher_topics_view(conn, user_id=uid, slug=slug)
+    assert view["applied"] and view["topics"]["unwanted"] == [] and view["topics"]["not_interest"] == []
+    preview, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    assert "profile" not in {t["id"]: t for t in preview["topics"]}[T2]
+    assert profiles_repo.topic_filters(conn, pid) == stored
+    # Taken off and applied again: the profile as it is now.
+    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=False)
+    wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
     view = wizard.researcher_topics_view(conn, user_id=uid, slug=slug)
     assert view["applied"] and [t["id"] for t in view["topics"]["unwanted"]] == [T2]
     preview, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)

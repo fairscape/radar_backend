@@ -23,6 +23,7 @@ from rag_lib.db.repos import (
     profiles as profiles_repo,
     users as users_repo,
 )
+from tests.edit_helpers import edit_saved
 from tests.test_orcid_import import ORCID, WORKS
 from tests.test_prosopia_import import StubProsopia, _stub_profile
 from tests.test_researcher_marks import _both_stubs
@@ -114,10 +115,13 @@ def world(env, monkeypatch):
     finally:
         conn.close()
 
+    # A saved interest takes uploads only through Edit interest (spec E):
+    # upload into the copy, then save it back onto 'A live'.
     files = {"file": ("alpha.pdf", io.BytesIO(b"%PDF-1.4\nalice-bytes"), "application/pdf")}
-    r = _request(app, "POST", "/api/vault/upload", files=files, data={"profile_slug": live_slug}, headers=A)
-    assert r.status_code == 200, r.text
-    upload_id = r.json()["id"]
+    with edit_saved(lambda m, p, **kw: _request(app, m, p, headers=A, **kw), live_slug) as copy:
+        r = _request(app, "POST", "/api/vault/upload", files=files, data={"profile_slug": copy}, headers=A)
+        assert r.status_code == 200, r.text
+        upload_id = r.json()["id"]
 
     seed_of_draft = _request(app, "GET", f"/api/researchers/{rid}", headers=A).json()["papers"][0]["id"]
 

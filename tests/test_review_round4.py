@@ -203,6 +203,8 @@ def test_ingest_marks_a_doi_found_only_in_the_body(tmp_path, monkeypatch):
             return False
 
     monkeypatch.setattr("pdfplumber.open", _Pdf)
+    # the body is read by pdfminer (rag_lib.pdf_text): one block a page
+    monkeypatch.setattr(vault_mod.pdf_text, "read_pages", lambda _p: [t.splitlines() + [""] for t in pages])
     rec = vault_mod.ingest_pdf(tmp_path / "x.pdf")
     assert rec.doi == "10.1093/bioinformatics/btab524" and rec.doi_from_body is True
     pages[0] += "\nhttps://doi.org/10.1000/own.1"

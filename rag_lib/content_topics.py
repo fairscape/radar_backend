@@ -6,8 +6,8 @@ searches for. Its UMLS concepts did reach the topic list, but each concept
 is mapped on its own name: a passing mention ("Evaluation", "Proteins")
 maps as confidently as the subject, and UMLS covers only biomedicine.
 
-Here the paper's own text -- its title and the start of its body, where
-the abstract is -- is embedded whole and compared with the OpenAlex topic
+Here the paper's own text -- its title and its abstract, or the start of
+its body where it has none (rag_lib.pdf_text.paper_text) -- is embedded whole and compared with the OpenAlex topic
 names (the index the UMLS mapper uses). Measured on 21 uploaded PDFs that
 OpenAlex *does* have, against the topics OpenAlex assigned them: at least
 one of the 3 nearest topics was OpenAlex's for 17 of 21, against 4 of 21
@@ -39,7 +39,8 @@ BODY_CHARS = 1500
 
 
 def topics_from_text(title: str | None, body: str | None, *, settings: Any) -> list[dict]:
-    """The nearest OpenAlex topics to ``title`` + the start of ``body``.
+    """The nearest OpenAlex topics to ``title`` + the start of ``body``
+    (``try_topics_json`` passes the abstract, or where the body's reading starts).
 
     Each is a ``Topic.to_dict`` shape with ``score`` the cosine. The index
     carries subfield/field/domain by name only, so they have no id and are
@@ -99,13 +100,18 @@ def ids_from_content(raw: str | None) -> set[str]:
     return {t["id"] for t in d.get("topics") or [] if isinstance(t, dict) and t.get("id")}
 
 
-def try_topics_json(title: str | None, body: str | None, *, settings: Any) -> str | None:
-    """``topics_json`` for an unmatched paper, or None when it cannot be read
-    now (index missing, embedder down) so a later aggregation retries."""
+def try_topics_json(title: str | None, abstract: str | None, body: str | None, *,
+                    settings: Any) -> str | None:
+    """``topics_json`` for an unmatched paper, read from its title and its
+    abstract (the start of its body without one), or None when it cannot
+    be read now (index missing, embedder down) so a later aggregation
+    retries."""
     if not getattr(settings, "RADAR_CONTENT_TOPICS_ENABLED", True):
         return None
+    from .pdf_text import paper_text
+
     try:
-        return topics_json(topics_from_text(title, body, settings=settings))
+        return topics_json(topics_from_text(title, paper_text(abstract, body, BODY_CHARS), settings=settings))
     except Exception as exc:  # noqa: BLE001 -- best effort; the upload must not fail on it
         log.warning("content_topics.failed", reason=str(exc)[:200])
         return None

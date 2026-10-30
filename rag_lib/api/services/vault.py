@@ -124,6 +124,10 @@ def _row_to_vault_doc(
         "tags": vault_repo.tags_for_paper(conn, user_id, row["openalex_id"]),
         "pages": int(row["n_pages"] or 0),
         "chunks": chunk_count,
+        # 'pdf' when it is the one printed in this user's uploaded file
+        # (FUNCTIONAL_SPEC P.5 Q2): the Vault page says so.
+        "abstract": _col(row, "abstract") or None,
+        "abstractSource": _col(row, "abstract_source"),
         # Which of the user's files of this paper it is (1 = the first
         # uploaded), when they have more than one; None otherwise.
         "version": (numbers if numbers is not None else versions_repo.version_numbers(conn, user_id))
@@ -198,6 +202,11 @@ def upload(
             # nothing said so.
             raise UploadRejected(f"no interest '{profile_slug}' to add the paper to", status_code=404)
         target_id = int(target["id"])
+        if not target["is_draft"]:
+            # A saved interest changes only through Edit interest, which
+            # uploads into its copy (FUNCTIONAL_SPEC E.2-8, E.6 R12).
+            raise UploadRejected(
+                f"'{profile_slug}' is a saved interest: add seeds to it in Edit interest.", status_code=409)
         if gather_runs_repo.has_unfinished_import(conn, int(target["id"])):
             # The Vault's "upload to <draft>" while that draft's import runs:
             # the wizard holds its own buttons, this path had no guard.
@@ -320,6 +329,16 @@ def upload(
         "local_path": str(pdf_path),
         "body_text": record.body_text,
     })
+    # OpenAlex has no abstract for it: the one printed in the PDF stands
+    # in, on this version only -- it was read from the user's own file
+    # (FUNCTIONAL_SPEC P.3-3). An OpenAlex abstract, then or later on a
+    # new upload, takes its place.
+    from_pdf = False
+    if not (paper_dict.get("abstract") or "").strip() and record.abstract:
+        kept = prior is not None and (prior["abstract"] or "").strip() and prior["abstract_source"] != "pdf"
+        if not kept:
+            paper_dict["abstract"] = record.abstract
+            from_pdf = True
     # Topics read while the version had no text (from its title alone) are
     # read again now that it has: parse_pending does the same.
     keep_topics = prior is not None and prior["topics_json"] and (
@@ -327,10 +346,14 @@ def upload(
     if canonical is None and not keep_topics:
         # OpenAlex does not have it, so nothing says what it is about: read
         # that from the PDF itself (rag_lib.content_topics).
-        found = content_topics.try_topics_json(paper_dict.get("title"), record.body_text, settings=settings)
+        found = content_topics.try_topics_json(
+            paper_dict.get("title"), paper_dict.get("abstract"), record.body_text, settings=settings)
         if found is not None:
             paper_dict["topics_json"] = found
     papers_repo.upsert(conn, paper_dict)
+    if from_pdf or (paper_dict.get("abstract") or "").strip():
+        conn.execute("UPDATE papers SET abstract_source = ? WHERE openalex_id = ?",
+                     ("pdf" if from_pdf else None, openalex_id))
     # A repaired upload: its file is where it was written now, and a
     # version scored on its metadata alone is fitted again from its text.
     conn.execute("UPDATE papers SET local_path = ? WHERE openalex_id = ?", (str(pdf_path), openalex_id))
@@ -414,6 +437,11 @@ def upload(
         total_ms=round((_time.monotonic() - t0) * 1000, 1),
     )
     return _row_to_vault_doc(conn, user_id, row, settings=settings)
+
+
+def _col(row: sqlite3.Row, key: str):
+    """A column some callers' rows do not select."""
+    return row[key] if key in row.keys() else None
 
 
 def list_docs(
@@ -738,7 +766,7 @@ def _enrich_via_openalex(
 # most real bylines.
 
 # Authors and the title are looked for where they are printed: the start.
-_HEAD_CHARS = 6000
+_HEAD_CHARS = 6000          # <= rag_lib.vault.FRONT_CHARS: read from front_text
 _FIRST_PAGE_CHARS = 3000
 # Letters allowed between a given name and the family name: a middle
 # initial or a particle ("Kathleen C. Fraser", "Guillaume Le Moing").
@@ -772,10 +800,16 @@ def title_rule(record: Any, work: dict) -> bool:
         return False
     if pdf == oa or _main_title(record.title) == oa or pdf == _main_title(_work_title(work)):
         return True
-    return _squash(_work_title(work)) in _squash(_front_matter(record.body_text))
+    return _squash(_work_title(work)) in _squash(_front_matter(_front_text(record)))
 
 
 _REFERENCES_HEADING = re.compile(r"\n\s*(?:\d+\.?\s*)?(?:references|bibliography|literature cited)\s*\n", re.IGNORECASE)
+
+
+def _front_text(record: Any) -> str:
+    """The start of the PDF as pdfplumber reads it (``PdfIngestRecord.front_text``);
+    a record without one (built by hand) is looked at through its body."""
+    return getattr(record, "front_text", "") or record.body_text or ""
 
 
 def _front_matter(body: str | None) -> str:
@@ -821,7 +855,7 @@ def _named_in(name: str, head: str, spaced_head: str) -> bool:
 
 
 def author_rule(record: Any, work: dict, *, first_only: bool = False) -> bool:
-    text = (record.body_text or "")[:_HEAD_CHARS]
+    text = _front_text(record)[:_HEAD_CHARS]
     head = _squash(text)
     spaced = re.sub(r"[0-9]+", " ", _norm(text))
     if not head:
@@ -1048,11 +1082,12 @@ def _try_extract_umls_unlocked(
         cache_dir = str(settings.RADAR_UMLS_CACHE_DIR)
         mapped = map_concepts_to_topics(
             concepts,
-            min_similarity=settings.RADAR_UMLS_MIN_TOPIC_SIMILARITY,
             embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
             cache_dir=cache_dir,
         )
-        mapped_json = json.dumps([m.to_dict() for m in mapped]) if mapped else None
+        # "[]" too: NULL beside concepts is a mapping by the earlier rules,
+        # which found no topic near enough (wizard.forget_stale_umls_mappings).
+        mapped_json = json.dumps([m.to_dict() for m in mapped])
 
         conn.execute(
             "UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? "

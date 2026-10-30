@@ -26,7 +26,11 @@ from tests.test_scheduler_jobs import _StubGatherer, _candidate_paper, db_path, 
 
 def test_removing_a_seed_under_a_running_scan_is_refused_before_anything_is_written(tmp_path):
     """The refit refuses under a scan; refused after the detach, the seed was
-    gone, the centroid stale and the answer a 500."""
+    gone, the centroid stale and the answer a 500. Spec E: a saved
+    interest's seed is removed on its copy; saving that under a scan is
+    refused with the interest as it was."""
+    from rag_lib.api.services import edit_copy
+    from tests.edit_helpers import edit_saved_db
     conn, uid = _db(tmp_path)
     pid, slug = _live_interest(conn, uid)
     for oa in ("https://openalex.org/W1", "https://openalex.org/W2"):
@@ -34,8 +38,12 @@ def test_removing_a_seed_under_a_running_scan_is_refused_before_anything_is_writ
         profiles_repo.attach_seed(conn, pid, oa)
         embeddings_repo.upsert(conn, oa, "placeholder-v1", [0.1] * 8)
     gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")
-    with pytest.raises(wizard.ScanRunning):
+    with pytest.raises(wizard.SavedInterest):
         wizard.remove_seed(conn, user_id=uid, slug=slug, openalex_id="https://openalex.org/W1")
+    with edit_saved_db(conn, uid, slug, save=False) as copy:
+        assert wizard.remove_seed(conn, user_id=uid, slug=copy, openalex_id="https://openalex.org/W1")
+        with pytest.raises(wizard.ScanRunning):
+            edit_copy.save_copy(conn, user_id=uid, slug=copy)
     assert "https://openalex.org/W1" in profiles_repo.list_seed_openalex_ids(conn, pid)
     conn.close()
 

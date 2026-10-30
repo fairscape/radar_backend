@@ -200,6 +200,13 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={
             "detail": "the interest's seeds changed while it was being fitted; try again"})
 
+    from .services.wizard import SavedInterest
+
+    @app.exception_handler(SavedInterest)
+    async def _saved_interest(request: Request, exc: SavedInterest):
+        # Refused in the service, whichever route reached it (spec E.6 R12).
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     from .services.researchers import ResearcherExists
 
     @app.exception_handler(ResearcherExists)

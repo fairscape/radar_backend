@@ -50,6 +50,8 @@ from typing import Any
 import requests
 import structlog
 
+from .pdf_text import paper_text
+
 log = structlog.get_logger("rag_lib.interest_terms")
 
 BACKEND_SPEC = "st:all-MiniLM-L6-v2"
@@ -201,7 +203,7 @@ def build_lite_profile(root: Path, profile_row: sqlite3.Row, seeds: list[sqlite3
         oa = s["openalex_id"]
         # A seed with no abstract (an uploaded PDF) is described by the
         # start of its text, so it still gets a chunk in the index.
-        abstract = (s["abstract"] or "").strip() or (s["body_text"] or "")[:1500].strip() or None
+        abstract = paper_text(s["abstract"], s["body_text"], 1500).strip() or None
         papers.append(PaperRecord(
             name=s["title"] or oa,
             paper_id=_paper_id(oa),

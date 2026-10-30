@@ -388,6 +388,15 @@ def refresh_reranker_job(profile_id: int) -> None:
     settings = get_settings()
     conn = connect(settings.RADAR_DB_PATH)
     try:
+        from ..api.services import wizard as wizard_service
+
+        # Topics or seeds changed since the last scan (Edit interest saved
+        # without scanning): the recommendations stay as that scan left
+        # them until the user scans (FUNCTIONAL_SPEC E.4 Q5). The scan
+        # reranks the pool itself.
+        if any(wizard_service.outdated(conn, profile_id).values()):
+            log.info("scheduler.rerank_refresh_deferred", profile_id=profile_id, reason="outdated_since_scan")
+            return
         refresh_reranker(conn, profile_id, settings)
     except Exception:  # noqa: BLE001 -- a failed refresh leaves the old logits
         log.exception("scheduler.rerank_refresh_failed", profile_id=profile_id)
@@ -718,6 +727,13 @@ def _gather_for_profile_locked(
                 message="Loading profile and seed embeddings",
             )
             profile = _load_profile(conn, profile_row)
+            # What this scan searches, and the seeds its fit was made from,
+            # recorded when it succeeds: the edit page says when the topics
+            # on or the seeds have changed since (spec T.2-4, E.2-5).
+            searched = enabled_topic_ids(profile.topic_filters)
+            from ..api.services import wizard as wizard_service
+            scored_with = (wizard_service.fit_seed_ids(profile_row)
+                           or sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id)))
 
             # Every topic switched off is a deliberate "gather nothing",
             # so stop here rather than running the rest of the pipeline
@@ -738,7 +754,7 @@ def _gather_for_profile_locked(
                 gather_runs_repo.finish(
                     conn, run_id,
                     n_fetched=0, n_new=0, n_redup=0, api_calls=0,
-                    tier_used="no-enabled-topics",
+                    tier_used="no-enabled-topics", topic_ids=searched, seed_ids=scored_with,
                 )
                 log.info(
                     "scheduler.gather_skipped",
@@ -915,6 +931,7 @@ def _gather_for_profile_locked(
                 n_redup=n_redup,
                 api_calls=int(api_calls),
                 tier_used=tier_label,
+                topic_ids=searched, seed_ids=scored_with,
             )
             log.info(
                 "scheduler.gather_ok",

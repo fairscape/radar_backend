@@ -240,6 +240,17 @@ def delete_profile(conn: sqlite3.Connection, user_id: int, slug: str) -> int | N
         if (gather_runs_repo.running_scan(conn, profile_id) is not None
                 or gather_runs_repo.has_unfinished_import(conn, profile_id)):
             raise ProfileBusy(slug)
+        # A copy open in Edit interest goes first, with what it brought in
+        # that nothing else uses (FUNCTIONAL_SPEC E, X-10); the cascade
+        # would take the row and leave its uploads behind.
+        from . import edit_copy as edit_copy_service
+        from rag_lib.db.repos import draft_owned as draft_owned_repo
+
+        copy = edit_copy_service.copy_of(conn, profile_id)
+        if copy is not None:
+            if gather_runs_repo.has_unfinished_import(conn, int(copy["id"])):
+                raise ProfileBusy(slug)
+            draft_owned_repo.discard(conn, int(copy["id"]))
         profiles_repo.delete(conn, profile_id)
     finally:
         lock.release()
