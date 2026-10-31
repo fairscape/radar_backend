@@ -231,12 +231,15 @@ def test_each_seed_says_where_it_came_from(env):
         {("researcher", rid, "Justin C. Niestroy")}
     w1 = detail["seeds"][0]["id"]
     _request(app, "DELETE", f"/api/profiles/{slug}/seeds", params={"openalex_id": w1})
+    # A new interest's draft has no feed: "feed" is refused (E.11), "vault" is not.
     r = _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [w1], "source": "feed"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200 and r.json()["rejected"] == [w1], r.text
+    r = _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": [w1], "source": "vault"})
+    assert r.status_code == 200 and r.json()["attached"] == 1, r.text
     r = _request(app, "POST", f"/api/profiles/{slug}/seeds",
                  json={"openalex_ids": [w1], "source": "researcher", "researcher_id": rid})
     seeds = {s["id"]: s for s in _request(app, "GET", f"/api/profiles/{slug}/detail").json()["seeds"]}
-    assert (seeds[w1]["source"], seeds[w1]["sourceResearcherId"]) == ("feed", None)
+    assert (seeds[w1]["source"], seeds[w1]["sourceResearcherId"]) == ("vault", None)
     # A researcher that is not the user's is refused.
     r = _request(app, "POST", f"/api/profiles/{slug}/seeds",
                  json={"openalex_ids": [w1], "source": "researcher", "researcher_id": 999})

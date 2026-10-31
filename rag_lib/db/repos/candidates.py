@@ -43,16 +43,23 @@ IN_YEARS = (
 # feed paper made a seed kept its candidate row, and a scan finds the seeds
 # themselves; either way the seed topped its own feed. Needs ``pc``. Same
 # rule as ``scoring.pool`` (``seed_keys``) and the gathers' ``without_seeds``.
-NOT_SEED = (
-    # A seed that is the user's uploaded version of the candidate counts too.
-    "NOT EXISTS (SELECT 1 FROM profile_seeds ps"
-    " LEFT JOIN papers sp ON sp.openalex_id = ps.openalex_id"
-    " LEFT JOIN paper_versions sv ON sv.version_id = ps.openalex_id"
-    " WHERE ps.profile_id = pc.profile_id AND (ps.openalex_id = pc.openalex_id"
-    " OR sv.canonical_openalex_id = pc.openalex_id"
-    " OR (sp.doi IS NOT NULL AND lower(sp.doi) ="
-    " (SELECT lower(cp.doi) FROM papers cp WHERE cp.openalex_id = pc.openalex_id))))"
-)
+def not_seed_of(profile: str) -> str:
+    """NOT_SEED against the seeds of interest ``profile`` (an SQL expression
+    or ``?``): an Edit interest copy's, for the feed papers its Seeds step
+    offers (FUNCTIONAL_SPEC E.11)."""
+    return (
+        # A seed that is the user's uploaded version of the candidate counts too.
+        "NOT EXISTS (SELECT 1 FROM profile_seeds ps"
+        " LEFT JOIN papers sp ON sp.openalex_id = ps.openalex_id"
+        " LEFT JOIN paper_versions sv ON sv.version_id = ps.openalex_id"
+        f" WHERE ps.profile_id = {profile} AND (ps.openalex_id = pc.openalex_id"
+        " OR sv.canonical_openalex_id = pc.openalex_id"
+        " OR (sp.doi IS NOT NULL AND lower(sp.doi) ="
+        " (SELECT lower(cp.doi) FROM papers cp WHERE cp.openalex_id = pc.openalex_id))))"
+    )
+
+
+NOT_SEED = not_seed_of("pc.profile_id")
 
 
 def insert_dedup(
@@ -451,6 +458,42 @@ def top_for_profile(
         (profile_id, year_from, year_from, bucket, bucket,
          triaged, None if triaged is None else int(triaged), limit),
     ).fetchall()
+
+
+def feed_seed_choices(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    copy_id: int,
+    *,
+    query: str = "",
+    limit: int | None = 100,
+) -> list[sqlite3.Row]:
+    """The interest's feed papers its Edit interest copy can take as seeds
+    (FUNCTIONAL_SPEC E.11): in the feed as the interest is saved (above its
+    threshold, in its years, not its seed), not dismissed, not a seed of
+    the copy already. Saved ones first, then by score. ``query`` keeps the
+    titles containing it, ignoring case; matched here, not in SQL, whose
+    ``lower`` folds ASCII only ("Über" never found "über"). ``limit`` None
+    is all of them.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT pc.openalex_id, pc.saved_at, COALESCE(pc.score_blended, pc.score) AS score,
+               p.title, p.year, p.venue, p.doi
+        FROM profile_candidates pc
+        JOIN papers p USING (openalex_id)
+        JOIN profiles pr ON pr.id = pc.profile_id
+        WHERE pc.profile_id = ?
+          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED} AND {not_seed_of("?")}
+          AND pc.dismissed_at IS NULL
+        ORDER BY (pc.saved_at IS NULL), COALESCE(pc.score_blended, pc.score) DESC, pc.openalex_id
+        """,
+        (profile_id, copy_id),
+    ).fetchall()
+    q = query.strip().casefold()
+    if q:
+        rows = [r for r in rows if q in (r["title"] or "").casefold()]
+    return rows if limit is None else rows[:limit]
 
 
 def stored_paper_keys(conn: sqlite3.Connection, profile_id: int) -> list[sqlite3.Row]:

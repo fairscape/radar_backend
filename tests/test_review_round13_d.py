@@ -66,13 +66,15 @@ def test_d_apply_then_remove_leaves_a_saved_interests_topics_as_they_were(tmp_pa
     assert _states(profiles_repo.topic_filters(conn, pid)) == {T1: True, T2: True}
 
     applied = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
-    # Folded into the stored list, not into a rebuild: T2 is still there,
-    # off because the profile says no, with its state remembered; T3 joined.
-    assert _states(applied) == {T1: True, T2: False, T3: True}
+    # Folded into the stored list, not into a rebuild: T2 is still there and
+    # still on. The profile does not want it, but a topic a removed seed
+    # brought still counts as the seeds' (E.8: switches move only when the
+    # user moves them), so the not-wanted default is keep. T3 joined.
+    assert _states(applied) == {T1: True, T2: True, T3: True}
     by_id = {t["id"]: t for t in applied["topics"]}
-    assert by_id[T2]["profile"] == rt.NOT_INTEREST and by_id[T2][rt.BEFORE] is True
+    assert "profile" not in by_id[T2] or by_id[T2]["profile"] is None
     assert by_id[T3]["source"] == rt.SOURCE and rt.is_applied(applied)
-    assert _states(profiles_repo.topic_filters(conn, pid)) == {T1: True, T2: False, T3: True}
+    assert _states(profiles_repo.topic_filters(conn, pid)) == {T1: True, T2: True, T3: True}
 
     removed = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=False)
     assert _states(removed) == {T1: True, T2: True}
@@ -94,7 +96,7 @@ def test_d_re_applying_after_the_profile_changed_drops_its_stale_marks(tmp_path,
                  (json.dumps({"research_interests": [_topic("T10001", "One", weight=0.5, method="declared")]}), pid))
     conn.commit()
     same = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)
-    assert _states(same) == _states(first) == {T1: True, T2: False, T3: True}
+    assert _states(same) == _states(first) == {T1: True, T2: True, T3: True}   # T2 kept (E.8, see above)
     assert {t["id"]: t.get("profile") for t in same["topics"]} == {t["id"]: t.get("profile") for t in first["topics"]}
     wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=False)
     again = wizard.set_researcher_topics(conn, user_id=uid, slug=slug, enabled=True)

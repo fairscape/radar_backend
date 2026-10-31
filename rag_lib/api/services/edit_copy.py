@@ -114,6 +114,18 @@ def _require_copy(conn: sqlite3.Connection, user_id: int, slug: str) -> sqlite3.
     return row
 
 
+def feed_seed_choices(conn: sqlite3.Connection, *, user_id: int, slug: str,
+                      query: str = "", limit: int = 100) -> list[sqlite3.Row]:
+    """The feed papers of the interest copy ``slug`` edits that its Seeds
+    step can add (FUNCTIONAL_SPEC E.11): ``candidates.feed_seed_choices``.
+    ``LookupError`` when ``slug`` is not one of the user's open copies."""
+    from rag_lib.db.repos import candidates as candidates_repo
+
+    copy = _require_copy(conn, user_id, slug)
+    return candidates_repo.feed_seed_choices(conn, int(copy["edit_of"]), int(copy["id"]),
+                                             query=query, limit=limit)
+
+
 def alive(conn: sqlite3.Connection, *, user_id: int, slug: str, tab: str) -> None:
     """The edit page of copy ``slug`` is still there: every 30 s, and when
     its tab comes back into view. ``LookupError`` when the copy is gone;

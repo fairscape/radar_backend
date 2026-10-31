@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
+    FeedSeedChoice,
     FeedbackThresholdResponse,
     LlmTopicsResult,
     SeedUmlsStatus,
@@ -259,6 +260,27 @@ def edit_state(
         return EditCopyState(changed=edit_copy_service.changed(db, user_id=int(user["id"]), slug=slug))
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/draft/{slug}/feed-papers", response_model=list[FeedSeedChoice])
+def feed_papers(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=100, ge=1, le=100),
+) -> list[FeedSeedChoice]:
+    """The feed papers of the interest the Edit interest copy ``slug``
+    edits, for adding as seeds (FUNCTIONAL_SPEC E.11): saved ones first,
+    then by score; ``q`` searches the titles. 404 for anything but one of
+    the user's open copies. Adding them is ``POST /{slug}/seeds`` with
+    ``source: "feed"``."""
+    try:
+        rows = edit_copy_service.feed_seed_choices(db, user_id=int(user["id"]), slug=slug, query=q, limit=limit)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return [FeedSeedChoice(id=r["openalex_id"], title=r["title"] or "", year=r["year"], venue=r["venue"],
+                           doi=r["doi"], saved=r["saved_at"] is not None, score=r["score"]) for r in rows]
 
 
 @router.post("/draft/{slug}/save-edit", response_model=Profile)

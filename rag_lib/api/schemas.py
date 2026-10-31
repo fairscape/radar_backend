@@ -1065,6 +1065,17 @@ class DraftSeedsRequest(_Model):
     researcher_id: int | None = None
 
 
+class FeedSeedChoice(_Model):
+    """A feed paper Edit interest's Seeds step can add (FUNCTIONAL_SPEC E.11)."""
+    id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    saved: bool = False
+    score: float | None = None
+
+
 class DraftSeedsResponse(_Model):
     attached: int
     # Ids that were not the user's to use; nothing was attached for these.

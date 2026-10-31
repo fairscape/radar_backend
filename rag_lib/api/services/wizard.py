@@ -1264,10 +1264,15 @@ def preview_topics(conn: sqlite3.Connection, *, user_id: int, slug: str) -> tupl
     but on a live interest it widened the next scan before the user had
     seen the list. Here a new topic starts off, and nothing is written
     until ``save_topics``. Returns the filters and the ids that are new.
+
+    On an Edit interest copy "new" is against the saved interest, not the
+    copy: the first tick writes the whole list to the copy, and every other
+    new topic lost its mark.
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
-    prior = set(_prior_topic_states(conn, profile_id))
+    saved_id = int(row["edit_of"]) if row["edit_of"] is not None else profile_id
+    prior = set(_prior_topic_states(conn, saved_id))
     topic_filters = _aggregate_topics(conn, profile_id, new_on=False)
     new = {t["id"] for t in topic_filters.get("topics") or [] if t.get("id") and t["id"] not in prior}
     return topic_filters, new

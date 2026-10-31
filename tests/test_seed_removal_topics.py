@@ -358,3 +358,25 @@ def test_a_removed_seeds_umls_topic_put_back_after_a_failed_merge_is_marked(tmp_
     monkeypatch.setattr(wizard, "_merge_umls_topics", boom)
     t5 = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])[T5]
     assert t5["on"] is True and t5.get("unmatched") is True and t5["papers"] == 0
+
+
+def test_on_the_edit_copy_new_topics_stay_new_after_a_tick(live):
+    """X-39 on the probe site: a seed added on the copy brought two topics,
+    both marked new; ticking one wrote the list to the copy and the other
+    lost its mark. "New" is against the saved interest, so both keep it
+    until the copy is saved; after the save neither is new."""
+    conn, uid, pid, slug = live
+    from tests.edit_helpers import edit_saved_db
+    T5 = "https://openalex.org/T10005"
+    _paper(conn, W3, (T4, "Four"), (T5, "Five"))
+    with edit_saved_db(conn, uid, slug) as copy:
+        copy_id = profiles_repo.get_by_slug(conn, uid, copy)["id"]
+        profiles_repo.attach_seed(conn, copy_id, W3)
+        _, new = wizard.preview_topics(conn, user_id=uid, slug=copy)
+        assert new == {T4, T5}
+        wizard.save_topics(conn, user_id=uid, slug=copy, selected_topic_ids=[T1, T2, T3, T9, T4])
+        got, new = wizard.preview_topics(conn, user_id=uid, slug=copy)
+        assert new == {T4, T5}
+        assert _by_id(got)[T4]["on"] is True and _by_id(got)[T5]["on"] is False
+    _, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    assert new == set()

@@ -682,6 +682,18 @@ def attach_seeds(
     else:
         researcher_id = None
     owned = researchers_repo.user_owns_papers(conn, user_id, wanted)
+    if source == "feed":
+        # "Added from the feed" is only true of the papers the copy's Seeds
+        # step lists: its interest's feed (FUNCTIONAL_SPEC E.11). A new
+        # interest's draft has no feed; anything else is rejected.
+        from ...db.repos import candidates as candidates_repo
+        # A seed of the copy already is not listed, but adding it again is
+        # the same no-op as for any other source, not a refusal.
+        offered = set(profiles_repo.list_seed_openalex_ids(conn, int(row["id"])))
+        if row["edit_of"] is not None:
+            offered |= {r["openalex_id"] for r in candidates_repo.feed_seed_choices(
+                conn, int(row["edit_of"]), int(row["id"]), limit=None)}
+        owned = {i for i in owned if i in offered}
     attached = 0
     rejected: list[str] = []
     accepted: list[str] = []
