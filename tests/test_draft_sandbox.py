@@ -338,12 +338,16 @@ def test_while_openalex_is_paused_nothing_that_needs_it_starts(pdfs):
     _upload(pdfs, b"matched P", A, d)
     before = _snapshot(pdfs)
     runs = _q(pdfs, "SELECT COUNT(*) FROM gather_runs")
+    # The world already holds A's profile of this person: the Profiles page
+    # refreshes it (O.2 D).
+    rid = _q(pdfs, "SELECT r.id FROM researchers r JOIN users u ON u.id = r.user_id "
+                   "WHERE r.key = 'sheffield-nathan' AND u.email = ?", A["X-User-Email"])[0][0]
     openalex_status.pause("quota")
     for method, path, body in (
         ("POST", "/api/profiles", {"slug": d, "threshold": 0.5, "selected_topic_ids": []}),
         ("POST", f"/api/profiles/draft/{d}/dry-run", {"days": 30}),
         ("POST", "/api/import/prosopia", {"ref": "sheffield-nathan", "name": "Nope"}),
-        ("POST", "/api/researchers/import", {"source": "prosopia", "ref": "sheffield-nathan"}),
+        ("POST", "/api/researchers/import", {"source": "prosopia", "ref": "sheffield-nathan", "researcher_id": rid}),
     ):
         r = _request(pdfs["app"], method, path, json=body, headers=A)
         assert r.status_code == 503, (path, r.text)

@@ -715,6 +715,12 @@ class OrcidWork(_Model):
     #: (a preprint and its version of record). The redundant copy stays in
     #: the list, unticked, rather than being hidden.
     duplicate_of: str | None = None
+    #: This author's institutions on this work, as OpenAlex records them.
+    institutions: list[str] = []
+    #: None of them is one of the person's institutions (their ORCID
+    #: employments and educations, else the ones most of their works give):
+    #: maybe a namesake's paper. Only a hint (FUNCTIONAL_SPEC O.2 A3).
+    other_institution: bool = False
 
 
 class OrcidWorksResponse(_Model):
@@ -729,6 +735,11 @@ class OrcidWorksResponse(_Model):
     works: list[OrcidWork]
     # More works than are listed: the newest ``orcid.MAX_WORKS`` are.
     truncated: bool = False
+    # The person's ORCID works list could be read. When not, nothing says
+    # which works are theirs and the picker starts with none ticked (O.2 A1).
+    registry_read: bool = False
+    # Where the person's institutions came from: "orcid", "works" or None.
+    institution_basis: str | None = None
 
 
 class OrcidImportRequest(_Model):
@@ -991,7 +1002,13 @@ class ResearcherWorks(_Model):
     name: str | None = None
     works: list[dict[str, Any]] = Field(default_factory=list)
     saved_ids: list[str] = Field(default_factory=list)
+    # Offered by an earlier import and left unticked: listed apart, unticked
+    # (FUNCTIONAL_SPEC O.2 E).
+    skipped_ids: list[str] = Field(default_factory=list)
     truncated: bool = False
+    # ORCID only, as OrcidWorksResponse.
+    registry_read: bool = False
+    institution_basis: str | None = None
 
 
 class ResearcherSuggestions(_Model):
@@ -1027,6 +1044,9 @@ class ResearcherImportRequest(_Model):
     base_url: str | None = None
     paper_ids: list[str] | None = None
     embedding_model: str | None = None
+    # "Check for new papers" on this stored profile. Without it a person
+    # already stored is refused with a 409 (FUNCTIONAL_SPEC O.2 D).
+    researcher_id: int | None = None
 
 
 class ResearcherImportStart(_Model):

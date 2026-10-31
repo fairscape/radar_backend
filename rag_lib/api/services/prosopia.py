@@ -62,13 +62,15 @@ from ...paper import Paper
 from ...prosopia_client import (
     DEFAULT_BASE_URL,
     ProfileNotFound,
+    ProfileNotPublic,
+    ProsopiaFormatChanged,
     ProsopiaClient,
     ProsopiaError,
     allowed_base_url,
     read_summary,
     looks_like_orcid,
 )
-from ...prosopia_seeds import RUNGS, _paper_id, normalize_doi, prefetch_works, resolve_seed
+from ...prosopia_seeds import RUNGS, Person, _paper_id, normalize_doi, prefetch_works, resolve_seed
 from . import wizard as wizard_service
 
 
@@ -79,7 +81,10 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "ImportPlan",
     "PapersNotFound",
+    "ProfileEmpty",
     "ProfileNotFound",
+    "ProfileNotPublic",
+    "ProsopiaFormatChanged",
     "ProsopiaError",
     "list_works",
     "prepare_import",
@@ -91,6 +96,17 @@ __all__ = [
 
 class PapersNotFound(LookupError):
     """None of the requested paper ids are on this profile."""
+
+
+class ProfileEmpty(ProsopiaError):
+    """The profile lists no papers: nothing to import, so nothing is
+    created (FUNCTIONAL_SPEC O.2 C)."""
+
+    def __init__(self, slug: str, *, refresh: bool = False):
+        super().__init__(
+            f"The Prosopia profile '{slug}' lists no papers any more, so there is nothing to add. Nothing was changed."
+            if refresh else
+            f"The Prosopia profile '{slug}' lists no papers, so there is nothing to import. Nothing was created.")
 
 
 # How often the per-paper loop writes a progress tick. Every paper would
@@ -130,6 +146,12 @@ class ImportPlan:
     # removes them again (``undo_import``), so nothing half-built stays.
     new_draft: bool = False
     new_researcher: bool = False
+    # Every work id the source offered for this import (the pick list), so
+    # the ones left unticked are remembered (FUNCTIONAL_SPEC O.2 E). None:
+    # nothing to remember (a caller that did not list).
+    listed_ids: set[str] | None = None
+    # Whose papers these are, for checking a title match (O.2 B).
+    person: Any = None
 
 
 def normalize_ref(raw: str) -> str:
@@ -244,18 +266,26 @@ def list_works(
     *,
     base_url: str | None = None,
     prosopia_client: Any | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """The papers on a profile, slimmed for a pick list.
 
     Same errors as :func:`prepare_import` (400 / 404 / 502 material),
     but nothing is written: this is the read the wizard makes before the
-    user decides which papers to keep.
+    user decides which papers to keep. ``refresh``: the read is "check for
+    new papers" on a stored profile; the result also carries the profile
+    itself (``profile``), whose fields the caller stores.
     """
     slug, profile = _resolve_profile(ref, base_url, prosopia_client)
+    if not profile.papers:
+        raise ProfileEmpty(slug, refresh=refresh)
     works = [_work_summary(r) for r in profile.papers]
     works.sort(key=lambda w: (-(w["year"] or 0), w["title"]))
     log.info("prosopia.list_works", slug=slug, n=len(works))
-    return {"slug": slug, "name": profile.name or None, "works": works}
+    out = {"slug": slug, "name": profile.name or None, "works": works}
+    if refresh:
+        out["profile"] = profile
+    return out
 
 
 class DraftNotFound(LookupError):
@@ -420,7 +450,14 @@ def prepare_import(
         profile=profile,
         new_draft=target is None,
         new_researcher=new_researcher,
+        listed_ids={_paper_id(r) for r in profile.papers},
+        person=person_of(profile),
     )
+
+
+def person_of(profile: Any) -> Person:
+    """The person a Prosopia profile is of: their name and ORCID (rid)."""
+    return Person.of(getattr(profile, "name", None), str(getattr(profile, "rid", "") or ""))
 
 
 def select_records(profile: Any, slug: str, paper_ids: list[str] | None) -> list[Any]:
@@ -430,6 +467,8 @@ def select_records(profile: Any, slug: str, paper_ids: list[str] | None) -> list
     :class:`PapersNotFound` when none of the ids are on the profile.
     """
     records = list(profile.papers)
+    if not records:
+        raise ProfileEmpty(slug)
     if paper_ids is not None:
         wanted = {(p or "").strip() for p in paper_ids if (p or "").strip()}
         if not wanted:
@@ -498,7 +537,7 @@ def run_import(
 
     resolved = []
     for i, record in enumerate(records, start=1):
-        resolution = resolve_seed(record, oa, slug=plan.slug, cache=cache)
+        resolution = resolve_seed(record, oa, slug=plan.slug, cache=cache, person=plan.person)
         if not resolution.resolved:
             # Only now is the summary artifact worth a round trip: it is
             # the embedding input for a paper we could not otherwise
@@ -527,38 +566,7 @@ def run_import(
             _tick(reporter, i, f"Embedded {i} / {len(resolved)} seeds")
 
     _step(reporter, "persisting", total=len(resolved), message=f"Saving {len(resolved)} seeds")
-    drafted = 0
-    for record, resolution in resolved:
-        oa_id = resolution.openalex_id
-        # No uploaded_by_user_id: an import does not upload anything. The
-        # papers row is shared by every user, and upsert keeps the newest
-        # non-null owner, so stamping the importer here moved another
-        # user's uploaded PDF -- local file, extracted text and all -- out
-        # of their vault and into the importer's. The importer's claim is
-        # the researcher_papers link written below, which the vault list
-        # and the seed ownership check both already read.
-        is_new = papers_repo.get_by_openalex_id(conn, oa_id) is None
-        store_resolved_paper(conn, resolution)
-        if is_new and plan.profile_id is not None:
-            draft_owned_repo.own(conn, plan.profile_id, "paper", oa_id)
-            conn.commit()
-        if oa_id in vectors:
-            embeddings_repo.upsert(conn, oa_id, plan.embedding_model, vectors.pop(oa_id))
-        if plan.researcher_id is not None:
-            researchers_repo.attach_paper(
-                conn, plan.researcher_id, oa_id,
-                paper_id=resolution.paper_id,
-                resolved_by=resolution.rung,
-                summary=(getattr(record, "summary", None) or None),
-            )
-        if plan.profile_id is not None:
-            profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source="researcher",
-                                      researcher_id=plan.researcher_id)
-        drafted += 1
-
-    if plan.researcher_id is not None:
-        researchers_repo.mark_imported(conn, plan.researcher_id, run_id=run_id)
-
+    drafted = _persist(conn, plan, resolved, vectors, run_id=run_id)
     log.info(
         "prosopia.import.done",
         slug=plan.slug, draft_slug=plan.draft_slug,
@@ -576,6 +584,114 @@ def run_import(
         "resolved_by": resolved_by,
         "unresolved": unresolved,
     }
+
+
+def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors: dict[str, Any], *,
+             run_id: int | None) -> int:
+    """Write what the first half resolved; returns how many papers.
+
+    Two records of one paper (the same OpenAlex work) are one paper: the
+    first is stored, the rest marked ``duplicate`` (FUNCTIONAL_SPEC O.2 H);
+    so is a record of a paper the researcher already has under another of
+    the source's ids. Every write the loop makes is listed, and a failure
+    part-way takes them back, so a failed import adds nothing even to an
+    existing draft or researcher. The repository calls commit one by one,
+    which is why this is undone by hand rather than rolled back.
+    """
+    done: list[tuple] = []        # what to take back, in order
+    seen: set[str] = set()
+    duplicate: set[str] = set()
+    have: dict[str, str | None] = {}
+    if plan.researcher_id is not None:
+        have = {r["openalex_id"]: r["paper_id"] for r in conn.execute(
+            "SELECT openalex_id, paper_id FROM researcher_papers WHERE researcher_id = ?", (plan.researcher_id,))}
+    drafted = 0
+    try:
+        for record, resolution in resolved:
+            oa_id = resolution.openalex_id
+            pid = resolution.paper_id
+            if oa_id in seen or (oa_id in have and have[oa_id] and pid and have[oa_id] != pid):
+                duplicate.add(pid)
+                continue
+            seen.add(oa_id)
+            # No uploaded_by_user_id: an import does not upload anything. The
+            # papers row is shared by every user, and upsert keeps the newest
+            # non-null owner, so stamping the importer here moved another
+            # user's uploaded PDF -- local file, extracted text and all -- out
+            # of their vault and into the importer's. The importer's claim is
+            # the researcher_papers link written below, which the vault list
+            # and the seed ownership check both already read.
+            is_new = papers_repo.get_by_openalex_id(conn, oa_id) is None
+            if store_resolved_paper(conn, resolution) and is_new:
+                done.append(("paper", oa_id))
+            if is_new and plan.profile_id is not None:
+                draft_owned_repo.own(conn, plan.profile_id, "paper", oa_id)
+                conn.commit()
+            if oa_id in vectors:
+                if not embeddings_repo.has(conn, oa_id, plan.embedding_model):
+                    done.append(("vector", oa_id))
+                embeddings_repo.upsert(conn, oa_id, plan.embedding_model, vectors.pop(oa_id))
+            if plan.researcher_id is not None:
+                if oa_id not in have:
+                    done.append(("link", oa_id))
+                researchers_repo.attach_paper(
+                    conn, plan.researcher_id, oa_id,
+                    paper_id=pid,
+                    resolved_by=resolution.rung,
+                    summary=(getattr(record, "summary", None) or None),
+                )
+            if plan.profile_id is not None:
+                if profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source="researcher",
+                                             researcher_id=plan.researcher_id):
+                    done.append(("seed", oa_id))
+            drafted += 1
+
+        if plan.researcher_id is not None:
+            taken = {res.paper_id for _r, res in resolved}
+            # Offered and left unticked: the listing less what was taken and
+            # what the researcher already had (a refresh lists those too;
+            # marked "skipped", one dropping out of the saved set later
+            # would show as "left out before" although it was imported).
+            from . import orcid as orcid_service
+
+            had = set(have) | {p for p in have.values() if p} | {orcid_service._strip_openalex(o) for o in have}
+            researchers_repo.set_work_marks(
+                conn, plan.researcher_id,
+                skipped=(plan.listed_ids or set()) - taken - had,
+                duplicate=duplicate, taken=taken - duplicate,
+            )
+            conn.commit()
+            researchers_repo.mark_imported(conn, plan.researcher_id, run_id=run_id)
+    except BaseException:
+        conn.rollback()
+        _take_back(conn, plan, done)
+        raise
+    return drafted
+
+
+def _take_back(conn: sqlite3.Connection, plan: ImportPlan, done: list[tuple]) -> None:
+    """Undo ``_persist``'s writes after a failure, newest first."""
+    for kind, oa_id in reversed(done):
+        if kind == "seed":
+            conn.execute("DELETE FROM profile_seeds WHERE profile_id = ? AND openalex_id = ?", (plan.profile_id, oa_id))
+            conn.execute("UPDATE profiles SET n_seed = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?) "
+                         "WHERE id = ?", (plan.profile_id, plan.profile_id))
+        elif kind == "link":
+            conn.execute("DELETE FROM researcher_papers WHERE researcher_id = ? AND openalex_id = ?",
+                         (plan.researcher_id, oa_id))
+        elif kind == "vector":
+            conn.execute("DELETE FROM paper_embeddings WHERE openalex_id = ? AND embedding_model = ?",
+                         (oa_id, plan.embedding_model))
+        elif kind == "paper":
+            if plan.profile_id is not None:
+                conn.execute("DELETE FROM draft_owned WHERE profile_id = ? AND kind = 'paper' AND item = ?",
+                             (plan.profile_id, oa_id))
+            if not draft_owned_repo._paper_in_use(conn, oa_id):
+                conn.execute("DELETE FROM papers WHERE openalex_id = ?", (oa_id,))
+    conn.commit()
+    if done:
+        log.info("prosopia.import.taken_back", n=len(done), profile_id=plan.profile_id,
+                 researcher_id=plan.researcher_id)
 
 
 def import_error(exc: BaseException) -> str:

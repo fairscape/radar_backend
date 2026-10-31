@@ -81,6 +81,34 @@ def get_import_openalex_client():
     return None
 
 
+
+def prosopia_http_error(exc: Exception, ref: str) -> HTTPException:
+    """The answer for a Prosopia read that failed, one place for every route.
+
+    404 no such profile; 403 not public; 422 no papers; 502 for the rest
+    (its interface changed, or it could not be read).
+    """
+    from ..services import prosopia as prosopia_service
+
+    if isinstance(exc, prosopia_service.ProfileNotFound):
+        # The client's own message is more specific when it names the
+        # ref (an ORCID nobody published under); otherwise say which
+        # slug was asked for, since a bare "not found" helps nobody.
+        message = str(exc)
+        if (ref or "").strip().lower() not in message.lower():
+            message = f"prosopia profile '{ref}' not found"
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
+    if isinstance(exc, prosopia_service.ProfileNotPublic):
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    if isinstance(exc, prosopia_service.ProfileEmpty):
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    if isinstance(exc, prosopia_service.ProsopiaFormatChanged):
+        return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"could not read prosopia profile '{ref}': {public_error(exc)}",
+    )
+
 @router.post("/prosopia", response_model=ProsopiaImportStart)
 def import_prosopia(
     body: ProsopiaImportRequest,
@@ -141,21 +169,8 @@ def import_prosopia(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
             ) from exc
-        except prosopia_service.ProfileNotFound as exc:
-            # The client's own message is more specific when it names the
-            # ref (an ORCID nobody published under); otherwise say which
-            # slug was asked for, since a bare "not found" helps nobody.
-            message = str(exc)
-            if body.ref.strip().lower() not in message.lower():
-                message = f"prosopia profile '{body.ref}' not found"
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=message,
-            ) from exc
         except prosopia_service.ProsopiaError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
-            ) from exc
+            raise prosopia_http_error(exc, body.ref) from exc
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
@@ -300,11 +315,13 @@ def orcid_works(
     if not oid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000)",
+            detail=f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000 with a valid last check digit)",
         )
     client = openalex_client or OpenAlexClient(mailto=_users_repo.mailto_from_row(user, settings.RADAR_DEFAULT_MAILTO))
     try:
         listing = orcid_service.list_works(oid, client)
+    except orcid_service.OrcidNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (OpenAlexUnavailable, ResearcherExists):
         # A 503 with the pause, a 409 with the researcher (app handlers).
         raise
@@ -417,16 +434,8 @@ def prosopia_works(
             ref, base_url=base_url or settings.RADAR_PROSOPIA_BASE_URL,
             prosopia_client=prosopia_client,
         )
-    except prosopia_service.ProfileNotFound as exc:
-        message = str(exc)
-        if ref.strip().lower() not in message.lower():
-            message = f"prosopia profile '{ref}' not found"
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message) from exc
     except prosopia_service.ProsopiaError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"could not read prosopia profile '{ref}': {public_error(exc)}",
-        ) from exc
+        raise prosopia_http_error(exc, ref) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return ProsopiaWorksResponse(**listing)

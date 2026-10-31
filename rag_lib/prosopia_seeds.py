@@ -320,6 +320,7 @@ def resolve_seed(
     slug: str = "",
     cache: WorkCache | None = None,
     fallback_text: str | None = None,
+    person: "Person | None" = None,
 ) -> Resolution:
     """Prosopia ``PaperRecord`` -> a paper row plus the rung that found it.
 
@@ -333,6 +334,11 @@ def resolve_seed(
     ``fallback_text`` is the body we embed a *non*-resolving paper from
     — the Prosopia summary artifact. Defaults to the record's own
     ``summary`` field.
+
+    ``person`` is whose papers these are. A title hit is taken only if
+    that person is among its authors and its year is within one of the
+    record's (FUNCTIONAL_SPEC O.2 B): "Editorial" or "Introduction"
+    matched whichever work ranked first.
     """
     paper_id = _paper_id(record)
     work: dict | None = None
@@ -376,6 +382,8 @@ def resolve_seed(
             hits = _call(
                 client.search_by_title, title, record.year, per_page=5,
             ) or []
+            if person is not None:
+                hits = [h for h in hits if person.wrote(h) and _year_close(record.year, h)]
             work = _best_title_match(title, hits)
             if work is not None:
                 rung = "title"
@@ -403,6 +411,48 @@ def resolve_seed(
         paper=paper,
         rung="none",
     )
+
+
+@dataclass(frozen=True)
+class Person:
+    """Who a profile's papers are by, for checking a title match."""
+
+    orcid: str | None
+    surname: str
+
+    @classmethod
+    def of(cls, name: str | None, orcid: str | None) -> "Person":
+        from .paper import surname
+
+        bare = re.sub(r"^(https?://)?(www\.)?orcid\.org/", "", (orcid or "").strip(), flags=re.IGNORECASE).strip("/").upper()
+        return cls(orcid=bare if re.fullmatch(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", bare) else None,
+                   surname=surname(name))
+
+    def wrote(self, work: dict) -> bool:
+        """This person is on the work's author list: by ORCID, else by surname.
+
+        A person with neither (a profile with no name and no ORCID) is no
+        evidence either way: every title hit would be refused for nothing.
+        """
+        from .paper import surname
+
+        if not self.orcid and not self.surname:
+            return True
+        for a in work.get("authorships") or []:
+            author = (a or {}).get("author") or {}
+            if self.orcid and (author.get("orcid") or "").upper().endswith(self.orcid):
+                return True
+            if self.surname and surname(author.get("display_name")) == self.surname:
+                return True
+        return False
+
+
+def _year_close(year: int | None, work: dict) -> bool:
+    """Within a year of the record's; either year missing is no evidence."""
+    other = work.get("publication_year")
+    if not year or not isinstance(other, int):
+        return True
+    return abs(int(year) - other) <= 1
 
 
 def synthetic_id(slug: str, paper_id: str) -> str:

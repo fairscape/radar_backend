@@ -144,6 +144,20 @@ def test_s8_a_wizard_import_openalex_cannot_answer_leaves_nothing(env):
     assert run[:2] == (None, None) and "daily request limit" in run[2]
 
 
+def test_a_wizard_import_openalex_paused_at_the_start_leaves_nothing(env):
+    """Paused before the import starts: no draft, no run (D2, O.2 F as
+    revised 2026-10-31: a failed import keeps no draft)."""
+    from rag_lib import openalex_status
+
+    before = _snapshot(env)
+    openalex_status.pause("quota")
+    r = _wizard_import(_app(StubOrcidOpenAlex(WORKS)), ["W1"], name="Paused")
+    assert r.status_code == 503, r.text
+    assert "draft_slug" not in r.json()
+    assert _snapshot(env) == before
+    assert _q(env, "SELECT COUNT(*) FROM gather_runs") == [(0,)]
+
+
 def test_an_import_into_a_draft_openalex_cannot_answer_keeps_the_draft_as_it_was(env):
     app = _app(StubOrcidOpenAlex(WORKS))
     d = _request(app, "POST", "/api/profiles/draft", json={"name": "Kept"}).json()["slug"]
@@ -164,15 +178,24 @@ def test_a_profiles_page_refresh_openalex_cannot_answer_keeps_the_researcher(env
     app = _app(StubOrcidOpenAlex(WORKS))
     _stored_researcher(app)
     before = _snapshot(env, bookkeeping=True)
-    r = _request(_app(Unanswering(WORKS)), "POST", "/api/researchers/import", json={"source": "orcid", "ref": ORCID})
+    rid = _q(env, "SELECT id FROM researchers")[0][0]
+    r = _request(_app(Unanswering(WORKS)), "POST", "/api/researchers/import",
+                 json={"source": "orcid", "ref": ORCID, "researcher_id": rid})
     assert r.status_code == 503, r.text
     assert _snapshot(env, bookkeeping=True) == before
 
 
-def test_a_researcher_a_draft_imported_is_the_users_once_imported_from_the_profiles_page(env):
+def test_a_researcher_a_draft_imported_is_the_users_once_checked_from_the_profiles_page(env):
+    """Importing the draft's person on the Profiles page is refused, with the
+    profile to open (O.2 D); checking that profile for new papers makes it
+    the user's own, so discarding the draft keeps it."""
     app = _app(StubOrcidOpenAlex(WORKS))
     slug = _wizard_import(app, ["W1"], name="Mine").json()["draft_slug"]
-    _stored_researcher(app)
+    r = _request(app, "POST", "/api/researchers/import", json={"source": "orcid", "ref": ORCID})
+    assert r.status_code == 409, r.text
+    rid = r.json()["researcher"]["id"]
+    r = _request(app, "POST", "/api/researchers/import", json={"source": "orcid", "ref": ORCID, "researcher_id": rid})
+    assert r.status_code == 200, r.text
     _request(app, "DELETE", f"/api/profiles/draft/{slug}")
     assert _q(env, "SELECT COUNT(*) FROM researchers") == [(1,)]
     assert _q(env, "SELECT COUNT(*) FROM researcher_papers") == [(len(WORKS),)]

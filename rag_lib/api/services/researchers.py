@@ -53,7 +53,8 @@ from ..schemas import (
 )
 from ... import researcher_topics
 from . import wizard as wizard_service
-from .prosopia import ImportPlan, _resolve_profile, select_records
+from .prosopia import ImportPlan, _resolve_profile, person_of, select_records
+from ...prosopia_seeds import Person, _paper_id
 from .profiles import _saves_dismisses
 
 
@@ -115,12 +116,36 @@ class ResearcherExists(RuntimeError):
     409 with the researcher, so the wizard can link to it.
     """
 
-    def __init__(self, researcher_id: int, name: str):
-        super().__init__(
+    def __init__(self, researcher_id: int, name: str, *, message: str | None = None):
+        super().__init__(message or (
             f"{name} is already one of your researcher profiles. Build the interest from that "
-            "profile's papers, or update the profile on the Profiles page first. Nothing was changed.")
+            "profile's papers, or update the profile on the Profiles page first. Nothing was changed."))
         self.researcher_id = int(researcher_id)
         self.name = name
+
+
+def refuse_a_second_profile(conn: sqlite3.Connection, *, user_id: int, source: str, key: str,
+                            orcid: str | None, refresh_of: int | None) -> None:
+    """The Profiles page's import of a person already stored: refused, with
+    that profile to open (FUNCTIONAL_SPEC O.2 D). The same person is the
+    same source and key, or the same ORCID under either source -- importing
+    someone by ORCID who is stored from Prosopia made a second profile and
+    embedded their papers twice.
+
+    ``refresh_of`` is the profile "check for new papers" adds to: that one
+    person is expected, any other is still refused.
+    """
+    row = researchers_repo.find_person(conn, user_id, source, key, orcid)
+    if row is None or (refresh_of is not None and int(row["id"]) == int(refresh_of)):
+        return
+    # A profile only an unsaved draft brought in: wanted for itself now, as
+    # the import this refuses would have made it, so discarding the draft
+    # does not remove the profile the answer points at.
+    _wanted_for_itself(conn, int(row["id"]))
+    name = row["name"] or key
+    raise ResearcherExists(int(row["id"]), name, message=(
+        f"{name} is already one of your researcher profiles, so no new one was created. "
+        "Open that profile to check it for new papers."))
 
 
 def refuse_if_known(
@@ -176,6 +201,7 @@ def record_prosopia_researcher(
         soul=str(soul) if soul else None,
         grants_json=_json_or_none(grants) if grants else None,
         document_json=_json_or_none(metadata),
+        follow_source=True,
     )
 
 
@@ -246,8 +272,14 @@ def prepare_researcher_import(
     embedding_model: str | None = None,
     prosopia_client: Any | None = None,
     openalex_client: Any | None = None,
+    refresh_of: int | None = None,
 ) -> ImportPlan:
     """Read the person, write the row, return the plan for the job.
+
+    ``refresh_of`` is the stored profile "check for new papers" adds to;
+    without it a person already stored is refused (:class:`ResearcherExists`,
+    O.2 D). A ``refresh_of`` that is not this user's is a
+    :class:`ResearcherNotFound`.
 
     ``source`` is ``prosopia`` (``ref`` a slug, profile URL or ORCID
     published there) or ``orcid`` (``ref`` an ORCID whose works OpenAlex
@@ -266,6 +298,8 @@ def prepare_researcher_import(
 
     # OpenAlex paused: nothing is created (FUNCTIONAL_SPEC F2), a 503.
     openalex_status.check()
+    if refresh_of is not None:
+        _require(conn, user_id, int(refresh_of))
     model = embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     if source == "prosopia":
         slug, profile = _resolve_profile(ref, base_url, prosopia_client)
@@ -275,6 +309,11 @@ def prepare_researcher_import(
             conn, user_id,
             researcher_id=int(existing["id"]) if existing is not None else None,
             orcid=rid.upper() if rid and not rid.lower().startswith("local:") else None,
+        )
+        refuse_a_second_profile(
+            conn, user_id=user_id, source="prosopia", key=slug,
+            orcid=rid.upper() if rid and not rid.lower().startswith("local:") else None,
+            refresh_of=refresh_of,
         )
         records = select_records(profile, slug, paper_ids)
         researcher_id = record_prosopia_researcher(
@@ -286,12 +325,16 @@ def prepare_researcher_import(
             slug=slug, user_id=user_id, embedding_model=model,
             researcher_id=researcher_id, records=records, profile=profile,
             new_researcher=existing is None,
+            listed_ids={_paper_id(r) for r in profile.papers},
+            person=person_of(profile),
         )
     if source == "orcid":
         oid = orcid_service.normalize_orcid(ref)
         if not oid:
             raise ValueError("orcid must be an ORCID iD such as 0000-0001-5643-4068")
         _refuse_if_importing(conn, user_id, orcid=oid)
+        refuse_a_second_profile(conn, user_id=user_id, source="orcid", key=oid, orcid=oid,
+                                refresh_of=refresh_of)
         wanted: set[str] | None = None
         if paper_ids is not None:
             wanted = {orcid_service._strip_openalex(i) for i in paper_ids if (i or "").strip()}
@@ -315,6 +358,8 @@ def prepare_researcher_import(
             slug=oid, user_id=user_id, embedding_model=model,
             researcher_id=researcher_id, records=records, profile=None,
             new_researcher=existing is None,
+            listed_ids={w["openalex_id"] for w in listing["works"]},
+            person=Person.of(listing["name"], oid),
         )
     raise ValueError(f"source must be one of {', '.join(SOURCES)}")
 
@@ -432,6 +477,10 @@ def works_for_refresh(
     A work counts as saved when its id matches (OpenAlex id for ORCID, the
     profile's paper id for Prosopia) or, failing that, its DOI does --
     the same paper can come back under a new OpenAlex id after a merge.
+
+    A Prosopia profile's fields (affiliation, expertise, ...) are stored
+    from this read whether or not any paper is imported: they follow the
+    source, a field it no longer has is cleared (FUNCTIONAL_SPEC O.2 F4).
     """
     from . import orcid as orcid_service
     from . import prosopia as prosopia_service
@@ -457,8 +506,10 @@ def works_for_refresh(
     else:
         listing = prosopia_service.list_works(
             row["key"], base_url=row["base_url"] or DEFAULT_BASE_URL,
-            prosopia_client=prosopia_client,
+            prosopia_client=prosopia_client, refresh=True,
         )
+        record_prosopia_researcher(conn, user_id=user_id, slug=row["key"],
+                                   profile=listing.pop("profile"), base_url=row["base_url"])
         works = listing["works"]
         known = {
             w["id"] for w in works
@@ -468,10 +519,19 @@ def works_for_refresh(
         }
         name = listing.get("name")
     known.discard("")
+    # What earlier imports did not take (FUNCTIONAL_SPEC O.2 E, H): another
+    # record of a paper already saved is saved; one left unticked is listed
+    # apart, unticked.
+    marks = researchers_repo.work_marks(conn, researcher_id)
+    ids = {w.get("openalex_id") if row["source"] == "orcid" else w.get("id") for w in works}
+    known |= {w for w, m in marks.items() if m == "duplicate" and w in ids}
+    skipped = {w for w, m in marks.items() if m == "skipped" and w in ids} - known
     return {
         "source": row["source"], "key": row["key"], "name": name or row["name"],
-        "works": works, "saved_ids": sorted(known),
+        "works": works, "saved_ids": sorted(known), "skipped_ids": sorted(skipped),
         "truncated": bool(listing.get("truncated")),
+        "registry_read": bool(listing.get("registry_read")),
+        "institution_basis": listing.get("institution_basis"),
     }
 
 

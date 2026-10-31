@@ -601,7 +601,7 @@ def test_restart_mid_researcher_import_then_build(app, env, monkeypatch):
     print("DET", det["researcher"], len(det["papers"]))
     assert det["researcher"]["importing"] is False and det["researcher"]["last_error"]
     holder[0] = app.state.inline
-    r2 = _ok(_request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}))
+    r2 = _ok(_request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "researcher_id": rid}))
     assert r2["researcher_id"] == rid
     det = _ok(_request(app, "GET", f"/api/researchers/{rid}"))
     print("DET2", det["researcher"], len(det["papers"]))

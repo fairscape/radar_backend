@@ -63,6 +63,7 @@ EXPECTED_VERSIONS = [
     "0032_scan_topic_ids",
     "0033_edit_copies",
     "0034_edit_lock",
+    "0035_researcher_work_marks",
 ]
 
 

@@ -168,7 +168,13 @@ def _one(env, sql, *params):
 
 def _import_researcher(app, ref="sheffield-nathan", source="prosopia", headers=None, **extra) -> int:
     body = {"source": source, "ref": ref, **extra}
-    return _ok(_request(app, "POST", "/api/researchers/import", json=body, headers=headers or {}))["researcher_id"]
+    r = _request(app, "POST", "/api/researchers/import", json=body, headers=headers or {})
+    if r.status_code == 409 and "researcher_id" not in body:
+        # Already a profile (FUNCTIONAL_SPEC O.2 D): refresh that one, as
+        # the profile page's "check for new papers" does.
+        r = _request(app, "POST", "/api/researchers/import",
+                     json={**body, "researcher_id": r.json()["researcher"]["id"]}, headers=headers or {})
+    return _ok(r)["researcher_id"]
 
 
 def _go_live(app, env, name="Live", *, seeds_from_researcher=True, headers=None, threshold=None):
@@ -471,7 +477,7 @@ def test_j2_researcher_profiles_end_to_end(app, env):
     assert set(works["saved_ids"]) == {w["id"] for w in works["works"]}
     n_before = _one(env, "SELECT COUNT(*) AS n FROM researcher_papers WHERE researcher_id = ?", rid)["n"]
     refreshed = _ok(_request(app, "POST", "/api/researchers/import",
-                             json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": [works["works"][0]["id"]]}))
+                             json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": [works["works"][0]["id"]], "researcher_id": rid}))
     assert refreshed["researcher_id"] == rid and refreshed["already_running"] is False
     assert _one(env, "SELECT COUNT(*) AS n FROM researcher_papers WHERE researcher_id = ?", rid)["n"] == n_before
     after = _ok(_request(app, "GET", f"/api/researchers/{rid}"))["researcher"]
@@ -980,8 +986,8 @@ def test_j5_names_slugs_and_odd_payloads(app, env):
     assert _request(app, "POST", "/api/researchers/import", json={"source": "github", "ref": "x"}).status_code == 400
     assert _request(app, "POST", "/api/researchers/import", json={"source": "orcid", "ref": "not-an-orcid"}).status_code == 400
     assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "   "}).status_code == 400
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": ["nope"]}).status_code == 404
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": []}).status_code == 400
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": ["nope"], "researcher_id": rid}).status_code == 404
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": [], "researcher_id": rid}).status_code == 400
     # Bad emails.
     assert _request(app, "GET", "/api/profiles", headers={"X-User-Email": "not-an-email"}).status_code == 400
     # Seeds payloads.
@@ -1223,7 +1229,7 @@ def test_j2_refresh_brings_only_the_new_paper_and_leaves_interests_alone(app, en
     fresh = [w for w in works["works"] if w["id"] not in works["saved_ids"]]
     assert [w["id"] for w in fresh] == ["new2026"]
     started = _ok(_request(app, "POST", "/api/researchers/import",
-                           json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": ["new2026"]}))
+                           json={"source": "prosopia", "ref": "sheffield-nathan", "paper_ids": ["new2026"], "researcher_id": rid}))
     assert started["researcher_id"] == rid and started["already_running"] is False
     st = _ok(_request(app, "GET", f"/api/import/prosopia/{started['run_id']}"))
     assert st["run"]["error"] is None and st["result"]["drafted"] == 1 and st["run"]["researcher_id"] == rid

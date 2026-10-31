@@ -178,7 +178,14 @@ def test_orcid_import_keeps_a_selection(env):
 def test_reimport_refreshes_the_same_row(env):
     app = _app(StubProsopia(_stub_profile()), _stub_openalex())
     first = _import(app, source="prosopia", ref="sheffield-nathan").json()
-    second = _import(app, source="prosopia", ref="https://prosopia.databio.org/sheffield-nathan").json()
+    # The same person again without saying it is a refresh: refused, with
+    # the stored profile to open (FUNCTIONAL_SPEC O.2 D).
+    again = _import(app, source="prosopia", ref="https://prosopia.databio.org/sheffield-nathan")
+    assert again.status_code == 409, again.text
+    assert again.json()["researcher"]["id"] == first["researcher_id"]
+    assert "no new one was created" in again.json()["detail"]
+    second = _import(app, source="prosopia", ref="https://prosopia.databio.org/sheffield-nathan",
+                     researcher_id=first["researcher_id"]).json()
     assert first["researcher_id"] == second["researcher_id"]
     assert second["run_id"] != first["run_id"]
     assert _count(env, "SELECT COUNT(*) FROM researchers") == 1
@@ -406,9 +413,12 @@ def test_check_for_new_papers_marks_what_is_already_saved(env):
     body = resp.json()
     assert body["source"] == "orcid" and len(body["works"]) == 3
     assert body["saved_ids"] == ["W1"]
+    # Offered and left unticked: listed apart (FUNCTIONAL_SPEC O.2 E).
+    assert body["skipped_ids"] == ["W2", "W3"]
 
-    _import(app, source="orcid", ref=ORCID, paper_ids=["W3"])          # pick one new paper
-    assert _request(app, "GET", f"/api/researchers/{rid}/works").json()["saved_ids"] == ["W1", "W3"]
+    _import(app, source="orcid", ref=ORCID, paper_ids=["W3"], researcher_id=rid)   # pick one new paper
+    body = _request(app, "GET", f"/api/researchers/{rid}/works").json()
+    assert body["saved_ids"] == ["W1", "W3"] and body["skipped_ids"] == ["W2"]
     assert _count(env, "SELECT COUNT(*) FROM researcher_papers") == 2  # W2 was never added
 
     # Prosopia: matched on the profile's own paper ids.

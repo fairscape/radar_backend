@@ -50,7 +50,7 @@ from ..schemas import (
     ResearcherWorks,
 )
 from ..settings import Settings
-from .prosopia import get_import_openalex_client, get_prosopia_client, launch_import
+from .prosopia import get_import_openalex_client, get_prosopia_client, launch_import, prosopia_http_error
 
 router = APIRouter()
 
@@ -102,22 +102,19 @@ def import_researcher(
                 embedding_model=body.embedding_model,
                 prosopia_client=prosopia_client,
                 openalex_client=openalex_client,
+                refresh_of=body.researcher_id,
             )
+        except researchers_service.ResearcherNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except researchers_service.ResearcherImportRunning as exc:
             # Already importing this person: the run to watch, not a second one.
             return ResearcherImportStart(researcher_id=exc.researcher_id, run_id=exc.run_id, already_running=True)
         except (prosopia_service.PapersNotFound, orcid_service.WorksNotFound) as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-        except prosopia_service.ProfileNotFound as exc:
-            message = str(exc)
-            if body.ref.strip().lower() not in message.lower():
-                message = f"prosopia profile '{body.ref}' not found"
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message) from exc
         except prosopia_service.ProsopiaError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"could not read prosopia profile '{body.ref}': {public_error(exc)}",
-            ) from exc
+            raise prosopia_http_error(exc, body.ref) from exc
+        except orcid_service.OrcidNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except (OpenAlexUnavailable, ResearcherExists):
@@ -210,9 +207,11 @@ def researcher_works(
     ] = None,
 ) -> ResearcherWorks:
     """The researcher's source read again, with the works already saved
-    marked (``saved_ids``): what "check for new papers" offers. Nothing is
-    written. 404 for another user's or an unknown researcher; 502 when the
-    source could not be read."""
+    marked (``saved_ids``): what "check for new papers" offers. No paper is
+    written; a Prosopia profile's fields are stored as the source has them
+    now (O.2 F4). 404 for another user's or an unknown researcher, or an
+    ORCID with no record; 502 when the source could not be read."""
+    from ..services import orcid as orcid_service
     from ..services import prosopia as prosopia_service
     from ..services import researchers as researchers_service
 
@@ -221,10 +220,10 @@ def researcher_works(
             db, settings, user_id=int(user["id"]), researcher_id=researcher_id,
             prosopia_client=prosopia_client, openalex_client=openalex_client,
         ))
-    except researchers_service.ResearcherNotFound as exc:
+    except (researchers_service.ResearcherNotFound, orcid_service.OrcidNotFound) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except prosopia_service.ProfileNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except prosopia_service.ProsopiaError as exc:
+        raise prosopia_http_error(exc, "") from exc
     except OverflowError as exc:   # an id SQLite cannot hold: no such researcher, not a source failure
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"researcher {researcher_id} not found") from exc
     except (OpenAlexUnavailable, ResearcherExists):

@@ -172,6 +172,7 @@ def upsert(
     soul: str | None = None,
     grants_json: str | None = None,
     document_json: str | None = None,
+    follow_source: bool = False,
 ) -> int:
     """Insert or refresh a researcher row; returns its id.
 
@@ -179,6 +180,10 @@ def upsert(
     says now, but keeps a value the new read did not supply (an ORCID
     re-import has no affiliation to offer, and must not blank the one a
     Prosopia read filled in).
+
+    ``follow_source``: the read is the whole profile (a Prosopia profile),
+    so a field it no longer has is cleared here too (FUNCTIONAL_SPEC O.2
+    F4: "跟着来源一起清空").
     """
     existing = get_by_key(conn, user_id, source, key)
     if existing is None:
@@ -196,21 +201,22 @@ def upsert(
         )
         conn.commit()
         return int(cur.lastrowid)
+    keep = "COALESCE(?, {0})" if not follow_source else "?"
     conn.execute(
         """
         UPDATE researchers SET
           base_url      = COALESCE(?, base_url),
           orcid         = COALESCE(?, orcid),
           name          = ?,
-          affiliation   = COALESCE(?, affiliation),
+          affiliation   = {affiliation},
           url           = COALESCE(?, url),
-          expertise     = COALESCE(?, expertise),
-          soul          = COALESCE(?, soul),
-          grants_json   = COALESCE(?, grants_json),
-          document_json = COALESCE(?, document_json),
+          expertise     = {expertise},
+          soul          = {soul},
+          grants_json   = {grants_json},
+          document_json = {document_json},
           updated_at    = datetime('now')
         WHERE id = ?
-        """,
+        """.format(**{f: keep.format(f) for f in ("affiliation", "expertise", "soul", "grants_json", "document_json")}),
         (
             base_url, orcid, name, affiliation, url, expertise, soul,
             grants_json, document_json, int(existing["id"]),
@@ -384,3 +390,30 @@ def set_profile_researcher(
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {k: row[k] for k in row.keys()}
+
+
+def work_marks(conn: sqlite3.Connection, researcher_id: int) -> dict[str, str]:
+    """``{work_id: mark}``: what earlier imports did not take (migration 0035)."""
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT work_id, mark FROM researcher_work_marks WHERE researcher_id = ?", (int(researcher_id),))}
+
+
+def set_work_marks(conn: sqlite3.Connection, researcher_id: int, *,
+                   skipped: set[str], duplicate: set[str], taken: set[str]) -> None:
+    """Record one import's choices. Not committed (the import's persist does).
+
+    ``taken`` clears a mark (a work skipped before and ticked now); a
+    duplicate outranks a skip; a skip never overwrites a duplicate.
+    """
+    rid = int(researcher_id)
+    for w in taken:
+        conn.execute("DELETE FROM researcher_work_marks WHERE researcher_id = ? AND work_id = ? AND mark = 'skipped'",
+                     (rid, w))
+    for w in duplicate:
+        conn.execute(
+            "INSERT INTO researcher_work_marks (researcher_id, work_id, mark) VALUES (?, ?, 'duplicate') "
+            "ON CONFLICT (researcher_id, work_id) DO UPDATE SET mark = 'duplicate', marked_at = datetime('now')",
+            (rid, w))
+    for w in skipped - duplicate - taken:
+        conn.execute("INSERT OR IGNORE INTO researcher_work_marks (researcher_id, work_id, mark) VALUES (?, ?, 'skipped')",
+                     (rid, w))

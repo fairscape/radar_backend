@@ -134,6 +134,7 @@ def canned_openalex_work(
     field_name: str = "Test Field",
     domain_id: str = "D1",
     domain_name: str = "Test Domain",
+    authors: list[tuple[str, str | None]] | None = None,
 ) -> dict:
     """Build a minimal OpenAlex work dict that paper_from_work can consume.
 
@@ -162,4 +163,9 @@ def canned_openalex_work(
         "primary_topic": topic_block,
         "topics": [topic_block],
         "concepts": [],
+        # (display_name, orcid) pairs; a title match needs the person here.
+        "authorships": [
+            {"author": {"display_name": n, "orcid": f"https://orcid.org/{o}" if o else None}}
+            for n, o in (authors or [])
+        ],
     }

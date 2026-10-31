@@ -233,10 +233,11 @@ RECORD_NOTHING = _record(
 )
 
 
-def _work(doi, oid, title, year=2024):
+def _work(doi, oid, title, year=2024, authors=None):
     return canned_openalex_work(
         doi=doi, openalex_id=f"https://openalex.org/{oid}", title=title,
         year=year, venue="A Journal", abstract_words=["an", "abstract"],
+        authors=authors,
     )
 
 
@@ -459,8 +460,10 @@ def _stub_openalex():
         },
         title_hits={
             "Taming the reference genome jungle": [
+                # The person is on it: a title match needs that (O.2 B).
                 _work("10.1093/bioinformatics/btag554", "W4414879798",
-                      "Taming the reference genome jungle", 2026),
+                      "Taming the reference genome jungle", 2026,
+                      authors=[("Nathan C. Sheffield", None)]),
             ],
         },
     )
@@ -777,22 +780,27 @@ def test_status_404s_for_another_users_run(env):
     assert _request(app, "GET", f"/api/import/prosopia/{run_id}").status_code == 404
 
 
-def test_import_of_an_empty_profile_still_creates_a_draft(env):
+def test_an_empty_profile_is_refused_and_creates_nothing(env):
+    """FUNCTIONAL_SPEC O.2 C (2026-10-31): a profile with no papers used to
+    create a draft with 0 seeds; now nothing is created, and the listing
+    says why."""
     profile = _stub_profile()
     profile.papers = []
     app = _app(StubProsopia(profile), _stub_openalex())
+    conn = connect(env)
+    before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ("profiles", "researchers", "gather_runs")}
+    conn.close()
     resp = _start(app, ref="sheffield-nathan")
-    assert resp.status_code == 200, resp.text
-    run_id = resp.json()["run_id"]
-
-    result = _request(
-        app, "GET", f"/api/import/prosopia/{run_id}",
-    ).json()["result"]
-    assert result["drafted"] == 0
-    assert result["unresolved"] == []
-    assert result["resolved_by"] == {
-        "work_id": 0, "doi": 0, "pmcid": 0, "title": 0, "none": 0,
-    }
+    assert resp.status_code == 422, resp.text
+    assert "lists no papers" in resp.json()["detail"]
+    listed = _request(app, "GET", "/api/import/prosopia/works?ref=sheffield-nathan")
+    assert listed.status_code == 422 and "lists no papers" in listed.json()["detail"]
+    conn = connect(env)
+    after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+             for t in ("profiles", "researchers", "gather_runs")}
+    conn.close()
+    assert after == before
 
 
 def test_no_scheduler_closes_the_run_with_an_error(env):

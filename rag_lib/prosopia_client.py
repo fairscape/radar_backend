@@ -70,6 +70,23 @@ class ProfileNotFound(ProsopiaError):
     """The slug does not name a profile visible to this caller."""
 
 
+class ProfileNotPublic(ProsopiaError):
+    """The profile exists but is not public (Prosopia answered 401/403)."""
+
+
+class ProsopiaFormatChanged(ProsopiaError):
+    """Prosopia answered in a shape this code does not know.
+
+    Raised rather than read as "no papers": a renamed field turned every
+    import into a draft with 0 seeds and no error (FUNCTIONAL_SPEC O.2 C).
+    """
+
+    def __init__(self, what: str):
+        super().__init__(
+            "Prosopia's interface has changed, so this profile could not be read "
+            f"({what}). Nothing was created.")
+
+
 # The server caps a page of works at 100, and a summaries read at 20 ids.
 PAPERS_PAGE_SIZE = 100
 SUMMARIES_BATCH = 20
@@ -108,9 +125,10 @@ class PagedApiStorage(ApiArtifactStorage):
             if isinstance(data, list):  # the unpaged server
                 entries = [e for e in data if isinstance(e, dict)]
                 break
-            if not isinstance(data, dict):
-                raise RuntimeError(f"unexpected papers payload: {type(data).__name__}")
-            entries.extend(e for e in (data.get("items") or []) if isinstance(e, dict))
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ProsopiaFormatChanged(
+                    "the papers list is not a list or an 'items' envelope")
+            entries.extend(e for e in data["items"] if isinstance(e, dict))
             cursor = data.get("next_cursor")
             if not data.get("has_more") or not cursor:
                 break
@@ -129,13 +147,14 @@ class PagedApiStorage(ApiArtifactStorage):
     def fields(self) -> dict:
         """The profile's own fields (``fields`` now, ``metadata`` before)."""
         d = self._detail()
-        if not isinstance(d, dict):
-            return {}
-        for part in ("fields", "metadata"):
-            block = d.get(part)
-            if isinstance(block, dict):
-                return block
-        return {}
+        if isinstance(d, dict):
+            for part in ("fields", "metadata"):
+                block = d.get(part)
+                if isinstance(block, dict):
+                    return block
+        # Neither: the name, affiliation and ORCID would all read as empty
+        # and the person be stored under their slug.
+        raise ProsopiaFormatChanged("the profile has neither 'fields' nor 'metadata'")
 
     def text_part(self, name: str) -> str:
         value = self._detail().get(name) if isinstance(self._detail(), dict) else None
@@ -168,6 +187,12 @@ class PagedApiStorage(ApiArtifactStorage):
                 ))
             except ValueError as exc:  # pydantic's ValidationError is one
                 log.warning("prosopia.paper_skipped", paper_id=e.get("paper_id"), error=str(exc)[:200])
+        if entries_seen := [e for e in self._paper_entries() if isinstance(e, dict)]:
+            if not out:
+                # One bad work is skipped; every one of them failing is the
+                # shape having changed, not a profile of malformed papers.
+                raise ProsopiaFormatChanged(
+                    f"none of its {len(entries_seen)} papers could be read")
         return out
 
     def _fetch_summary(self, paper_id: str) -> str:
@@ -222,6 +247,11 @@ class ApiProfile:
         return self._summaries
 
 
+def _bare_orcid(value: str) -> str:
+    v = re.sub(r"^(https?://)?(www\.)?orcid\.org/", "", (value or "").strip(), flags=re.IGNORECASE)
+    return v.strip("/").upper()
+
+
 class ProsopiaClient:
     """Builds one SDK profile per slug, with RADAR's errors on the way out."""
 
@@ -245,6 +275,21 @@ class ProsopiaClient:
             name = profile.name
         except KeyError as exc:
             raise ProfileNotFound(f"prosopia profile '{slug}' not found") from exc
+        except ProsopiaError:
+            raise
+        except PermissionError as exc:
+            # The SDK's answer to a 401: the profile is there, not public.
+            raise ProfileNotPublic(
+                f"the Prosopia profile '{slug}' is not public, so it cannot be read") from exc
+        except RuntimeError as exc:
+            # A 403 is one of the SDK's "client error"s, a RuntimeError like
+            # a transport failure; only its text tells them apart.
+            if str(exc).startswith("client error 403"):
+                raise ProfileNotPublic(
+                    f"the Prosopia profile '{slug}' is not public, so it cannot be read") from exc
+            raise ProsopiaError(
+                f"could not read profile '{slug}' from {self.base_url}: {exc}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             # Everything else is a 502's worth of upstream trouble. The
             # SDK raises RuntimeError for transport failures and for any
@@ -271,22 +316,34 @@ class ProsopiaClient:
         list is short, so this scans it. Raises ``ProfileNotFound`` when
         nobody with that ORCID has published a profile here.
         """
-        want = orcid.strip().upper()
-        url = f"{self.base_url}/api/v1/profiles"
-        try:
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            entries = resp.json().get("profiles") or []
-        except Exception as exc:  # noqa: BLE001
-            raise ProsopiaError(
-                f"could not list profiles at {self.base_url}: {exc}"
-            ) from exc
-        for entry in entries:
-            rid = str(entry.get("rid") or "").strip().upper()
-            slug = entry.get("slug")
-            if rid == want and slug:
-                log.info("prosopia.resolve_orcid", orcid=want, slug=slug)
-                return str(slug)
+        want = _bare_orcid(orcid)
+        url: str | None = f"{self.base_url}/api/v1/profiles"
+        params: dict[str, Any] | None = None
+        for _ in range(MAX_PAPER_PAGES):
+            try:
+                resp = requests.get(url, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                raise ProsopiaError(
+                    f"could not list profiles at {self.base_url}: {exc}"
+                ) from exc
+            if not isinstance(data, dict) or not isinstance(data.get("profiles", data.get("items")), list):
+                raise ProsopiaFormatChanged("the profile list has no 'profiles'")
+            for entry in data.get("profiles", data.get("items")) or []:
+                if not isinstance(entry, dict):
+                    continue
+                # The rid may be stored as an orcid.org URL.
+                rid = _bare_orcid(str(entry.get("rid") or ""))
+                slug = entry.get("slug")
+                if rid == want and slug:
+                    log.info("prosopia.resolve_orcid", orcid=want, slug=slug)
+                    return str(slug)
+            # Today the list is one page; should it ever be paged, follow it.
+            cursor = data.get("next_cursor")
+            if not data.get("has_more") or not cursor:
+                break
+            params = {"cursor": cursor}
         raise ProfileNotFound(f"no prosopia profile with ORCID '{want}'")
 
 

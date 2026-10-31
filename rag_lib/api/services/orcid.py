@@ -36,9 +36,9 @@ from ...db.repos import gather_runs as gather_runs_repo
 from ...db.repos import users as users_repo
 from ...db.repos.papers import plausible_year
 from ...openalex_client import OpenAlexClient
-from ...orcid_registry import ClaimedWorks, fetch_claimed
+from ...orcid_registry import ClaimedWorks, RegistryRecord, bare_ror, fetch_record
 from ...paper import normalize_title, surname, title_key
-from ...prosopia_seeds import normalize_doi
+from ...prosopia_seeds import Person, normalize_doi
 from .prosopia import ImportPlan, open_draft_owning, target_draft
 
 
@@ -63,12 +63,27 @@ __all__ = [
 MAX_WORKS = 1000
 
 ORCID_RE = re.compile(r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$", re.IGNORECASE)
-_ORCID_PREFIX = re.compile(r"^https?://(www\.)?orcid\.org/", re.IGNORECASE)
+# With or without the scheme: people paste ``orcid.org/0000-…`` from a CV.
+_ORCID_PREFIX = re.compile(r"^(https?://)?(www\.)?orcid\.org/", re.IGNORECASE)
 _OPENALEX_PREFIX = "https://openalex.org/"
 
 
 class WorksNotFound(LookupError):
     """None of the requested works belong to this ORCID."""
+
+
+class OrcidNotFound(LookupError):
+    """No ORCID record has this iD (the registry answered 404)."""
+
+
+def orcid_checksum_ok(orcid: str) -> bool:
+    """ISO 7064 mod 11-2 over the first 15 digits, as orcid.org checks it."""
+    digits = orcid.replace("-", "").upper()
+    total = 0
+    for ch in digits[:-1]:
+        total = (total + int(ch)) * 2
+    result = (12 - total % 11) % 11
+    return digits[-1] == ("X" if result == 10 else str(result))
 
 
 def refuse_if_importing(
@@ -124,15 +139,9 @@ class ImportAlreadyRunning(RuntimeError):
     one researcher; the useful answer to "import this ORCID" when it is
     already happening is the run that is happening.
 
-    What this does NOT catch: the run row is opened by the router after
-    ``prepare_import`` returns, and ``prepare_import`` spends seconds in
-    OpenAlex pagination first, so two requests arriving inside that window
-    both pass the check and both build a draft (``create_draft``
-    de-duplicates the name with a numeric suffix, so neither fails).
-    Closing that needs the uniqueness enforced where the run row is
-    written, not in a SELECT beforehand. This guard is for the common
-    case -- a user returning to a tab and clicking import again while the
-    previous one is still embedding -- not for a double submit.
+    Two identical requests at once (a double click) are caught too: the
+    router holds ``import_start_lock`` from this check to the insert of
+    the run row.
     """
 
     def __init__(self, slug: str, run_id: int):
@@ -142,10 +151,14 @@ class ImportAlreadyRunning(RuntimeError):
 
 
 def normalize_orcid(raw: str | None) -> str | None:
-    """Bare upper-case ORCID from an id or an ``orcid.org`` URL; else None."""
+    """Bare upper-case ORCID from an id or an ``orcid.org`` URL; else None.
+
+    None too when the check digit is wrong: a mistyped iD is a different
+    person's, or nobody's, and is caught here rather than as "no works".
+    """
     value = (raw or "").strip()
     value = _ORCID_PREFIX.sub("", value).strip("/").strip()
-    if not ORCID_RE.match(value):
+    if not ORCID_RE.match(value) or not orcid_checksum_ok(value):
         return None
     return value.upper()
 
@@ -218,11 +231,84 @@ def _summary(work: dict, orcid: str) -> dict[str, Any]:
         "authors": names[:3],
         "n_authors": len(names) or None,
         "author_position": mine.get("author_position"),
+        # This author's institutions on this work, for the institution
+        # check in list_works (FUNCTIONAL_SPEC O.2 A3).
+        "institutions": [
+            str(i.get("display_name")) for i in (mine.get("institutions") or [])
+            if isinstance(i, dict) and i.get("display_name")
+        ],
+        "_inst_keys": sorted({k for i in (mine.get("institutions") or []) if isinstance(i, dict)
+                              for k in _institution_keys(i.get("ror"), i.get("display_name"))}),
+        "other_institution": False,
         # Filled in by list_works, which has the registry and the whole
         # list to compare against; a single work cannot answer either.
         "claimed": None,
         "duplicate_of": None,
     }
+
+
+def _norm_institution(name: str | None) -> str:
+    """Comparable form of an institution name: case, accents, punctuation
+    and a leading "the" do not count."""
+    import unicodedata
+
+    v = unicodedata.normalize("NFKD", name or "")
+    v = "".join(c for c in v if not unicodedata.combining(c)).casefold()
+    v = re.sub(r"[^a-z0-9]+", " ", v).strip()
+    return re.sub(r"^the ", "", v)
+
+
+def _institution_keys(ror: str | None, name: str | None) -> set[str]:
+    """``ror:<id>`` and ``name:<normalized>`` -- either one matching is the
+    same institution (ORCID often names one without a ROR id)."""
+    out = set()
+    r = bare_ror(ror)
+    if r:
+        out.add(f"ror:{r}")
+    n = _norm_institution(name)
+    if n:
+        out.add(f"name:{n}")
+    return out
+
+
+# The person's institutions when their ORCID record lists none: the ones
+# most of their works carry. A few, because people move.
+TOP_WORK_INSTITUTIONS = 3
+
+
+def _mark_other_institutions(summaries: list[dict[str, Any]], record: RegistryRecord | None) -> str | None:
+    """Mark works whose author is at none of the person's institutions.
+
+    Only a hint (O.2 A3): which works are imported is the user's choice.
+    The person's institutions are the employments and educations on their
+    ORCID record; when it lists none, the few institutions most of these
+    works give for them. A work with no institution for the author is not
+    marked. Returns where the institutions came from: ``orcid``,
+    ``works`` or None (nothing to compare against).
+    """
+    mine: set[str] = set()
+    basis = None
+    if record is not None and record.affiliations:
+        for a in record.affiliations:
+            mine |= _institution_keys(a.ror, a.name)
+        basis = "orcid"
+    else:
+        counts: dict[str, int] = {}
+        for s in summaries:
+            for k in {k for k in s["_inst_keys"] if k.startswith("ror:")} or set(s["_inst_keys"]):
+                counts[k] = counts.get(k, 0) + 1
+        top = sorted(counts, key=lambda k: (-counts[k], k))[:TOP_WORK_INSTITUTIONS]
+        if top:
+            # The names of the top ror keys too, so a work that names the
+            # same institution without its ROR id still matches.
+            names = {k for s in summaries if set(s["_inst_keys"]) & set(top)
+                     for k in s["_inst_keys"] if k.startswith("name:")}
+            mine = set(top) | names
+            basis = "works"
+    for s in summaries:
+        keys = set(s.pop("_inst_keys"))
+        s["other_institution"] = bool(mine) and bool(keys) and not (keys & mine)
+    return basis
 
 
 def _dedupe_key(s: dict[str, Any]) -> str:
@@ -407,9 +493,14 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
     # Newest first from OpenAlex itself: unsorted, the cap kept an arbitrary
     # ``limit`` of a prolific author's works, recent ones possibly not among
     # them, and nothing said the list was cut (round 19).
-    works = client.paginate_filter(f"author.orcid:{orcid}", limit=limit,
+    # One more than the cap: exactly ``limit`` works is the whole list, not
+    # a cut one.
+    works = client.paginate_filter(f"author.orcid:{orcid}",
+                                   limit=limit + 1 if limit is not None else None,
                                    sort="publication_date:desc") or []
-    truncated = limit is not None and len(works) >= limit
+    truncated = limit is not None and len(works) > limit
+    if truncated:
+        works = works[:limit]
     summaries = [_summary(w, orcid) for w in works]
     # abstract presence only feeds _version_rank, so it is read off the
     # raw work here rather than carried in the response.
@@ -423,7 +514,13 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
     # Registry first: _version_rank reads `claimed`, so marking duplicates
     # before this would decide which copy to keep without the strongest
     # signal available.
-    registry: ClaimedWorks | None = fetch_claimed(orcid) if check_registry else None
+    record: RegistryRecord | None = fetch_record(orcid) if check_registry else None
+    if record is not None and record.found is False and not summaries:
+        # Nothing on OpenAlex and no such record: a mistyped iD, said as
+        # such rather than as "no works".
+        raise OrcidNotFound(f"there is no ORCID record for {orcid}")
+    registry: ClaimedWorks | None = record.claimed if record is not None else None
+    institution_basis = _mark_other_institutions(summaries, record)
     n_unclaimed = n_unknown = 0
     if registry is not None:
         for s in summaries:
@@ -442,9 +539,14 @@ def list_works(orcid: str, client: Any, *, limit: int = MAX_WORKS,
 
     log.info("orcid.list_works", orcid=orcid, n=len(summaries),
              n_duplicates=n_dup, n_unclaimed=n_unclaimed,
-             n_claim_unknown=n_unknown, registry_read=registry is not None)
+             n_claim_unknown=n_unknown, registry_read=registry is not None,
+             n_other_institution=sum(1 for s in summaries if s["other_institution"]),
+             institution_basis=institution_basis)
+    # ``registry_read``: whether the person's ORCID works list could be
+    # read; when not, the picker starts with nothing ticked (O.2 A1).
     return {"orcid": orcid, "name": _author_name(works, orcid), "works": summaries,
-            "truncated": truncated}
+            "truncated": truncated, "registry_read": registry is not None,
+            "institution_basis": institution_basis}
 
 
 def prepare_import(
@@ -497,6 +599,10 @@ def prepare_import(
     # so the annotations would be an uncached HTTP round trip to
     # pub.orcid.org inside this POST for an answer nobody reads. The user
     # already saw them on the listing this selection came from.
+    # OpenAlex paused: the import does not start and nothing is created
+    # (FUNCTIONAL_SPEC F2, O.2 F), a 503.
+    from ... import openalex_status
+    openalex_status.check()
     listing = list_works(oid, client, check_registry=False)
     records = records_for(listing, wanted)
     if not records:
@@ -536,6 +642,8 @@ def prepare_import(
         profile=None,
         new_draft=target is None,
         new_researcher=new_researcher,
+        listed_ids={w["openalex_id"] for w in listing["works"]},
+        person=Person.of(listing["name"], oid),
     )
 
 

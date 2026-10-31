@@ -3,7 +3,7 @@
 The suites here are offline by design: OpenAlex, Prosopia and the
 embedders are all stubbed or injected. ``rag_lib.orcid_registry`` is the
 one thing that reaches the network without being handed a client --
-``list_works`` calls ``fetch_claimed`` itself, because the annotation is
+``list_works`` calls ``fetch_record`` itself, because the annotation is
 advisory and the caller should not have to care. That is convenient in
 production and wrong in a test suite: the ORCID iDs in these fixtures are
 real, so the calls succeed, the assertions then depend on what those
@@ -64,7 +64,7 @@ def _openalex_not_paused():
 
 @pytest.fixture(autouse=True)
 def _no_orcid_registry(request, monkeypatch):
-    """Make ``fetch_claimed`` return None unless a test opts out.
+    """Make ``fetch_record`` answer "registry unreadable" unless a test opts out.
 
     ``None`` is the "registry unreadable" answer, which is a state the
     production code already has to handle, so stubbing it does not put the
@@ -73,11 +73,11 @@ def _no_orcid_registry(request, monkeypatch):
     if "live_orcid_registry" in request.fixturenames:
         return
     import rag_lib.orcid_registry as reg
-    monkeypatch.setattr(reg, "fetch_claimed", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "fetch_record", lambda *a, **k: reg.RegistryRecord())
     # services.orcid imported the name directly, so patching the module
     # attribute alone would leave that binding pointing at the real one.
     import rag_lib.api.services.orcid as orcid_service
-    monkeypatch.setattr(orcid_service, "fetch_claimed", lambda *a, **k: None)
+    monkeypatch.setattr(orcid_service, "fetch_record", lambda *a, **k: reg.RegistryRecord())
 
 
 @pytest.fixture

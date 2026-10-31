@@ -124,7 +124,14 @@ def _request(app, method, path, **kwargs) -> httpx.Response:
 def test_normalize_orcid_accepts_ids_and_urls():
     assert normalize_orcid("0000-0002-1103-3882") == ORCID
     assert normalize_orcid("https://orcid.org/0000-0002-1103-3882/") == ORCID
-    assert normalize_orcid("0000-0002-1103-388x") == "0000-0002-1103-388X"
+    # A lowercase check digit X (0000-0002-1694-233X is ORCID's own example).
+    assert normalize_orcid("0000-0002-1694-233x") == "0000-0002-1694-233X"
+    # Without the scheme, as pasted from a CV (O.2: both paths accept it).
+    assert normalize_orcid("orcid.org/0000-0002-1103-3882") == ORCID
+    assert normalize_orcid("www.orcid.org/0000-0002-1103-3882") == ORCID
+    # A mistyped digit fails the check digit: someone else's iD, or nobody's.
+    assert normalize_orcid("0000-0002-1103-3883") is None
+    assert normalize_orcid("0000-0002-1103-388X") is None
     assert normalize_orcid("sheffield-nathan") is None
     assert normalize_orcid("") is None
 
@@ -298,7 +305,8 @@ def test_list_works_leaves_the_order_alone_when_nothing_is_duplicated():
 
 def test_list_works_for_an_orcid_with_nothing_has_no_name():
     listing = list_works(OTHER, StubOrcidOpenAlex(WORKS))
-    assert listing == {"orcid": OTHER, "name": None, "works": [], "truncated": False}
+    assert listing == {"orcid": OTHER, "name": None, "works": [], "truncated": False,
+                       "registry_read": False, "institution_basis": None}
 
 
 # --- routes ----------------------------------------------------------------

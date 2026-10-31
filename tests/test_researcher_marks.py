@@ -52,7 +52,7 @@ def test_marking_moves_the_person_to_the_top_of_their_group(env):
     assert _order(app) == [(nathan, "self", 0), (justin, None, 1)]
 
     # Followed goes behind the user themself, ahead of the unmarked.
-    c = _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "0000-0001-5643-4068"})
+    c = _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "0000-0001-5643-4068", "researcher_id": nathan})
     assert c.status_code == 200, c.text
     assert c.json()["researcher_id"] == nathan          # the same person, refreshed
     _request(app, "PATCH", f"/api/researchers/{justin}", json={"mark": "followed"})

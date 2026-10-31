@@ -77,52 +77,42 @@ class ClaimedWorks:
         return None
 
 
-def fetch_claimed(
-    orcid: str, *, timeout: tuple[float, float] = (3.0, 5.0)
-) -> ClaimedWorks | None:
-    """Works the person claims on their ORCID record, or ``None``.
+@dataclass
+class Affiliation:
+    """One employment or education entry on the person's ORCID record."""
 
-    ``None`` rather than an empty ``ClaimedWorks`` whenever the answer
-    would not be evidence, so a caller can tell "the registry does not
-    list this paper" from "we never got to ask". Three cases give
-    ``None``: the request failed, the record does not exist (404), and --
-    the one that matters most in practice -- the record is readable but
-    lists nothing, because a works list that is uncurated or visible only
-    to trusted parties returns 200 with an empty group set. Reporting that
-    as an empty claim would mark every one of the author's works
-    unclaimed, which is the opposite of useful.
+    name: str
+    ror: str | None = None    # bare ROR id (``0153tk833``) when the record gives one
 
-    Never raises. The registry being down is not a reason to fail an
-    import that OpenAlex can serve on its own.
 
-    The timeout is a ``(connect, read)`` pair and deliberately short: this
-    runs inside a request handler that is already paying for OpenAlex
-    pagination, and the answer is advisory. A scalar would apply to each
-    phase separately, so a black-holed host could cost twice the number
-    written.
+@dataclass
+class RegistryRecord:
+    """What the public ORCID record says, read once (``/activities``).
+
+    ``found`` is False only on a 404 (no such ORCID iD), None when the
+    registry could not be asked. ``claimed`` follows ``fetch_claimed``:
+    None whenever the works list is not evidence (unreadable, private,
+    empty). ``affiliations`` are the employments and educations the
+    person lists, every institution they were at.
     """
-    import requests
 
-    try:
-        r = requests.get(
-            f"{ORCID_PUBLIC_API}/{orcid}/works",
-            headers={"Accept": "application/json",
-                     "User-Agent": "radar-backend orcid-import"},
-            timeout=timeout,
-        )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:  # noqa: BLE001 — registry down: proceed without
-        log.warning("orcid_registry.unavailable", orcid=orcid, error=str(exc))
-        return None
+    found: bool | None = None
+    claimed: ClaimedWorks | None = None
+    affiliations: list[Affiliation] = field(default_factory=list)
 
-    if not isinstance(data, dict):
-        log.warning("orcid_registry.unexpected_body", orcid=orcid, kind=type(data).__name__)
-        return None
+
+_ROR = re.compile(r"^(?:https?://)?ror\.org/", re.IGNORECASE)
+
+
+def bare_ror(value: str | None) -> str | None:
+    """``https://ror.org/0153tk833`` → ``0153tk833``; None for anything empty."""
+    v = _ROR.sub("", (value or "").strip()).strip("/").lower()
+    return v or None
+
+
+def _claimed_from(works: dict | None) -> ClaimedWorks | None:
     out = ClaimedWorks()
-    for group in data.get("group") or []:
+    for group in (works or {}).get("group") or []:
         out.n_works += 1
         for e in (group.get("external-ids") or {}).get("external-id") or []:
             if (e.get("external-id-type") or "").lower() == "doi" \
@@ -133,9 +123,84 @@ def fetch_claimed(
             k = title_key(t)
             if k:
                 out.title_keys.add(k)
-    if out.n_works == 0:
-        log.info("orcid_registry.empty", orcid=orcid)
-        return None
-    log.info("orcid_registry.read", orcid=orcid, n_groups=out.n_works,
-             n_dois=len(out.dois), n_titles=len(out.title_keys))
+    return out if out.n_works else None
+
+
+def _affiliations_from(data: dict) -> list[Affiliation]:
+    out: list[Affiliation] = []
+    for section in ("employments", "educations"):
+        for group in (data.get(section) or {}).get("affiliation-group") or []:
+            for summary in group.get("summaries") or []:
+                for entry in (summary or {}).values():
+                    org = (entry or {}).get("organization") or {}
+                    name = str(org.get("name") or "").strip()
+                    if not name:
+                        continue
+                    dis = org.get("disambiguated-organization") or {}
+                    ror = bare_ror(dis.get("disambiguated-organization-identifier")) \
+                        if (dis.get("disambiguation-source") or "").upper() == "ROR" else None
+                    out.append(Affiliation(name=name, ror=ror))
     return out
+
+
+def fetch_record(
+    orcid: str, *, timeout: tuple[float, float] = (3.0, 5.0)
+) -> RegistryRecord:
+    """The person's public ORCID record: claimed works and affiliations.
+
+    One request (``/activities`` carries works, employments and
+    educations). Never raises: the registry being down is not a reason to
+    fail a listing OpenAlex can serve on its own. A 404 is the one answer
+    that is evidence of something -- the iD does not exist.
+
+    The timeout is a ``(connect, read)`` pair and deliberately short: this
+    runs inside a request handler that is already paying for OpenAlex
+    pagination, and the answer is advisory.
+    """
+    import requests
+
+    try:
+        r = requests.get(
+            f"{ORCID_PUBLIC_API}/{orcid}/activities",
+            headers={"Accept": "application/json",
+                     "User-Agent": "radar-backend orcid-import"},
+            timeout=timeout,
+        )
+        if r.status_code == 404:
+            log.info("orcid_registry.not_found", orcid=orcid)
+            return RegistryRecord(found=False)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001 — registry down: proceed without
+        log.warning("orcid_registry.unavailable", orcid=orcid, error=str(exc))
+        return RegistryRecord()
+
+    if not isinstance(data, dict):
+        log.warning("orcid_registry.unexpected_body", orcid=orcid, kind=type(data).__name__)
+        return RegistryRecord()
+    claimed = _claimed_from(data.get("works"))
+    affiliations = _affiliations_from(data)
+    if claimed is None:
+        # A works list that is uncurated or visible only to trusted parties
+        # comes back empty; reporting that as an empty claim would mark
+        # every one of the author's works unclaimed.
+        log.info("orcid_registry.empty", orcid=orcid)
+    else:
+        log.info("orcid_registry.read", orcid=orcid, n_groups=claimed.n_works,
+                 n_dois=len(claimed.dois), n_titles=len(claimed.title_keys),
+                 n_affiliations=len(affiliations))
+    return RegistryRecord(found=True, claimed=claimed, affiliations=affiliations)
+
+
+def fetch_claimed(
+    orcid: str, *, timeout: tuple[float, float] = (3.0, 5.0)
+) -> ClaimedWorks | None:
+    """Works the person claims on their ORCID record, or ``None``.
+
+    ``None`` rather than an empty ``ClaimedWorks`` whenever the answer
+    would not be evidence, so a caller can tell "the registry does not
+    list this paper" from "we never got to ask": the request failed, the
+    record does not exist (404), or the record is readable but lists
+    nothing (uncurated, or visible only to trusted parties). Never raises.
+    """
+    return fetch_record(orcid, timeout=timeout).claimed

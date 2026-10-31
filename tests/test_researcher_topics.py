@@ -906,7 +906,7 @@ def test_a_topic_the_profile_stops_rejecting_goes_back_to_what_it_was(env):
     assert applied["T10001"]["on"] is False and applied["T10001"]["profile"] == "not_interest"
 
     profile.metadata = {"research_interests": [_topic("T10222", "Genomics and Chromatin Dynamics", weight=0.5, method="declared")]}
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "researcher_id": rid}).status_code == 200
     topics = _topics(app, slug)
     assert topics["T10001"]["on"] is False and topics["T10001"]["profile"] == "not_interest"
     assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False}).status_code == 200
@@ -1221,7 +1221,8 @@ def test_a_choice_on_a_saved_interest_leaves_marks_a_re_import_changed(env):
     the interest applied still wants T10515."""
     profile = _profile_with_document()
     app = _app(StubProsopia(profile), _stub_openalex())
-    slug = _draft_from(app, _import_prosopia(app))
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
     _commit(app, slug, [t["id"] for t in applied if t["on"]])
     t10515 = "https://openalex.org/T10515"
@@ -1232,7 +1233,7 @@ def test_a_choice_on_a_saved_interest_leaves_marks_a_re_import_changed(env):
         if entry["concept"].get("code") == "T10515":
             entry["weight"] = -0.2                           # now rejected
     profile.metadata = doc
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "researcher_id": rid}).status_code == 200
     with _edit(app, slug) as copy:
         after = _choose(app, copy, "T10001", "filter")
         assert after["T10001"]["on"] is False
@@ -1256,13 +1257,14 @@ def test_a_saved_interest_shows_the_default_a_save_records(env):
     copy (remove, then apply), which reads the researcher as now."""
     profile = _profile_with_document()
     app = _app(StubProsopia(profile), _stub_openalex())
-    slug = _draft_from(app, _import_prosopia(app))
+    rid = _import_prosopia(app)
+    slug = _draft_from(app, rid)
     applied = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).json()
     on = [t["id"] for t in applied if t["on"]]
     _commit(app, slug, on)
     profile.metadata = {**DOCUMENT, "research_interests": [*DOCUMENT["research_interests"],
                                                            _topic("T12345", "Something New", weight=-0.4, method="declared")]}
-    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan"}).status_code == 200
+    assert _request(app, "POST", "/api/researchers/import", json={"source": "prosopia", "ref": "sheffield-nathan", "researcher_id": rid}).status_code == 200
     _add_seed_topics(env, slug, [("T12345", "Something New")])
     assert "https://openalex.org/T12345" not in _rows(app, slug)
     with _edit(app, slug) as copy:
