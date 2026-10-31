@@ -65,6 +65,14 @@ http://:8080 {
 		}
 	}
 
+	# Sign-in buttons: /auth/login/<provider>, its
+	# callback and logout run in the backend and set its session cookie.
+	handle /auth/* {
+		reverse_proxy 127.0.0.1:8000 {
+			header_down Cache-Control "no-store"
+		}
+	}
+
 	handle {
 		root * /p/realai/lei/radar_deployment/radar_frontend/dist
 		# The SPA shell must be revalidated on every load: asset names are

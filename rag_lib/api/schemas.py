@@ -1234,6 +1234,31 @@ class User(_Model):
     created_at: str | None = None
 
 
+class MyProsopiaProfile(_Model):
+    """The signed-in person's self profile on Prosopia (public record)."""
+
+    slug: str
+    name: str
+    affiliation: str | None = None
+    paper_count: int | None = None
+    url: str
+
+
+class MyProsopia(_Model):
+    """``GET /api/users/me/prosopia``: the signed-in person's own profile.
+
+    Every field is optional and all-null is the common answer: header
+    mode, no self profile on the Prosopia account, no public copy of it,
+    or Prosopia unreachable. The UI shows the one-click card only when
+    ``profile`` is set.
+    """
+
+    profile: MyProsopiaProfile | None = None
+    # This user's stored researcher for that profile, once imported.
+    researcher_id: int | None = None
+    imported_at: str | None = None
+
+
 class UserUpdateRequest(_Model):
     """Body of ``PATCH /api/users/me``."""
 

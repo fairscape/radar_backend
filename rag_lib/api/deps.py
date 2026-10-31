@@ -11,9 +11,14 @@ Three dependencies the rest of the service hangs off:
     ``RADAR_REQUIRE_AUTH`` is False; 401s when the header is absent and
     auth is required.
 
-Identity is email-only: there are no tokens or passwords. The header is
-trusted — the surface is the same as a public API behind a reverse
-proxy, which is the demo's threat model. CSRF is N/A (no cookies).
+Identity is email-only. Two models, picked by whether any sign-in
+provider is on (``oidc.providers``):
+
+  - none: the header is trusted — the surface is the same as a public
+    API behind a reverse proxy (Cloudflare Access fills it in production).
+  - one or more: the ``bioxplorer_session`` cookie that the ``/auth`` routes
+    issue after a Prosopia or Google sign-in names the user, and there is
+    no demo-user fallback; the header is ignored.
 """
 
 from __future__ import annotations
@@ -22,11 +27,12 @@ import re
 import sqlite3
 from typing import Annotated, Iterator
 
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 
 from rag_lib.db import connect
 from rag_lib.db.repos import users
 
+from . import oidc
 from .settings import Settings, get_settings
 
 
@@ -63,6 +69,7 @@ def get_current_user(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     x_user_email: Annotated[str | None, Header(alias="X-User-Email")] = None,
+    bioxplorer_session: Annotated[str | None, Cookie()] = None,
 ) -> sqlite3.Row:
     """Resolve the acting user from ``X-User-Email``.
 
@@ -81,7 +88,19 @@ def get_current_user(
     backend can claim any email". Phase 13's docker-compose puts the
     backend behind localhost only; production deployments must add a
     real auth proxy on top.
+
+    With a sign-in provider on, none of the above applies: only a valid
+    session cookie names the user, and anything else is 401.
     """
+    if oidc.providers(settings):
+        session = oidc.read_session(settings, bioxplorer_session)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="not signed in",
+            )
+        return users.upsert(db, session["email"])
+
     if x_user_email:
         email = x_user_email.strip().lower()
         if not _EMAIL_RE.match(email):

@@ -48,9 +48,9 @@ ENVIRON_ONLY = {"RADAR_SQLITE_JOURNAL_MODE"}
 # start_backend.sh's own switch, not a backend setting.
 SCRIPT_ONLY = {"RADAR_ALLOW_EMPTY_DB"}
 
-ANY_KEY = re.compile(r"\bRADAR_[A-Z0-9_]+\b")
+ANY_KEY = re.compile(r"\b(?:RADAR|BIOXPLORER)_[A-Z0-9_]+\b")
 # "# RADAR_X=value" -- a commented-out line documents the default.
-COMMENTED = re.compile(r"^#\s*(RADAR_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
+COMMENTED = re.compile(r"^#\s*((?:RADAR|BIOXPLORER)_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
 
 
 def _text(name: str) -> str:
