@@ -120,7 +120,7 @@ def test_prosopia_import_stores_the_person_and_their_papers(env):
     by_id = {p["id"]: p for p in papers}
     assert by_id["https://openalex.org/W4415881950"]["resolved_by"] == "work_id"
     assert by_id["https://openalex.org/W2184563578"]["resolved_by"] == "pmcid"
-    ghost = by_id["prosopia:sheffield-nathan:ghost2020nowhere"]
+    ghost = by_id["prosopia:1:sheffield-nathan:ghost2020nowhere"]
     assert ghost["resolved_by"] == "none"
     assert ghost["summary"] == "Only the Prosopia summary describes this work."
 
@@ -338,13 +338,14 @@ def test_deleting_a_researcher_keeps_papers_and_interests(env):
 
 
 # ---------------------------------------------------------------------------
-# The wizard's own imports leave a researcher behind
+# The wizard's own imports leave a researcher behind, when asked to (M.2)
 # ---------------------------------------------------------------------------
 
 
 def test_wizard_prosopia_import_records_the_researcher(env):
+    # Asked to (FUNCTIONAL_SPEC M.2); unticked, none is (test_m2_m3_import_topics).
     app = _app(StubProsopia(_stub_profile()), _stub_openalex())
-    resp = _request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan"})
+    resp = _request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "save_profile": True})
     assert resp.status_code == 200, resp.text
     draft_slug = resp.json()["draft_slug"]
 
@@ -366,7 +367,7 @@ def test_wizard_orcid_import_records_the_researcher(env):
     app = _app(openalex=StubOrcidOpenAlex(WORKS))
     resp = _request(
         app, "POST", "/api/import/orcid",
-        json={"orcid": ORCID, "openalex_ids": ["W1", "W2"]},
+        json={"orcid": ORCID, "openalex_ids": ["W1", "W2"], "save_profile": True},
     )
     assert resp.status_code == 200, resp.text
     listing = _request(app, "GET", "/api/researchers").json()
@@ -390,7 +391,7 @@ def test_stored_papers_can_be_attached_to_a_plain_draft(env):
         app, "POST", f"/api/profiles/draft/{slug}/seeds",
         json={"openalex_ids": [
             "https://openalex.org/W4415881950", "https://openalex.org/W4415881950",
-            "prosopia:sheffield-nathan:ghost2020nowhere", "https://openalex.org/W-not-mine",
+            "prosopia:1:sheffield-nathan:ghost2020nowhere", "https://openalex.org/W-not-mine",
         ]},
     )
     assert resp.status_code == 200, resp.text

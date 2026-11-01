@@ -152,6 +152,7 @@ def import_prosopia(
                 prosopia_client=prosopia_client,
                 paper_ids=body.paper_ids,
                 into=body.into,
+                save_profile=body.save_profile,
             )
         except prosopia_service.DraftNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -212,6 +213,9 @@ def launch_import(
             researcher_id=plan.researcher_id,
             user_id=user_id,
             tier_used=tier,
+            import_orcid=plan.import_orcid,
+            import_key=plan.import_key,
+            opened_draft=plan.new_draft,
         )
     except sqlite3.IntegrityError as exc:
         # The draft or the researcher was deleted in another tab while the
@@ -374,6 +378,7 @@ def import_orcid(
                 embedding_model=body.embedding_model,
                 openalex_client=openalex_client,
                 into=body.into,
+                save_profile=body.save_profile,
             )
         except prosopia_service.DraftNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

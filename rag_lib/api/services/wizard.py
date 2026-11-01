@@ -49,7 +49,7 @@ from ...db.repos import (
     users as users_repo,
     schedules as schedules_repo,
 )
-from ... import interest_terms, llm_topics, researcher_topics
+from ... import interest_terms, llm_topics, prosopia_interests, researcher_topics
 from ...gatherers.openalex import OpenAlexGatherer
 from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
@@ -465,6 +465,9 @@ def _aggregate_topics(
     ``profile_topics`` says whether the researcher's profile topics are folded
     in: None reads the stored flag, True/False overrides it (the apply and
     remove paths, which then write what this returns in one go).
+
+    The interests of the Prosopia profiles the papers came from
+    (FUNCTIONAL_SPEC M.3) are applied last: marked, and added off.
     """
     prior_on = _prior_topic_states(conn, profile_id)
     stored = _stored_topic_filters(conn, profile_id)
@@ -540,7 +543,18 @@ def _aggregate_topics(
                 t.setdefault(researcher_topics.BEFORE, prior_on.get(t["id"], _new_topic_on(t, new_on)))
                 if t["id"] not in prior_on or stored_marks.get(researcher_topics.code(t["id"])) != t["profile"]:
                     t["on"] = t["profile"] == researcher_topics.INTEREST
-    return topic_filters
+    return prosopia_interests.apply(topic_filters, prior_on, _prosopia_interests(conn, profile_id))
+
+
+def _prosopia_interests(conn: sqlite3.Connection, profile_id: int) -> list[dict]:
+    """The interests of the Prosopia profiles kept on ``profile_id``."""
+    from ..settings import get_settings
+
+    try:
+        row = conn.execute("SELECT prosopia_docs_json FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    except sqlite3.OperationalError:  # a database from before migration 0036
+        return []
+    return prosopia_interests.interests(row[0] if row else None, settings=get_settings())
 
 
 # A saved topic no seed brings any more (FUNCTIONAL_SPEC T.2-2).
@@ -1300,9 +1314,11 @@ def save_topics(
         return _prune_topic_filters(full, selected)
 
     pruned = _write_rebuilt_topics(conn, profile_id, build)
-    # Topic names are the reranker's queries in topic mode.
-    from rag_lib.scheduler.jobs import request_rerank_refresh
-    request_rerank_refresh(profile_id)
+    # Topic names are the reranker's queries in topic mode. A draft (its
+    # topic step stores the ticks as they change) has no pool to rerank.
+    if not row["is_draft"]:
+        from rag_lib.scheduler.jobs import request_rerank_refresh
+        request_rerank_refresh(profile_id)
     return pruned
 
 

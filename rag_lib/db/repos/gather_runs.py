@@ -23,16 +23,23 @@ def start(
     filter_string: str | None = None,
     tier_used: str | None = None,
     researcher_id: int | None = None,
+    import_orcid: str | None = None,
+    import_key: str | None = None,
+    opened_draft: bool = False,
 ) -> int:
     """Open a run row. A researcher import has no profile; a scan has no
-    researcher. At least one of the two should be set."""
+    researcher. At least one of the two should be set. An import says whom
+    it imports (``import_orcid``, ``import_key``) and whether it opened its
+    draft, for :func:`find_inflight_import`."""
+    cols = ["profile_id", "researcher_id", "user_id", "since_date", "filter_string", "tier_used"]
+    vals: list = [profile_id, researcher_id, user_id, since_date, filter_string, tier_used]
+    if import_orcid is not None or import_key is not None or opened_draft:
+        # Only an import names these (0037): a scan's row is written as before.
+        cols += ["import_orcid", "import_key", "opened_draft"]
+        vals += [import_orcid, import_key, int(bool(opened_draft))]
     cur = conn.execute(
-        """
-        INSERT INTO gather_runs
-          (profile_id, researcher_id, user_id, since_date, filter_string, tier_used)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (profile_id, researcher_id, user_id, since_date, filter_string, tier_used),
+        f"INSERT INTO gather_runs ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        vals,
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -234,7 +241,7 @@ def is_inflight(conn: sqlite3.Connection, run_id: int) -> bool:
 
 def find_inflight_import(
     conn: sqlite3.Connection, user_id: int, *, orcid: str | None = None,
-    researcher_id: int | None = None,
+    researcher_id: int | None = None, key: str | None = None,
 ) -> sqlite3.Row | None:
     """An import of this person already in flight for this user, or None.
 
@@ -257,25 +264,34 @@ def find_inflight_import(
 
     ``researcher_id`` finds the same person by their row, for a Prosopia
     profile that has no ORCID.
+
+    A wizard import that saved no researcher profile (FUNCTIONAL_SPEC M.2)
+    is found by what its run records: ``import_orcid``, and ``key`` against
+    ``import_key`` (``prosopia:<slug>`` / ``orcid:<id>``). ``opened_draft``
+    says the run opened its draft for this person.
     """
-    if not orcid and researcher_id is None:
+    if not orcid and researcher_id is None and not key:
         return None
     placeholders = ",".join("?" * len(IMPORT_TIERS))
     return conn.execute(
         f"""
         SELECT p.slug AS slug, g.id AS run_id, g.tier_used AS tier_used,
-               g.researcher_id AS researcher_id, p.researcher_id AS draft_researcher_id
+               g.researcher_id AS researcher_id, p.researcher_id AS draft_researcher_id,
+               g.opened_draft AS opened_draft
           FROM gather_runs g
-          JOIN researchers r ON r.id = g.researcher_id
+          LEFT JOIN researchers r ON r.id = g.researcher_id
           LEFT JOIN profiles p ON p.id = g.profile_id
-         WHERE ((? IS NOT NULL AND r.orcid = ?) OR (? IS NOT NULL AND r.id = ?))
+         WHERE ((? IS NOT NULL AND (r.orcid = ? OR g.import_orcid = ?))
+                OR (? IS NOT NULL AND r.id = ?)
+                OR (? IS NOT NULL AND g.import_key = ?))
            AND (p.user_id = ? OR (p.id IS NULL AND g.user_id = ?))
            AND g.tier_used IN ({placeholders})
            AND {_INFLIGHT_PREDICATE}
          ORDER BY g.id DESC
          LIMIT 1
         """,
-        (orcid, orcid, researcher_id, researcher_id, user_id, user_id, *IMPORT_TIERS, _stale_cutoff()),
+        (orcid, orcid, orcid, researcher_id, researcher_id, key, key, user_id, user_id,
+         *IMPORT_TIERS, _stale_cutoff()),
     ).fetchone()
 
 

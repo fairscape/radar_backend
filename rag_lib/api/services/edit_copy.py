@@ -52,10 +52,10 @@ _COPIED = (
     "embedding_model", "centroid", "threshold", "topic_filters_json", "selector_config_json",
     "gatherer_config_json", "coherence_median", "coherence_iqr", "coherence_bimodal", "n_seed",
     "reranker_config_json", "seed_sim_min", "seed_sim_median", "seed_sim_max", "researcher_id",
-    "interest_terms_json", "year_from", "year_to", "researcher_doc_json",
+    "interest_terms_json", "year_from", "year_to", "researcher_doc_json", "prosopia_docs_json",
 )
 _SAVED = ("threshold", "topic_filters_json", "interest_terms_json", "researcher_id",
-          "researcher_doc_json", "year_from", "year_to")
+          "researcher_doc_json", "prosopia_docs_json", "year_from", "year_to")
 
 
 # A copy not heard from for this long is left behind (E.7 R5, user's Q1).

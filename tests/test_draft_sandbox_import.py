@@ -53,16 +53,18 @@ class Unanswering(StubOrcidOpenAlex):
         raise OpenAlexUnavailable("quota", detail="429")
 
 
-def test_s5_discarding_a_wizard_import_removes_the_new_researcher_and_its_papers(env):
+def test_s5_discarding_a_wizard_import_removes_its_papers(env):
+    # No researcher profile unless asked (FUNCTIONAL_SPEC M.2): the papers
+    # are only the draft's.
     before = _snapshot(env)
     app = _app(StubOrcidOpenAlex(WORKS))
     r = _wizard_import(app, ["W1", "W3"], name="S5")
     assert r.status_code == 200, r.text
     slug, run_id = r.json()["draft_slug"], r.json()["run_id"]
-    assert _q(env, "SELECT COUNT(*) FROM researchers") == [(1,)]
+    assert _q(env, "SELECT COUNT(*) FROM researchers") == [(0,)]
     assert _q(env, "SELECT COUNT(*) FROM paper_embeddings") == [(2,)]
-    assert len(_q(env, "SELECT * FROM draft_owned")) == 3        # the researcher, W1, W3
-    assert _request(app, "GET", "/api/researchers").json() != []
+    assert len(_q(env, "SELECT * FROM draft_owned")) == 2        # W1, W3
+    assert _request(app, "GET", "/api/researchers").json() == []
 
     r = _request(app, "DELETE", f"/api/profiles/draft/{slug}")
     assert r.status_code == 200, r.text
@@ -121,15 +123,31 @@ def test_the_same_person_under_prosopia_is_a_stored_researcher_too(env):
     assert r.status_code == 409, r.text
 
 
-def test_more_papers_of_the_drafts_own_researcher_can_be_added(env):
+def test_more_papers_of_the_drafts_own_person_can_be_added(env):
     app = _app(StubOrcidOpenAlex(WORKS))
     slug = _wizard_import(app, ["W1"], name="Mine").json()["draft_slug"]
     r = _wizard_import(app, ["W3"], into=slug)
     assert r.status_code == 200, r.text
-    assert len(_q(env, "SELECT * FROM researcher_papers")) == 2
+    assert _q(env, "SELECT COUNT(*) FROM profile_seeds") == [(2,)]
     _request(app, "DELETE", f"/api/profiles/draft/{slug}")
     assert _q(env, "SELECT COUNT(*) FROM researchers") == [(0,)]
     assert _q(env, "SELECT COUNT(*) FROM papers") == [(0,)]
+
+
+def test_more_papers_of_the_researcher_a_draft_saved_can_be_added(env):
+    """Saved when the draft imported them (M.2): the person is the draft's
+    own, not "already one of your profiles"; the saved profile and its
+    papers stay when the draft goes."""
+    app = _app(StubOrcidOpenAlex(WORKS))
+    slug = _wizard_import(app, ["W1"], name="Mine", save_profile=True).json()["draft_slug"]
+    for ticked in (False, True):
+        r = _wizard_import(app, ["W3"], into=slug, save_profile=ticked)
+        assert r.status_code == 200, r.text
+    assert _q(env, "SELECT COUNT(*) FROM profile_seeds") == [(2,)]
+    assert len(_q(env, "SELECT * FROM researcher_papers")) == 2
+    _request(app, "DELETE", f"/api/profiles/draft/{slug}")
+    assert _q(env, "SELECT COUNT(*) FROM researchers") == [(1,)]
+    assert _q(env, "SELECT COUNT(*) FROM papers") == [(2,)]
 
 
 def test_s8_a_wizard_import_openalex_cannot_answer_leaves_nothing(env):
@@ -190,7 +208,7 @@ def test_a_researcher_a_draft_imported_is_the_users_once_checked_from_the_profil
     profile to open (O.2 D); checking that profile for new papers makes it
     the user's own, so discarding the draft keeps it."""
     app = _app(StubOrcidOpenAlex(WORKS))
-    slug = _wizard_import(app, ["W1"], name="Mine").json()["draft_slug"]
+    slug = _wizard_import(app, ["W1"], name="Mine", save_profile=True).json()["draft_slug"]
     r = _request(app, "POST", "/api/researchers/import", json={"source": "orcid", "ref": ORCID})
     assert r.status_code == 409, r.text
     rid = r.json()["researcher"]["id"]

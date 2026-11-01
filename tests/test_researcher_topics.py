@@ -37,6 +37,14 @@ def _topic(code: str, name: str, *, weight=None, method="inferred"):
     return entry
 
 
+def _not_prosopia(topics: dict) -> set[str]:
+    """The ids of ``topics`` ({id: topic}) bar those only a Prosopia interest
+    brought: the profile's stated interests join every interest from it,
+    off (FUNCTIONAL_SPEC M.3), whether its topics are applied or not."""
+    assert all(t["on"] is False for t in topics.values() if t.get("source") == "prosopia")
+    return {i for i, t in topics.items() if t.get("source") != "prosopia"}
+
+
 def _text(label: str, *, weight: float, method="declared"):
     return {"@type": "ResearchInterest", "method": method, "weight": weight,
             "concept": {"label": label, "unmapped": True}}
@@ -313,8 +321,8 @@ def test_an_interest_takes_the_profiles_topics_and_keeps_them_across_aggregation
     resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False})
     assert resp.status_code == 200, resp.text
     dropped = {t["id"]: t for t in resp.json()}
-    assert set(dropped) == {"T10001"} and dropped["T10001"]["profile"] is None and dropped["T10001"]["on"] is True
-    assert set(_topics(app, slug)) == {"T10001"}
+    assert _not_prosopia(dropped) == {"T10001"} and dropped["T10001"]["profile"] is None and dropped["T10001"]["on"] is True
+    assert _not_prosopia(_topics(app, slug)) == {"T10001"}
     assert _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()["applied"] is False
 
 
@@ -394,7 +402,7 @@ def test_a_forgotten_researcher_takes_their_topics_with_them(env):
     assert _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": True}).status_code == 200
     assert _request(app, "DELETE", f"/api/researchers/{rid}").status_code == 200
     topics = _topics(app, slug)
-    assert set(topics) == {"T10001"} and topics["T10001"]["profile"] is None
+    assert _not_prosopia(topics) == {"T10001"} and topics["T10001"]["profile"] is None
     view = _request(app, "GET", f"/api/profiles/{slug}/researcher-topics").json()
     assert view["researcher_id"] is None and view["applied"] is False
 
@@ -724,7 +732,7 @@ def test_a_researcher_removed_underneath_restores_the_seeds_topics_on_the_next_r
     finally:
         conn.close()
     topics = _topics(app, slug)
-    assert set(topics) == {"T10001"} and topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
+    assert _not_prosopia(topics) == {"T10001"} and topics["T10001"]["on"] is True and topics["T10001"]["profile"] is None
     assert _stored(env, slug).get("researcher_topics") is not True
 
 
@@ -813,7 +821,7 @@ def test_removing_what_was_never_applied_writes_nothing(env):
     finally:
         conn.close()
     resp = _request(app, "PUT", f"/api/profiles/{slug}/researcher-topics", json={"enabled": False})
-    assert resp.status_code == 200 and [t["id"] for t in resp.json()] == ["T10001"]
+    assert resp.status_code == 200 and _not_prosopia({t["id"]: t for t in resp.json()}) == {"T10001"}
     assert _stored(env, slug) == before
 
 

@@ -437,7 +437,9 @@ def upsert(
     return int(existing["id"])
 
 
-SEED_SOURCES = ("upload", "researcher", "vault", "feed")
+# "orcid" / "prosopia": imported in the wizard without saving a researcher
+# profile (FUNCTIONAL_SPEC M.2).
+SEED_SOURCES = ("upload", "researcher", "vault", "feed", "orcid", "prosopia")
 
 
 def attach_seed(

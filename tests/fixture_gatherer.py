@@ -33,7 +33,10 @@ class FixtureGatherer:
         limit: int | None = None,
     ) -> list[Paper]:
         t0 = time.time()
-        topic_ids = [t.get("id") for t in profile.topic_filters.get("topics", [])]
+        # The topics switched on, as the OpenAlex gatherer searches them
+        # (openalex_tiers.is_enabled): one switched off changes nothing.
+        from rag_lib.openalex_tiers import is_enabled
+        topic_ids = [t.get("id") for t in profile.topic_filters.get("topics", []) if is_enabled(t)]
         n = self.n_candidates if limit is None else min(self.n_candidates, limit)
         out = [
             Paper(

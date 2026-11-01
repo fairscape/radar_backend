@@ -1031,7 +1031,9 @@ def test_j5_delete_draft_journeys(app, env):
 
 def test_j1b_wizard_imports_from_prosopia_then_adds_an_orcid(app, env):
     # "A Prosopia profile" as the seed source: the draft exists at once.
-    start = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "name": "Nathan's work"}))
+    start = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "name": "Nathan's work",
+                                                                       # Saved as a researcher profile (M.2).
+                                                                       "save_profile": True}))
     slug, run_id = start["draft_slug"], start["run_id"]
     assert slug == "nathan-s-work" and start["already_running"] is False
     st = _ok(_request(app, "GET", f"/api/import/prosopia/{run_id}"))
@@ -1063,11 +1065,12 @@ def test_j1b_wizard_imports_from_prosopia_then_adds_an_orcid(app, env):
     assert st2["run"]["error"] is None and st2["result"]["drafted"] == 2
     assert len(_ok(_request(app, "GET", "/api/vault/docs", params={"tag": slug}))) == 7
     # The draft stays Nathan's: the topics box still names him and the
-    # applied profile is intact; the ORCID person was recorded separately.
+    # applied profile is intact; the ORCID person, not asked to be saved,
+    # is no researcher profile (FUNCTIONAL_SPEC M.2).
     view = _ok(_request(app, "GET", f"/api/profiles/{slug}/researcher-topics"))
     assert view["researcher_id"] == rid and view["applied"] is True
     rs = {r["source"]: r for r in _ok(_request(app, "GET", "/api/researchers"))}
-    assert set(rs) == {"prosopia", "orcid"} and rs["orcid"]["n_papers"] == 2 and rs["orcid"]["n_interests"] == 0
+    assert set(rs) == {"prosopia"}
     assert _ok(_request(app, "GET", "/api/profiles/drafts"))[0]["n_seeds"] == 7
     # ``into`` a draft that is not this user's / not a draft: 404.
     assert _request(app, "POST", "/api/import/orcid", json={"orcid": ORCID, "openalex_ids": picked, "into": "nope"}).status_code == 404
@@ -1077,7 +1080,7 @@ def test_j1b_wizard_imports_from_prosopia_then_adds_an_orcid(app, env):
     again = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "into": slug}))
     assert again["draft_slug"] == slug
     assert len(_ok(_request(app, "GET", "/api/vault/docs", params={"tag": slug}))) == 7
-    assert _one(env, "SELECT COUNT(*) AS n FROM researchers")["n"] == 2
+    assert _one(env, "SELECT COUNT(*) AS n FROM researchers")["n"] == 1
 
     # Through the rest of the wizard and live.
     topics = _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/topics"))

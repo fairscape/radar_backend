@@ -557,7 +557,8 @@ def test_restart_mid_import_then_resume(app, env, monkeypatch):
     stub = app.state.openalex
     app.dependency_overrides.pop(get_import_openalex_client)
     monkeypatch.setattr(prosopia_service, "OpenAlexClient", lambda **kw: stub)
-    start = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "name": "Restarted"}))
+    start = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "name": "Restarted",
+                                                                      "save_profile": True}))
     slug, run_id = start["draft_slug"], start["run_id"]
     # Before the restart... but every _request runs the lifespan, i.e. a restart.
     st = _ok(_request(app, "GET", f"/api/import/prosopia/{run_id}"))
@@ -571,7 +572,8 @@ def test_restart_mid_import_then_resume(app, env, monkeypatch):
     assert rs and rs[0]["importing"] is False
     # Retry into the same draft, with the jobs running this time.
     holder[0] = app.state.inline
-    again = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "into": slug}))
+    again = _ok(_request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "into": slug,
+                                                                      "save_profile": True}))
     print("AGAIN", again)
     st2 = _ok(_request(app, "GET", f"/api/import/prosopia/{again['run_id']}"))
     print("ST2", st2["run"], st2["result"])

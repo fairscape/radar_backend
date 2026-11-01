@@ -120,7 +120,8 @@ def test_0021_to_head_keeps_every_row_and_adds_the_new_rules(db_at_0020):
         # 0033 and 0034 add columns, empty on these rows (none has a researcher's
         # topics applied, which is what fills ``researcher_doc_json``).
         cols_after = [r[1] for r in conn.execute("PRAGMA table_info(profiles)")]
-        assert cols_after == cols_before + ["edit_of", "researcher_doc_json", "edit_tab", "edit_seen_at"]
+        assert cols_after == cols_before + ["edit_of", "researcher_doc_json", "edit_tab", "edit_seen_at",
+                                            "prosopia_docs_json"]
         old = ", ".join(cols_before)
         assert [tuple(r) for r in conn.execute(f"SELECT {old} FROM profiles ORDER BY id")] == profiles_before
         assert conn.execute("SELECT COUNT(*) FROM profiles WHERE edit_of IS NOT NULL OR researcher_doc_json IS NOT NULL").fetchone()[0] == 0

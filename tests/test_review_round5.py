@@ -183,8 +183,10 @@ def test_a_prosopia_profile_without_an_orcid_is_guarded_too(tmp_path):
     apply_migrations(conn)
     s = settings_module.get_settings()
     plan = prosopia_service.prepare_import(conn, s, user_id=1, ref="doe-jane", prosopia_client=_Client())
+    # As the router opens it (launch_import): whom it imports, on the run.
     run = gather_runs_repo.start(conn, profile_id=plan.profile_id, researcher_id=plan.researcher_id,
-                                 user_id=1, tier_used="prosopia_import")
+                                 user_id=1, tier_used="prosopia_import", import_orcid=plan.import_orcid,
+                                 import_key=plan.import_key, opened_draft=plan.new_draft)
     with pytest.raises(orcid_service.ImportAlreadyRunning) as e:
         prosopia_service.prepare_import(conn, s, user_id=1, ref="doe-jane", prosopia_client=_Client())
     assert (e.value.slug, e.value.run_id) == (plan.draft_slug, run)

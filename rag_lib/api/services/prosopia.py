@@ -41,7 +41,7 @@ from __future__ import annotations
 from ..schemas import MAX_NAME
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -54,6 +54,7 @@ from ...db.repos import (
     profiles as profiles_repo,
     researchers as researchers_repo,
     users as users_repo,
+    versions as versions_repo,
 )
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
@@ -152,6 +153,14 @@ class ImportPlan:
     listed_ids: set[str] | None = None
     # Whose papers these are, for checking a title match (O.2 B).
     person: Any = None
+    # What the seeds say they came from: the researcher they were saved
+    # under, or the source itself when no researcher profile was saved
+    # (FUNCTIONAL_SPEC M.2).
+    seed_source: str = "researcher"
+    # Whom a wizard import imports, recorded on its run (``gather_runs.
+    # import_orcid`` / ``import_key``) so a second request finds it.
+    import_orcid: str | None = None
+    import_key: str | None = None
 
 
 def normalize_ref(raw: str) -> str:
@@ -345,24 +354,30 @@ def open_draft(
     return draft_row
 
 
-def open_draft_owning(
-    conn: sqlite3.Connection, settings: Any, *, researcher_id: int, new_researcher: bool,
+def open_draft_for_import(
+    conn: sqlite3.Connection, settings: Any, *, save_profile: bool, record_researcher, new_researcher: bool,
     **kwargs: Any,
-) -> sqlite3.Row:
-    """``open_draft`` for a researcher the wizard imported: the researcher
-    is the draft's, and goes when the draft is discarded or the import
-    fails (FUNCTIONAL_SPEC D). One this request created is removed again
-    when the draft cannot be opened."""
+) -> tuple[sqlite3.Row, int | None]:
+    """The draft a wizard import fills, and the researcher it saved, if any
+    (FUNCTIONAL_SPEC M.2).
+
+    Not saving (the default): no researcher; the papers are the draft's
+    seeds, and go with it. Saving: ``record_researcher()`` makes the
+    researcher profile at once -- a saved one, not the draft's, so it
+    stays whatever becomes of the draft. One this request created is
+    removed again when the draft cannot be opened, or (``undo_import``)
+    when the import fails.
+    """
+    if not save_profile:
+        return open_draft(conn, settings, researcher_id=None, **kwargs), None
+    researcher_id = record_researcher()
     try:
-        draft_row = open_draft(conn, settings, researcher_id=researcher_id, **kwargs)
-        draft_owned_repo.own(conn, int(draft_row["id"]), "researcher", researcher_id)
-        conn.commit()
+        return open_draft(conn, settings, researcher_id=researcher_id, **kwargs), researcher_id
     except BaseException:
         conn.rollback()
         if new_researcher:
             researchers_repo.delete(conn, researcher_id)
         raise
-    return draft_row
 
 
 def _has_seeds(conn: sqlite3.Connection, profile_id: int) -> bool:
@@ -383,6 +398,7 @@ def prepare_import(
     prosopia_client: Any | None = None,
     paper_ids: list[str] | None = None,
     into: str | None = None,
+    save_profile: bool = False,
 ) -> ImportPlan:
     """Read the profile and open the draft. Fast enough for a request.
 
@@ -412,7 +428,7 @@ def prepare_import(
     known = researchers_repo.get_by_key(conn, user_id, "prosopia", slug)
     orcid_service.refuse_if_importing(
         conn, user_id, rid if looks_like_orcid(rid) else None, into,
-        researcher_id=int(known["id"]) if known is not None else None,
+        researcher_id=int(known["id"]) if known is not None else None, key=f"prosopia:{slug}",
     )
     # A person already stored is not imported again from a draft: the
     # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
@@ -425,18 +441,21 @@ def prepare_import(
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
-    # The researcher is recorded whichever way the import was started,
-    # so the papers this draft is about to embed are reusable for the
-    # next interest without a second import -- once the draft is saved.
-    researcher_id = researchers_service.record_prosopia_researcher(
-        conn, user_id=user_id, slug=slug, profile=profile,
-        base_url=base_url or DEFAULT_BASE_URL,
-    )
-    draft_row = open_draft_owning(
-        conn, settings, user_id=user_id, target=target,
+    draft_row, researcher_id = open_draft_for_import(
+        conn, settings, save_profile=save_profile, new_researcher=new_researcher,
+        record_researcher=lambda: researchers_service.record_prosopia_researcher(
+            conn, user_id=user_id, slug=slug, profile=profile,
+            base_url=base_url or DEFAULT_BASE_URL,
+        ),
+        user_id=user_id, target=target,
         name=(name or profile.name or slug).strip()[:MAX_NAME], embedding_model=model,
-        researcher_id=researcher_id, new_researcher=new_researcher,
     )
+    # The profile's interest / not interest go with the draft, saved
+    # profile or not (FUNCTIONAL_SPEC M.3).
+    from ... import prosopia_interests
+    prosopia_interests.keep_doc(conn, int(draft_row["id"]), key=slug,
+                            name=(str(getattr(profile, "name", "") or "") or slug),
+                            document=researchers_service.profile_document(profile))
 
     return ImportPlan(
         slug=slug,
@@ -449,9 +468,12 @@ def prepare_import(
         records=records,
         profile=profile,
         new_draft=target is None,
-        new_researcher=new_researcher,
+        new_researcher=bool(new_researcher and researcher_id is not None),
         listed_ids={_paper_id(r) for r in profile.papers},
         person=person_of(profile),
+        seed_source="researcher" if researcher_id is not None else "prosopia",
+        import_orcid=rid if looks_like_orcid(rid) else None,
+        import_key=f"prosopia:{slug}",
     )
 
 
@@ -492,6 +514,63 @@ def store_resolved_paper(conn: sqlite3.Connection, resolution) -> bool:
         return False
     papers_repo.upsert(conn, dict(resolution.paper))
     return True
+
+
+def for_user(user_id: int, resolution):
+    """``resolution`` keyed so that what came from this user's Prosopia
+    profile is stored as theirs (FUNCTIONAL_SPEC M.1).
+
+    A record OpenAlex has nothing for gets the user in its synthetic id:
+    two users importing the same profile get a row each, and one's
+    refresh never rewrites the other's. A work whose row would hold
+    Prosopia's text (``own_text``) becomes the user's copy of it, a
+    version like an upload; the public row keeps what OpenAlex says.
+    """
+    oa_id = resolution.openalex_id
+    if oa_id.startswith("prosopia:"):
+        own = f"prosopia:{int(user_id)}:{oa_id[len('prosopia:'):]}"
+    elif resolution.own_text:
+        own = versions_repo.prosopia_copy_id(user_id, oa_id)
+        return replace(resolution, openalex_id=own, canonical=oa_id,
+                       paper={**resolution.paper, "openalex_id": own})
+    else:
+        return resolution
+    return replace(resolution, openalex_id=own, paper={**resolution.paper, "openalex_id": own})
+
+
+# What a Prosopia record says of a work OpenAlex could not be reached for
+# that may go on the work's public row when there is none yet: what
+# identifies it. Its text stays on the user's copy.
+_IDENTIFYING = ("title", "doi", "year", "venue")
+
+
+def store_own_copy(conn: sqlite3.Connection, user_id: int, resolution) -> list[str]:
+    """Store ``user_id``'s copy of ``resolution.canonical`` and the public
+    row it is a copy of. Returns the rows this added, the public one first
+    (so taking them back in reverse removes the copy before its work).
+
+    The public row gets OpenAlex's record, with no abstract when OpenAlex
+    has none; a work OpenAlex could not be reached for gets only what
+    identifies it, and only when it has no row yet.
+    """
+    work = resolution.canonical
+    added: list[str] = []
+    exists = papers_repo.get_by_openalex_id(conn, work) is not None
+    if resolution.resolved:
+        papers_repo.upsert(conn, {**resolution.paper, "openalex_id": work, "abstract": "", "body_text": None})
+    elif not exists:
+        papers_repo.upsert(conn, {"openalex_id": work, "source": "prosopia",
+                                  **{k: resolution.paper.get(k) for k in _IDENTIFYING}})
+    if not exists:
+        added.append(work)
+    copy = resolution.openalex_id
+    if papers_repo.get_by_openalex_id(conn, copy) is None:
+        added.append(copy)
+    papers_repo.upsert(conn, dict(resolution.paper))
+    versions_repo.register(conn, user_id=user_id, paper_id=copy, canonical_id=work,
+                           file_hash=f"prosopia:{work.rsplit('/', 1)[-1]}")
+    conn.commit()
+    return added
 
 
 def run_import(
@@ -547,6 +626,7 @@ def run_import(
                 plan.profile, record, resolution.paper_id,
             )
             unresolved.append(resolution.paper_id)
+        resolution = for_user(plan.user_id, resolution)
         resolved_by[resolution.rung] += 1
         resolved.append((record, resolution))
         if reporter is not None and (i % _TICK_EVERY == 0 or i == len(records)):
@@ -621,11 +701,16 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
             # of their vault and into the importer's. The importer's claim is
             # the researcher_papers link written below, which the vault list
             # and the seed ownership check both already read.
-            is_new = papers_repo.get_by_openalex_id(conn, oa_id) is None
-            if store_resolved_paper(conn, resolution) and is_new:
-                done.append(("paper", oa_id))
-            if is_new and plan.profile_id is not None:
-                draft_owned_repo.own(conn, plan.profile_id, "paper", oa_id)
+            if resolution.canonical is not None:
+                added = store_own_copy(conn, plan.user_id, resolution)
+            else:
+                is_new = papers_repo.get_by_openalex_id(conn, oa_id) is None
+                added = [oa_id] if store_resolved_paper(conn, resolution) and is_new else []
+            for item in added:
+                done.append(("paper", item))
+                if plan.profile_id is not None:
+                    draft_owned_repo.own(conn, plan.profile_id, "paper", item)
+            if added:
                 conn.commit()
             if oa_id in vectors:
                 if not embeddings_repo.has(conn, oa_id, plan.embedding_model):
@@ -641,7 +726,7 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
                     summary=(getattr(record, "summary", None) or None),
                 )
             if plan.profile_id is not None:
-                if profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source="researcher",
+                if profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source=plan.seed_source,
                                              researcher_id=plan.researcher_id):
                     done.append(("seed", oa_id))
             drafted += 1

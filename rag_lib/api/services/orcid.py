@@ -39,7 +39,7 @@ from ...openalex_client import OpenAlexClient
 from ...orcid_registry import ClaimedWorks, RegistryRecord, bare_ror, fetch_record
 from ...paper import normalize_title, surname, title_key
 from ...prosopia_seeds import Person, normalize_doi
-from .prosopia import ImportPlan, open_draft_owning, target_draft
+from .prosopia import ImportPlan, open_draft_for_import, target_draft
 
 
 log = structlog.get_logger("rag_lib.api.services.orcid")
@@ -88,7 +88,7 @@ def orcid_checksum_ok(orcid: str) -> bool:
 
 def refuse_if_importing(
     conn: sqlite3.Connection, user_id: int, orcid: str | None, into: str | None,
-    *, researcher_id: int | None = None,
+    *, researcher_id: int | None = None, key: str | None = None,
 ) -> None:
     """Raise ``ImportAlreadyRunning`` when this person is already being imported.
 
@@ -102,16 +102,20 @@ def refuse_if_importing(
     other draft as the new interest.
 
     ``researcher_id`` finds the person without an ORCID (a Prosopia profile
-    with no rid).
+    with no rid), and so does ``key`` (``import_key``), when no researcher
+    profile was saved.
     """
-    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=orcid, researcher_id=researcher_id)
+    inflight = gather_runs_repo.find_inflight_import(conn, user_id, orcid=orcid, researcher_id=researcher_id,
+                                                     key=key)
     if inflight is None:
         return
     slug = inflight["slug"]
     if into is not None:
         same_target = slug == into
     else:
-        same_target = slug is not None and inflight["draft_researcher_id"] == inflight["researcher_id"]
+        same_target = slug is not None and (bool(inflight["opened_draft"]) or (
+            inflight["researcher_id"] is not None
+            and inflight["draft_researcher_id"] == inflight["researcher_id"]))
     raise ImportAlreadyRunning(slug if same_target else None, int(inflight["run_id"]))
 
 
@@ -560,6 +564,7 @@ def prepare_import(
     embedding_model: str | None = None,
     openalex_client: Any | None = None,
     into: str | None = None,
+    save_profile: bool = False,
 ) -> ImportPlan:
     """Keep the chosen works, open the draft, return the job's plan.
 
@@ -584,7 +589,7 @@ def prepare_import(
     # re-embed the same papers on the same GPU and leave two half-built
     # drafts behind. Checked here rather than in the router so the CLI and
     # the test path get it too.
-    refuse_if_importing(conn, user_id, oid, into)
+    refuse_if_importing(conn, user_id, oid, into, key=f"orcid:{oid}")
     # A person already stored is not imported again from a draft: the
     # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
     from . import researchers as researchers_service
@@ -612,16 +617,13 @@ def prepare_import(
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
-    # Record the researcher too: the works embedded for this draft are
-    # then on hand for the next interest built from the same person, once
-    # the draft is saved.
-    researcher_id = researchers_service.record_orcid_researcher(
-        conn, user_id=user_id, orcid=oid, name=listing["name"],
-    )
-    draft_row = open_draft_owning(
-        conn, settings, user_id=user_id, target=target,
+    draft_row, researcher_id = open_draft_for_import(
+        conn, settings, save_profile=save_profile, new_researcher=new_researcher,
+        record_researcher=lambda: researchers_service.record_orcid_researcher(
+            conn, user_id=user_id, orcid=oid, name=listing["name"],
+        ),
+        user_id=user_id, target=target,
         name=(name or listing["name"] or f"ORCID {oid}").strip()[:MAX_NAME], embedding_model=model,
-        researcher_id=researcher_id, new_researcher=new_researcher,
     )
     draft = {"slug": draft_row["slug"], "name": draft_row["name"]}
 
@@ -641,9 +643,12 @@ def prepare_import(
         records=records,
         profile=None,
         new_draft=target is None,
-        new_researcher=new_researcher,
+        new_researcher=bool(new_researcher and researcher_id is not None),
         listed_ids={w["openalex_id"] for w in listing["works"]},
         person=Person.of(listing["name"], oid),
+        seed_source="researcher" if researcher_id is not None else "orcid",
+        import_orcid=oid,
+        import_key=f"orcid:{oid}",
     )
 
 

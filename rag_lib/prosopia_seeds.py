@@ -88,6 +88,13 @@ class Resolution:
     openalex_id: str
     paper: dict[str, Any]
     rung: str
+    # The row holds text Prosopia has and OpenAlex does not: the record's
+    # abstract on a work OpenAlex has none for, or (rung "none" under a
+    # real work id) the record's summary. Not the public row's to hold
+    # (FUNCTIONAL_SPEC M.1).
+    own_text: bool = False
+    # Set by the import: the public work a user's copy stands for.
+    canonical: str | None = None
 
     @property
     def resolved(self) -> bool:
@@ -390,11 +397,13 @@ def resolve_seed(
 
     if work is not None:
         paper = _paper_from_work(client, work, record)
+        own_text = paper.pop("abstract_from_prosopia")
         return Resolution(
             paper_id=paper_id,
             openalex_id=paper["openalex_id"],
             paper=paper,
             rung=rung,
+            own_text=own_text,
         )
 
     paper = _paper_from_record(record, slug=slug, fallback_text=fallback_text)
@@ -410,6 +419,7 @@ def resolve_seed(
         openalex_id=paper["openalex_id"],
         paper=paper,
         rung="none",
+        own_text=bool(oa_id and id_unreachable),
     )
 
 
@@ -479,6 +489,7 @@ def _paper_from_work(client: Any, work: dict, record: PaperRecord) -> dict[str, 
         "pdf_url": paper.pdf_url or record.pdf_url or record.full_text_link,
         "oa_status": paper.oa_status,
         "body_text": None,
+        "abstract_from_prosopia": not paper.abstract and bool(record.abstract),
     }
 
 

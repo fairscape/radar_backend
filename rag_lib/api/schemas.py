@@ -213,6 +213,9 @@ class Topic(_Model):
     # since): kept as saved (FUNCTIONAL_SPEC T.2-2). Set on the edit page's
     # list (``topics/preview``); None elsewhere.
     unmatched: bool | None = None
+    # The Prosopia profiles that list it as an interest (FUNCTIONAL_SPEC
+    # M.3): ``[{"profile"}]``, their names; None when none does.
+    prosopia: list[dict] | None = None
 
 
 class ScanTopics(_Model):
@@ -668,6 +671,10 @@ class ProsopiaImportRequest(_Model):
     paper_ids: list[str] | None = None
     # A draft to add these papers to, instead of opening a new one.
     into: str | None = None
+    # "Also save as a researcher profile" (FUNCTIONAL_SPEC M.2): a
+    # researcher profile is made at once, its papers kept whatever becomes
+    # of the draft. Off: the papers are only the draft's seeds.
+    save_profile: bool = False
 
 
 class ProsopiaWork(_Model):
@@ -756,6 +763,10 @@ class OrcidImportRequest(_Model):
     # A draft to add these works to, instead of opening a new one: the
     # wizard's "add papers from another ORCID" once a draft exists.
     into: str | None = None
+    # "Also save as a researcher profile" (FUNCTIONAL_SPEC M.2): a
+    # researcher profile is made at once, its papers kept whatever becomes
+    # of the draft. Off: the papers are only the draft's seeds.
+    save_profile: bool = False
 
 
 class ProsopiaImportStart(_Model):

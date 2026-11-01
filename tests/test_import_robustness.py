@@ -278,6 +278,11 @@ def test_o14_two_records_of_one_paper_are_one_seed_and_never_new(env):
     result = _request(app, "GET", f"/api/import/prosopia/{r.json()['run_id']}").json()["result"]
     assert result["drafted"] == 2
     assert _q(env, "SELECT COUNT(*) FROM profile_seeds") == [(2,)]
+    # No researcher profile saved (M.2), so nothing to mark the twin on.
+    assert _q(env, "SELECT COUNT(*) FROM researcher_work_marks") == [(0,)]
+    r = _request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "save_profile": True})
+    assert r.status_code == 200, r.text
+    assert _q(env, "SELECT COUNT(*) FROM profile_seeds") == [(4,)]
     assert _q(env, "SELECT work_id, mark FROM researcher_work_marks") == [("leroy2025twin", "duplicate")]
     rid = _q(env, "SELECT id FROM researchers")[0][0]
     works = _request(app, "GET", f"/api/researchers/{rid}/works").json()
@@ -446,7 +451,8 @@ def test_o8_a_profile_only_a_draft_brought_in_survives_the_draft_after_a_refusal
     """The 409 points at that profile; discarding the draft must not then
     delete it."""
     app = _app(StubProsopia(_stub_profile()), _stub_openalex())
-    slug = _request(app, "POST", "/api/import/prosopia", json={"ref": "sheffield-nathan"}).json()["draft_slug"]
+    slug = _request(app, "POST", "/api/import/prosopia",
+                    json={"ref": "sheffield-nathan", "save_profile": True}).json()["draft_slug"]
     r = _import(app, source="prosopia", ref="sheffield-nathan")
     assert r.status_code == 409, r.text
     rid = r.json()["researcher"]["id"]

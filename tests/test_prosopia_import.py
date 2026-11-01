@@ -634,7 +634,7 @@ def test_import_attaches_and_embeds_every_seed(env):
             )
         ]
         assert len(seeds) == 5
-        assert "prosopia:sheffield-nathan:ghost2020nowhere" in seeds
+        assert "prosopia:1:sheffield-nathan:ghost2020nowhere" in seeds
 
         # Every seed carries a vector under the draft's model, otherwise
         # the coherence join in wizard step 2 comes back empty.
@@ -651,7 +651,7 @@ def test_import_attaches_and_embeds_every_seed(env):
         # The synthetic row is embedded from its summary, not its title.
         ghost = conn.execute(
             "SELECT body_text, abstract, source FROM papers WHERE openalex_id = ?",
-            ("prosopia:sheffield-nathan:ghost2020nowhere",),
+            ("prosopia:1:sheffield-nathan:ghost2020nowhere",),
         ).fetchone()
         assert ghost["source"] == "prosopia"
         assert ghost["abstract"] == ""
@@ -677,7 +677,7 @@ def test_import_reads_a_summary_only_for_the_paper_that_needs_one(env):
     try:
         body = conn.execute(
             "SELECT body_text FROM papers WHERE openalex_id = ?",
-            ("prosopia:sheffield-nathan:ghost2020nowhere",),
+            ("prosopia:1:sheffield-nathan:ghost2020nowhere",),
         ).fetchone()["body_text"]
         assert "Only the Prosopia summary" in body
         assert "Artifact prose." in body
@@ -925,7 +925,8 @@ def test_import_into_an_existing_draft_adds_seeds_to_it(env):
     try:
         assert conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"] == 1
         row = conn.execute("SELECT id, name, researcher_id FROM profiles WHERE slug = ?", (slug,)).fetchone()
-        assert row["name"] == "Mixed" and row["researcher_id"] is not None
+        # No researcher profile saved, so none linked (FUNCTIONAL_SPEC M.2).
+        assert row["name"] == "Mixed" and row["researcher_id"] is None
         n = conn.execute("SELECT COUNT(*) AS n FROM profile_seeds WHERE profile_id = ?", (row["id"],)).fetchone()["n"]
         assert n == 5
     finally:

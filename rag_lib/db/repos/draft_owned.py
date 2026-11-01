@@ -104,7 +104,9 @@ def discard(conn: sqlite3.Connection, profile_id: int) -> dict[str, list[str]]:
                 gone["researcher"].append(rid)
         # Versions before the public records: a version is the use that
         # keeps its public record.
-        for oa in sorted(items["paper"], key=lambda i: not i.startswith("local:upload:")):
+        from .versions import is_version
+
+        for oa in sorted(items["paper"], key=lambda i: not is_version(i)):
             if _paper_in_use(conn, oa):
                 continue
             paths = {r[0] for r in conn.execute(

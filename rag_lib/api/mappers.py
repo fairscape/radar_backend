@@ -346,6 +346,7 @@ def topic_filters_to_topics(topic_filters: dict | None, new: set[str] | None = N
             # topics the seeds brought in since the list was saved (a preview)
             new=(tid in new) if new is not None else None,
             unmatched=True if it.get("unmatched") else None,
+            prosopia=it.get("prosopia") or None,
         ))
     return out
 

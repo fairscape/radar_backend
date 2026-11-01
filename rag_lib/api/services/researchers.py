@@ -90,6 +90,17 @@ def _read(profile: Any, attr: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
+def profile_document(profile: Any) -> dict | None:
+    """A Prosopia profile's document as stored on its researcher
+    (``document_json``): what its interest / not interest are read from."""
+    raw = _json_or_none(_read(profile, "metadata"))
+    try:
+        got = json.loads(raw) if raw else None
+    except (ValueError, TypeError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
 def _json_or_none(value: Any) -> str | None:
     if value is None:
         return None
@@ -154,16 +165,19 @@ def refuse_if_known(
 ) -> bool:
     """Raise ``ResearcherExists`` when the wizard would import a stored person.
 
-    Not for a person draft ``draft_id`` itself imported (more of their
-    papers added to the draft being built): that researcher is still the
-    draft's, part of its sandbox. Returns whether the person is new.
+    Not for the person of draft ``draft_id`` itself (more of their papers
+    added to the draft being built): a researcher that draft imported --
+    part of its sandbox -- or the one it is built from, saved when the
+    import was asked to (FUNCTIONAL_SPEC M.2). Returns whether the person
+    is new.
     """
     row = researchers_repo.find_person(conn, user_id, source, key, orcid)
     if row is None:
         return True
     if draft_id is not None and conn.execute(
-        "SELECT 1 FROM draft_owned WHERE profile_id = ? AND kind = 'researcher' AND item = ?",
-        (int(draft_id), str(row["id"])),
+        """SELECT 1 FROM draft_owned WHERE profile_id = ? AND kind = 'researcher' AND item = ?
+           UNION ALL SELECT 1 FROM profiles WHERE id = ? AND is_draft = 1 AND researcher_id = ?""",
+        (int(draft_id), str(row["id"]), int(draft_id), int(row["id"])),
     ).fetchone() is not None:
         return False
     raise ResearcherExists(int(row["id"]), row["name"] or key)
@@ -687,11 +701,28 @@ def create_interest(
         if researchers_repo.get(conn, researcher_id) is not None:
             raise
         raise ResearcherNotFound(f"researcher {researcher_id} not found") from None
+    _keep_prosopia_doc(conn, profile_id, researcher_id)
     log.info(
         "researchers.create_interest",
         researcher_id=researcher_id, draft_slug=draft["slug"], n_seeds=n,
     )
     return Draft(**draft), n
+
+
+def _keep_prosopia_doc(conn: sqlite3.Connection, profile_id: int, researcher_id: int) -> None:
+    """A Prosopia researcher's interest / not interest go with an interest
+    built from them, as with one imported from Prosopia (FUNCTIONAL_SPEC M.3)."""
+    from ... import prosopia_interests
+
+    row = researchers_repo.get(conn, researcher_id)
+    if row is None or row["source"] != "prosopia" or not row["document_json"]:
+        return
+    try:
+        document = json.loads(row["document_json"])
+    except (ValueError, TypeError):
+        return
+    prosopia_interests.keep_doc(conn, profile_id, key=row["key"], name=row["name"] or row["key"],
+                            document=document if isinstance(document, dict) else None)
 
 
 def attach_seeds(

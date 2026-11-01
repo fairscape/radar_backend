@@ -30,13 +30,27 @@ import structlog
 log = structlog.get_logger("rag_lib.db.repos.versions")
 
 PREFIX = "local:upload:"
+# A user's copy of a public work holding text from their Prosopia profile
+# that OpenAlex does not have (its abstract, or its summary when the work
+# could not be reached): the public row keeps only what OpenAlex says
+# (FUNCTIONAL_SPEC M.1). A version like an upload, with no file.
+PROSOPIA_PREFIX = "local:prosopia:"
 
 
 def version_id(user_id: int, file_hash: str) -> str:
     return f"{PREFIX}{int(user_id)}:{file_hash}"
 
 
+def prosopia_copy_id(user_id: int, work_id: str) -> str:
+    """``user_id``'s Prosopia copy of public work ``work_id`` (one per work)."""
+    return f"{PROSOPIA_PREFIX}{int(user_id)}:{str(work_id).rsplit('/', 1)[-1]}"
+
+
 def is_version(openalex_id: str | None) -> bool:
+    return bool(openalex_id) and str(openalex_id).startswith((PREFIX, PROSOPIA_PREFIX))
+
+
+def is_upload(openalex_id: str | None) -> bool:
     return bool(openalex_id) and str(openalex_id).startswith(PREFIX)
 
 
@@ -94,7 +108,7 @@ def version_numbers(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[i
         FROM paper_versions v
         JOIN papers p ON p.openalex_id = v.version_id
         LEFT JOIN paper_uploads u ON u.user_id = v.user_id AND u.openalex_id = v.version_id
-        WHERE v.user_id = ?
+        WHERE v.user_id = ? AND v.version_id LIKE 'local:upload:%'
         ORDER BY at, v.rowid
         """,
         (int(user_id),),
