@@ -88,9 +88,7 @@ def test_dismissed_paper_made_a_seed_still_counts_as_dismissed(app, env):
     prof = next(p for p in _ok(_request(app, "GET", "/api/profiles")) if p["key"] == slug)
     feed = _feed(app, slug)["cards"] + _feed(app, slug, bucket="low")["cards"]
     feed_dismissed = sum(1 for c in feed if c.get("state") == "dismissed")
-    ft = _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback-threshold"))
-    assert (prof["dismisses30"], feed_dismissed, ft["n_dismissed"]) == (feed_dismissed,) * 3, (
-        prof["dismisses30"], feed_dismissed, ft["n_dismissed"])
+    assert prof["dismisses30"] == feed_dismissed, (prof["dismisses30"], feed_dismissed)
 
 
 def test_below_the_bar_across_interests_is_not_closest_to_the_bar_first(app, env):

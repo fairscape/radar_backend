@@ -156,6 +156,8 @@ def daily(
     states: dict[str, CardState | None] = {}
     # Each card's own interest's threshold, for "closest to the bar" across interests.
     bar_of: dict[int, float] = {}
+    # Cards un-saved: after every other card (FUNCTIONAL_SPEC 5.5).
+    unsaved: set[int] = set()
     profile_ids: list[int] = []
     per_profile: list[tuple[int, list[Card], list[Card], Any]] = []
 
@@ -198,6 +200,8 @@ def daily(
                 )
                 if threshold is not None:
                     bar_of[id(card)] = float(threshold)
+                if crow["unsaved_at"] is not None:
+                    unsaved.add(id(card))
                 out.append(card)
             return out
 
@@ -255,10 +259,11 @@ def daily(
         # By the distance under the card's own interest's bar: across
         # interests the raw similarity put a paper 0.10 under a 0.9 bar
         # ahead of one 0.01 under a 0.5 bar.
-        cards.sort(key=lambda c: (c.similarity - bar_of.get(id(c), 0.0)) if c.similarity is not None else -9.0,
+        cards.sort(key=lambda c: (id(c) not in unsaved,
+                                  (c.similarity - bar_of.get(id(c), 0.0)) if c.similarity is not None else -9.0),
                    reverse=True)
     else:
-        cards.sort(key=lambda c: c.score, reverse=True)
+        cards.sort(key=lambda c: (id(c) not in unsaved, c.score), reverse=True)
 
     fetched_at, scored = _last_run_metrics(conn, profile_ids)
     fetch_ms = int(round((time.perf_counter() - t0) * 1000))

@@ -66,7 +66,7 @@ def _calls(w):
         (P, live, "PATCH", f"/api/profiles/{live}", {"json": {"threshold": 0.2}}),
         (P, live, "PATCH", f"/api/profiles/{live}", {"json": {"years": {"year_from": 2019, "year_to": None}}}),
         (P, live, "POST", f"/api/profiles/{live}/refit", {}),
-        (P, live, "POST", f"/api/profiles/{live}/refit?autotune=1", {}),
+        (P, live, "GET", f"/api/profiles/{live}/saved", {}),
         (P, live, "POST", f"/api/profiles/{live}/dry-run", {"json": {}}),
         (P, live, "POST", f"/api/profiles/{live}/recompute-coherence", {}),
         (P, live, "POST", f"/api/profiles/{live}/recompute-topics", {}),

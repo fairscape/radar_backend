@@ -167,6 +167,11 @@ def mark_shown(
     return cur.rowcount
 
 
+# A paper un-saved goes back to the feed, after every other paper of its
+# interest (FUNCTIONAL_SPEC 5.5); it still has to pass the bar and years.
+UNSAVED_LAST = "(pc.unsaved_at IS NOT NULL)"
+
+
 def set_state(
     conn: sqlite3.Connection, profile_id: int, openalex_id: str,
     column: str, on: bool | None = None, on_change=None,
@@ -208,19 +213,25 @@ def _set_state_locked(conn, profile_id, openalex_id, column, other, label, on, o
         return None
     if on is None:
         on = row[column] is None
+    # A save puts the paper in the Vault for good: only the Vault's delete
+    # takes it out (FUNCTIONAL_SPEC 5.5). An un-save leaves it there and
+    # marks it so the feed puts it last; saving again lifts that.
     if on:
+        extra = (", vaulted_at = COALESCE(vaulted_at, datetime('now')), unsaved_at = NULL"
+                 if column == "saved_at" else "")
         cur = conn.execute(
             f"""
             UPDATE profile_candidates
-            SET {column} = datetime('now'), {other} = NULL
+            SET {column} = datetime('now'), {other} = NULL{extra}
             WHERE profile_id = ? AND openalex_id = ? AND {column} IS NULL
             """,
             (profile_id, openalex_id),
         )
     else:
+        extra = ", unsaved_at = datetime('now')" if column == "saved_at" else ""
         cur = conn.execute(
             f"""
-            UPDATE profile_candidates SET {column} = NULL
+            UPDATE profile_candidates SET {column} = NULL{extra}
             WHERE profile_id = ? AND openalex_id = ? AND {column} IS NOT NULL
             """,
             (profile_id, openalex_id),
@@ -256,6 +267,27 @@ def mark_dismissed(
     return None if res is None else res[0]
 
 
+def saved_for_profile(conn: sqlite3.Connection, profile_id: int) -> list[sqlite3.Row]:
+    """The interest's saved papers, last saved first (FUNCTIONAL_SPEC 5.2-3).
+
+    Every one, whatever the bar and years say now (5.4 Q1), and one made a
+    seed since (5.4 Q2) with ``is_seed`` set.
+    """
+    return conn.execute(
+        """
+        SELECT pc.openalex_id, pc.saved_at, COALESCE(pc.score_raw, pc.score) AS score,
+               p.title, p.doi, p.year, p.venue,
+               EXISTS (SELECT 1 FROM profile_seeds ps
+                       WHERE ps.profile_id = pc.profile_id AND ps.openalex_id = pc.openalex_id) AS is_seed
+        FROM profile_candidates pc
+        JOIN papers p USING (openalex_id)
+        WHERE pc.profile_id = ? AND pc.saved_at IS NOT NULL
+        ORDER BY pc.saved_at DESC, pc.openalex_id
+        """,
+        (profile_id,),
+    ).fetchall()
+
+
 def unshown_for_profile(
     conn: sqlite3.Connection, profile_id: int, limit: int = 50
 ) -> list[sqlite3.Row]:
@@ -276,7 +308,7 @@ def unshown_for_profile(
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
-        ORDER BY COALESCE(pc.score_blended, pc.score) DESC
+        ORDER BY {UNSAVED_LAST}, COALESCE(pc.score_blended, pc.score) DESC
         LIMIT ?
         """,
         (profile_id, limit),
@@ -437,7 +469,7 @@ def top_for_profile(
         f"""
         SELECT
           pc.profile_id, pc.openalex_id, pc.score, pc.tier_used,
-          pc.fetched_at, pc.shown_at, pc.dismissed_at, pc.saved_at,
+          pc.fetched_at, pc.shown_at, pc.dismissed_at, pc.saved_at, pc.unsaved_at,
           pc.score_raw, pc.score_pct, pc.score_blended,
           pc.score_reranker_raw, pc.score_reranker_norm,
           pc.sourced_by_topic_id,
@@ -452,7 +484,7 @@ def top_for_profile(
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
           AND (? IS NULL OR {BUCKET_SQL} = ?)
           AND (? IS NULL OR (pc.saved_at IS NOT NULL OR pc.dismissed_at IS NOT NULL) = ?)
-        ORDER BY {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
+        ORDER BY {UNSAVED_LAST}, {"pc.score_raw" if below else "COALESCE(pc.score_blended, pc.score)"} DESC
         LIMIT ?
         """,
         (profile_id, year_from, year_from, bucket, bucket,

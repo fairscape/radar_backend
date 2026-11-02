@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
     FeedSeedChoice,
-    FeedbackThresholdResponse,
+    SavedPaper,
     LlmTopicsResult,
     SeedUmlsStatus,
     CommitDraftRequest,
@@ -1417,7 +1417,6 @@ def refit_profile(
     key: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-    autotune: int = Query(default=0, ge=0, le=1),
 ) -> RefitResponse:
     """Re-fit the selector for the given profile on its current seeds.
 
@@ -1426,8 +1425,9 @@ def refit_profile(
     commit. It now runs ``wizard.refit_profile``. 404 for an unknown
     profile, 400 for a draft or a profile with no embedded seed.
 
-    ``?autotune=1`` (Phase 8) runs ``feedback.autotune.apply_recommended``
-    after the refit and reports the new threshold inline in ``cost``.
+    The fit reads the interest's seeds and nothing else: saves and
+    dismisses in the feed never move the threshold (FUNCTIONAL_SPEC 5.2-1,
+    5.2-5; ``?autotune=1`` is gone).
     """
     _editable(db, int(user["id"]), key)
     try:
@@ -1439,18 +1439,6 @@ def refit_profile(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     cost = f"{fit['elapsed_s']:.2f} s · {fit['n_embedded']} vecs"
-    if autotune:
-        from rag_lib.feedback.autotune import apply_recommended
-
-        profile_id = _resolve_profile_id(db, int(user["id"]), key)
-        result = apply_recommended(db, profile_id)
-        if result["applied"]:
-            old_str = (
-                f"{result['old']:.3f}" if result["old"] is not None else "—"
-            )
-            cost = f"{cost} · autotune {old_str}→{result['new']:.3f}"
-        else:
-            cost = f"{cost} · autotune skipped (n={result['n_events']})"
     return RefitResponse(ok=True, key=key, cost=cost)
 
 
@@ -1672,27 +1660,21 @@ def backfill(
     return GatherNowResponse(ok=True, run_id=run_id)
 
 
-@router.get("/{key}/feedback-threshold", response_model=FeedbackThresholdResponse)
-def feedback_threshold(
+@router.get("/{key}/saved", response_model=list[SavedPaper])
+def list_saved(
     key: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-) -> FeedbackThresholdResponse:
-    """The threshold that best separates the papers saved from those dismissed.
-
-    Read-only; the Threshold tab offers it, and applying it is the usual
-    threshold PATCH. This is where saves and dismisses change the scoring.
-    """
-    from rag_lib.feedback.autotune import MIN_EVENTS, recommend_threshold, triaged_scores
+) -> list[SavedPaper]:
+    """The papers saved in this interest, last saved first (FUNCTIONAL_SPEC
+    5.2-3): its Saved tab. Un-saving is the feed's ``POST
+    /api/radar/cards/save`` with ``on: false``. 404 for another user's."""
+    from rag_lib.db.repos import candidates as candidates_repo
 
     profile_id = _resolve_profile_id(db, int(user["id"]), key)
-    saves, dismisses = triaged_scores(db, profile_id)
-    row = db.execute("SELECT threshold FROM profiles WHERE id = ?", (profile_id,)).fetchone()
-    return FeedbackThresholdResponse(
-        n_saved=len(saves), n_dismissed=len(dismisses), min_events=MIN_EVENTS,
-        suggested=recommend_threshold(db, profile_id),
-        threshold=float(row["threshold"]) if row and row["threshold"] is not None else None,
-    )
+    return [SavedPaper(id=r["openalex_id"], title=r["title"] or "", year=r["year"], venue=r["venue"],
+                       doi=r["doi"], score=r["score"], saved_at=r["saved_at"], is_seed=bool(r["is_seed"]))
+            for r in candidates_repo.saved_for_profile(db, profile_id)]
 
 
 @router.get("/{key}/feedback", response_model=list[FeedbackEventOut])

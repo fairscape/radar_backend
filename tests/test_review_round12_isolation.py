@@ -203,7 +203,7 @@ def test_user_b_cannot_read_or_touch_user_a(world):
         hit("POST", f"/api/profiles/{s}/dry-run")
         hit("POST", f"/api/profiles/{s}/gather-now?days=1&limit=10")
         hit("POST", f"/api/profiles/{s}/backfill", json={"year_from": 2020, "year_to": 2021})
-        hit("GET", f"/api/profiles/{s}/feedback-threshold")
+        hit("GET", f"/api/profiles/{s}/saved")
         hit("GET", f"/api/profiles/{s}/feedback")
         hit("GET", f"/api/profiles/{s}/runs")
         hit("GET", f"/api/profiles/{s}/reranker-comparison")

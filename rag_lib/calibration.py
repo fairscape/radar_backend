@@ -235,7 +235,7 @@ def suggest_threshold(
             lo = float(np.percentile(arr, THRESHOLD_MIN_PERCENTILE))
             hi = float(np.percentile(arr, THRESHOLD_MAX_PERCENTILE))
             thr = min(max(thr, lo), hi)
-        # Down, as autotune rounds: up could lift the clamped bar over
+        # Rounded down: up could lift the clamped bar over
         # the top 2% it promises to let through.
         return bar_floor(thr)
     if arr.size >= 10:

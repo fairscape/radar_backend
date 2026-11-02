@@ -185,14 +185,14 @@ def test_save_dismiss_undo_counts_agree(app, env):
     assert r["state"] is None
     p = _ok(_request(app, "GET", f"/api/profiles/{slug}"))
     fb = _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback"))
-    thr = _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback-threshold"))
+    saved = _ok(_request(app, "GET", f"/api/profiles/{slug}/saved"))
     f2 = _feed(app, slug)
-    print("PROFILE", p["saves30"], p["dismisses30"], "FB", [(e.get("action"), e.get("openalex_id") or e.get("id")) for e in fb], "THR", thr, "STATES", f2["states"])
+    print("PROFILE", p["saves30"], p["dismisses30"], "FB", [(e.get("action"), e.get("openalex_id") or e.get("id")) for e in fb], "SAVED", saved, "STATES", f2["states"])
     states = f2["states"]
     n_saved = sum(1 for v in states.values() if v == "saved")
     n_dis = sum(1 for v in states.values() if v == "dismissed")
-    assert p["saves30"] == n_saved == thr["n_saved"]
-    assert p["dismisses30"] == n_dis == thr["n_dismissed"]
+    assert p["saves30"] == n_saved == len(saved)
+    assert p["dismisses30"] == n_dis
 
 
 def test_threshold_edit_feed_matches_histogram(app, env):
@@ -334,7 +334,7 @@ def test_wizard_routes_on_a_live_interest_and_live_routes_on_a_draft(app, env):
         ("POST", f"/api/profiles/{d}/dry-run", {}),
         ("PATCH", f"/api/profiles/{d}", {"json": {"threshold": 0.4}}),
         ("PATCH", f"/api/profiles/{d}/schedule", {"json": {"enabled": True}}),
-        ("GET", f"/api/profiles/{d}/feedback-threshold", {}),
+        ("GET", f"/api/profiles/{d}/saved", {}),
         ("GET", f"/api/radar/daily?profile={d}", {}),
     ]:
         c = _code(app, m, p, **kw)

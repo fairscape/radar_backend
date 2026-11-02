@@ -60,7 +60,6 @@ def _calls(w):
         "thr": ("PATCH", f"/api/profiles/{L}", {"json": {"threshold": 0.2}}),
         "years": ("PATCH", f"/api/profiles/{L}", {"json": {"years": {"year_from": 2019, "year_to": None}}}),
         "refit": ("POST", f"/api/profiles/{L}/refit", {}),
-        "autotune": ("POST", f"/api/profiles/{L}/refit?autotune=1", {}),
         "recompute": ("POST", f"/api/profiles/{L}/recompute-topics", {}),
         "topics1": ("PUT", f"/api/profiles/{L}/topics", {"json": {"selected_topic_ids": t_one}}),
         "rt_on": ("PUT", f"/api/profiles/{L}/researcher-topics", {"json": {"enabled": True}}),
@@ -180,7 +179,6 @@ def _effect(name, w, st):
 
 # Pairs where B's effect is legitimately undone by A (A runs last and means to change it).
 OVERRIDES = {
-    ("autotune", "thr"),          # autotune sets the threshold after
     ("save", "dismiss"), ("dismiss", "save"),
     ("topics1", "rt_on"), ("rt_on", "topics1"), ("rt_off", "topics1"),
     ("rm0", "add"), ("rm1", "add"),

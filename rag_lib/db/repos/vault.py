@@ -7,8 +7,10 @@ two sources:
    user; migration 0020). These have a ``local_path`` and were typically attached
    to a profile as a seed via ``profile_seeds``.
 2. Papers the user saved from the daily radar
-   (``profile_candidates.saved_at IS NOT NULL`` for a profile owned by
-   the user). These have no PDF on disk; the vault still tracks them so
+   (``profile_candidates.vaulted_at IS NOT NULL`` for a profile owned by
+   the user). Set on the first save and kept through an un-save or a
+   dismiss: only the Vault's own delete takes a paper out (FUNCTIONAL_SPEC
+   5.5). These have no PDF on disk; the vault still tracks them so
    the saved-paper UX is honest about the user's reading list.
 
 3. Every seed of the user's interests, however it got there: a paper
@@ -20,7 +22,7 @@ two sources:
 
 Tags = profile slugs the paper is attached to in either way:
 ``profile_seeds`` (seed membership) ∪ ``profile_candidates`` rows whose
-``saved_at`` is set. ``tags_for_paper`` returns the union, dedup'd.
+``vaulted_at`` is set. ``tags_for_paper`` returns the union, dedup'd.
 
 Dismiss state lives on ``profile_candidates.dismissed_at`` and is the
 "trash" record — there's no UI for it but the column is the durable
@@ -78,7 +80,7 @@ def list_for_user(
                  JOIN profiles pr ON pr.id = pc.profile_id
                  WHERE pc.openalex_id = p.openalex_id
                    AND pr.user_id = ?
-                   AND pc.saved_at IS NOT NULL
+                   AND pc.vaulted_at IS NOT NULL
                )
                OR EXISTS (
                  SELECT 1
@@ -110,7 +112,7 @@ def list_for_user(
               WHERE pc.openalex_id = p.openalex_id
                 AND pr.user_id = ?
                 AND pr.slug = ?
-                AND pc.saved_at IS NOT NULL
+                AND pc.vaulted_at IS NOT NULL
             )
            -- The user's upload of a work tagged by its public record: the
            -- work is the upload here too (list_docs drops the record).
@@ -123,7 +125,7 @@ def list_for_user(
                              WHERE ps.profile_id = pr.id AND ps.openalex_id = v.canonical_openalex_id)
                   OR EXISTS (SELECT 1 FROM profile_candidates pc
                              WHERE pc.profile_id = pr.id AND pc.openalex_id = v.canonical_openalex_id
-                               AND pc.saved_at IS NOT NULL))
+                               AND pc.vaulted_at IS NOT NULL))
             )
         ORDER BY added_at DESC, p.openalex_id
         """,
@@ -156,11 +158,11 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           JOIN researchers r        ON r.id = rp.researcher_id
           WHERE r.user_id = ?
           UNION
-          SELECT p.openalex_id, p.n_pages, p.first_seen_at, pc.saved_at AS event_at
+          SELECT p.openalex_id, p.n_pages, p.first_seen_at, pc.vaulted_at AS event_at
           FROM papers p
           JOIN profile_candidates pc ON pc.openalex_id = p.openalex_id
           JOIN profiles pr           ON pr.id = pc.profile_id
-          WHERE pr.user_id = ? AND pc.saved_at IS NOT NULL
+          WHERE pr.user_id = ? AND pc.vaulted_at IS NOT NULL
           UNION
           -- Every seed of the user's interests (module docstring, 3.).
           SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
@@ -220,7 +222,7 @@ def tag_counts_for_user(
           FROM profile_candidates pc
           JOIN profiles pr ON pr.id = pc.profile_id
           WHERE pr.user_id = ?
-            AND pc.saved_at IS NOT NULL
+            AND pc.vaulted_at IS NOT NULL
         ),
         -- With the user's uploads of the works there, as tags_for_paper.
         tagged AS (
@@ -275,7 +277,7 @@ def _tags(conn: sqlite3.Connection, user_id: int, openalex_id: str) -> list[str]
           JOIN profiles pr ON pr.id = pc.profile_id
           WHERE pr.user_id = ?
             AND pc.openalex_id = ?
-            AND pc.saved_at IS NOT NULL
+            AND pc.vaulted_at IS NOT NULL
         )
         ORDER BY slug
         """,

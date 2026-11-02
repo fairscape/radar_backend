@@ -354,8 +354,7 @@ def test_j1_wizard_to_feed_and_back(app, env):
     actions = sorted((e["openalex_id"], e["action"]) for e in events)
     assert actions.count((liked["id"], "saved")) == 2 and actions.count((liked["id"], "dismissed")) == 1
     assert actions.count((disliked["id"], "dismissed")) == 1 and actions.count((saved_then_undone["id"], "saved")) == 1
-    fb = _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback-threshold"))
-    assert fb["n_saved"] == 1 and fb["n_dismissed"] == 1
+    assert [p["id"] for p in _ok(_request(app, "GET", f"/api/profiles/{slug}/saved"))] == [liked["id"]]
 
     # Scan now again: the same papers come back; triage survives, nothing doubles.
     run2 = _scan(app, slug)
@@ -734,7 +733,7 @@ def test_j3_edit_a_saved_interest(app, env):
         assert len(seeds()) == n_seeds                                      # nothing written
     assert len(seeds()) == n_seeds                                          # discarded
     # Reads on the page still answer.
-    for path in ("detail", "runs", "feedback", "feedback-threshold", "topic-yield", "reranker-comparison", "umls", "terms", "researcher-topics"):
+    for path in ("detail", "runs", "feedback", "saved", "topic-yield", "reranker-comparison", "umls", "terms", "researcher-topics"):
         _ok(_request(app, "GET", f"/api/profiles/{slug}/{path}"))
 
 
@@ -1172,7 +1171,7 @@ def test_j5_stale_tabs_patch_and_scan_drafts(app, env):
     assert res.status_code in (200, 400, 404, 409), res.text
     for path, method, body in (("topics/preview", "GET", None), ("topics", "PUT", {"selected_topic_ids": []}),
                                ("recompute-coherence", "POST", None), ("recompute-topics", "POST", None),
-                               ("dry-run", "POST", None), ("feedback-threshold", "GET", None), ("runs", "GET", None),
+                               ("dry-run", "POST", None), ("saved", "GET", None), ("runs", "GET", None),
                                ("feedback", "GET", None), ("topic-yield", "GET", None), ("reranker-comparison", "GET", None),
                                ("terms", "GET", None), ("umls", "GET", None), ("umls", "POST", None)):
         res = _request(app, method, f"/api/profiles/{d}/{path}", json=body) if body is not None else _request(app, method, f"/api/profiles/{d}/{path}")

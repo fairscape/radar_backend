@@ -408,15 +408,17 @@ class CardActionResponse(_Model):
     profile: str | None = None
 
 
-class FeedbackThresholdResponse(_Model):
-    """What the interest's saves and dismisses say the threshold should be."""
+class SavedPaper(_Model):
+    """A paper saved in one interest: its Saved tab (FUNCTIONAL_SPEC 5.2-3)."""
 
-    n_saved: int
-    n_dismissed: int
-    min_events: int
-    # None until there are min_events triaged papers with at least one save.
-    suggested: float | None = None
-    threshold: float | None = None
+    id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    score: float | None = None
+    saved_at: str
+    is_seed: bool = False
 
 
 class FeedbackEventOut(_Model):

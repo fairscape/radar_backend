@@ -150,7 +150,7 @@ def test_second_user_cannot_touch_first_users_interest(app, env):
         ("GET", f"/api/profiles/{slug}/feedback", {}),
         ("GET", f"/api/profiles/{slug}/topic-yield", {}),
         ("GET", f"/api/profiles/{slug}/reranker-comparison", {}),
-        ("GET", f"/api/profiles/{slug}/feedback-threshold", {}),
+        ("GET", f"/api/profiles/{slug}/saved", {}),
         ("GET", f"/api/profiles/{slug}/umls", {}),
         ("GET", f"/api/profiles/{slug}/terms", {}),
         ("POST", f"/api/profiles/{slug}/dry-run", {}),

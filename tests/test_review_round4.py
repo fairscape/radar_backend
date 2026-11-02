@@ -83,27 +83,7 @@ def test_below_the_bar_is_ordered_by_similarity(tmp_path):
 # --- H2: the feedback suggestion when the top save rounds up ----------------
 
 
-def _triaged(conn, pid, saves, dismisses):
-    for i, (s, saved) in enumerate([(s, True) for s in saves] + [(d, False) for d in dismisses]):
-        oa = f"W{i}"
-        conn.execute("INSERT INTO papers (openalex_id, title, source) VALUES (?, 't', 'openalex')", (oa,))
-        conn.execute(
-            "INSERT INTO profile_candidates (profile_id, openalex_id, score, score_raw, tier_used, fetched_at,"
-            " saved_at, dismissed_at) VALUES (?, ?, ?, ?, 'topic', datetime('now'), ?, ?)",
-            (pid, oa, s, s, "2026-10-01" if saved else None, None if saved else "2026-10-01"))
-    conn.commit()
-
-
-def test_a_top_save_that_rounds_up_does_not_divide_by_zero(tmp_path):
-    from rag_lib.feedback.autotune import recommend_threshold
-
-    conn, uid = _db(tmp_path)
-    pid = _live(conn, uid, "I", threshold=0.85)
-    # Only the top save clears the dismisses, and 0.9126 rounds up to 0.913.
-    _triaged(conn, pid, [0.9126], [0.86 + i * 0.001 for i in range(29)])
-    th = recommend_threshold(conn, pid)
-    assert th == 0.912          # rounded down: the save it was cut at stays in
-    assert th <= 0.9126
+# The threshold-from-feedback test lived here: removed with it (FUNCTIONAL_SPEC 5.2-5).
 
 
 # --- M1: no commit (or trial) while an import is still attaching seeds ------

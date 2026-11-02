@@ -2,7 +2,8 @@
 
 Append-only DB mirror of the per-user JSONL feedback log. Inserts are
 fire-and-forget (the JSONL line is the canonical record); reads back
-the recent rows for the profile detail panel and the autotune sweep.
+the recent rows for the profile detail panel. Nothing scores or fits
+from them (FUNCTIONAL_SPEC 5.2).
 """
 
 from __future__ import annotations
@@ -126,43 +127,9 @@ def total_for_profile(conn: sqlite3.Connection, profile_id: int) -> int:
     return int(row["n"])
 
 
-def scored_save_dismiss_for_profile(
-    conn: sqlite3.Connection, profile_id: int, *, limit: int | None = None
-) -> list[sqlite3.Row]:
-    """Saved/dismissed events with non-NULL score, newest first.
-
-    Used by the autotune sweep — needs ``(action, score)`` only.
-    """
-    if limit is None:
-        return conn.execute(
-            """
-            SELECT action, score
-            FROM feedback_events
-            WHERE profile_id = ?
-              AND action IN ('saved', 'dismissed')
-              AND score IS NOT NULL
-            ORDER BY ts DESC, id DESC
-            """,
-            (profile_id,),
-        ).fetchall()
-    return conn.execute(
-        """
-        SELECT action, score
-        FROM feedback_events
-        WHERE profile_id = ?
-          AND action IN ('saved', 'dismissed')
-          AND score IS NOT NULL
-        ORDER BY ts DESC, id DESC
-        LIMIT ?
-        """,
-        (profile_id, limit),
-    ).fetchall()
-
-
 __all__ = [
     "insert",
     "recent_for_profile",
     "count_by_action",
     "total_for_profile",
-    "scored_save_dismiss_for_profile",
 ]

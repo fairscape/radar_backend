@@ -305,8 +305,7 @@ def test_probe_feedback_after_undo(app, env):
     print("feedback after undo:", [(x["action"], x["openalex_id"]) for x in fb])
     det = _ok(_request(app, "GET", f"/api/profiles/{SLUG}/detail", headers=A))
     print("detail feedbackLog:", det["feedbackLog"], det["profile"]["saves30"])
-    ft = _ok(_request(app, "GET", f"/api/profiles/{SLUG}/feedback-threshold", headers=A))
-    print("feedback-threshold:", ft)
+    print("saved:", _ok(_request(app, "GET", f"/api/profiles/{SLUG}/saved", headers=A)))
     # below-the-bar dismiss
     conn = connect(env)
     conn.execute("UPDATE profile_candidates SET score_raw = 0.5 WHERE openalex_id = 'W2000049'")

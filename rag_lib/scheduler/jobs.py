@@ -4,10 +4,6 @@ Each function here is the entry point a scheduled job lands in. They
 must be importable by their dotted path (APScheduler ``add_job`` stores
 the callable as a reference) and own their DB connection — the
 foreground request connection isn't safe to share across threads.
-
-Phase 8 will wrap ``gather_for_profile`` to chain an autotune pass on
-each successful run; keep the gather body factored so that hook can
-slot in without refactoring the call site.
 """
 
 from __future__ import annotations

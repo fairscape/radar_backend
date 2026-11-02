@@ -58,8 +58,7 @@ def test_b2_feedback_log_records_the_unsave(app, env):
     assert det["profile"]["saves30"] == 0
     assert len(det["feedbackLog"]) == 2
     assert "UNSAVED" in det["feedbackLog"][0] and "SAVED" in det["feedbackLog"][1]
-    ft = _ok(_request(app, "GET", f"/api/profiles/{SLUG}/feedback-threshold", headers=A))
-    assert ft["n_saved"] == 0
+    assert _ok(_request(app, "GET", f"/api/profiles/{SLUG}/saved", headers=A)) == []
     # The same for dismiss and its undo; a repeated undo logs nothing.
     _ok(_request(app, "POST", "/api/radar/cards/dismiss", json={"card_id": cid, "profile": SLUG, "on": True}, headers=A))
     _ok(_request(app, "POST", "/api/radar/cards/dismiss", json={"card_id": cid, "profile": SLUG, "on": False}, headers=A))

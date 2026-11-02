@@ -424,11 +424,10 @@ def test_save_is_idempotent_and_feedback_is_logged_once(app):
     assert res[3].json()["state"] is None
 
 
-def test_feedback_threshold_endpoint(app):
+def test_feedback_threshold_endpoint_is_gone(app):
+    """Saves and dismisses no longer suggest a threshold (FUNCTIONAL_SPEC 5.2-5)."""
     (res,) = _requests(app, [("GET", "/api/profiles/chromatin/feedback-threshold", {})])
-    body = res.json()
-    assert res.status_code == 200
-    assert body["n_saved"] == 0 and body["suggested"] is None and body["min_events"] == 30
+    assert res.status_code == 404
 
 
 def test_scan_now_is_refused_while_a_scan_runs(app, tmp_path):

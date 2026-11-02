@@ -54,8 +54,7 @@ def _check(app, env, slug, log, fitted):
                       " JOIN papers p ON p.openalex_id = pc.openalex_id"
                       f" WHERE pc.profile_id=? AND pc.saved_at IS NOT NULL AND {NOT_SEED} AND {IN_YEARS}", row["id"])["n"]
     assert prof["saves30"] == n_saved_db
-    thr_view = _ok(_request(app, "GET", f"/api/profiles/{slug}/feedback-threshold"))
-    assert thr_view["threshold"] == pytest.approx(thr)
+    assert prof["threshold"] == pytest.approx(thr)
     # Topics: detail = stored
     stored = json.loads(row["topic_filters_json"] or "{}")
     assert {t["id"]: bool(t.get("on", True)) for t in stored.get("topics") or []} == {t["id"]: t["on"] for t in det["topics"]}

@@ -66,6 +66,7 @@ EXPECTED_VERSIONS = [
     "0035_researcher_work_marks",
     "0036_prosopia_docs",
     "0037_import_person",
+    "0038_vault_and_unsave",
 ]
 
 

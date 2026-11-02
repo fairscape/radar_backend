@@ -2,8 +2,9 @@
 
 Append-only record of triage decisions (save / dismiss / snooze). The
 canonical store is per-user JSONL on disk; the DB mirror in
-``feedback_events`` exists for queries (profile detail panel, autotune
-sweep, ``GET /api/profiles/{key}/feedback``).
+``feedback_events`` exists for queries (profile detail panel,
+``GET /api/profiles/{key}/feedback``). Nothing scores or fits from it
+(FUNCTIONAL_SPEC 5.2).
 """
 
 from .log import (
