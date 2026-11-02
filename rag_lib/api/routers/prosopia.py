@@ -35,7 +35,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ...openalex_status import OpenAlexUnavailable
 from ...redact import public_error
-from ..services.researchers import ResearcherExists
 
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
@@ -301,6 +300,7 @@ _launch = launch_import
 def orcid_works(
     orcid: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     openalex_client: Annotated[
         object | None, Depends(get_import_openalex_client)
@@ -326,15 +326,15 @@ def orcid_works(
         listing = orcid_service.list_works(oid, client)
     except orcid_service.OrcidNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except (OpenAlexUnavailable, ResearcherExists):
-        # A 503 with the pause, a 409 with the researcher (app handlers).
+    except OpenAlexUnavailable:
+        # A 503 with the pause (app handler).
         raise
     except Exception as exc:  # noqa: BLE001 — upstream trouble is a 502
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"could not read works for ORCID {oid} from OpenAlex: {public_error(exc)}",
         ) from exc
-    return OrcidWorksResponse(**listing)
+    return OrcidWorksResponse(**listing, saved_profile=_saved_profile(db, user, "orcid", oid, oid))
 
 
 @router.post("/orcid", response_model=ProsopiaImportStart)
@@ -405,8 +405,8 @@ def import_orcid(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
             ) from exc
-        except (OpenAlexUnavailable, ResearcherExists):
-            # A 503 with the pause, a 409 with the researcher (app handlers).
+        except OpenAlexUnavailable:
+            # A 503 with the pause (app handler).
             raise
         except Exception as exc:  # noqa: BLE001 — OpenAlex could not be read
             raise HTTPException(
@@ -421,29 +421,45 @@ def import_orcid(
 @router.get("/prosopia/works", response_model=ProsopiaWorksResponse)
 def prosopia_works(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     ref: str = Query(..., description="Profile slug, profile URL or ORCID"),
     base_url: str | None = Query(default=None),
     prosopia_client: Annotated[object | None, Depends(get_prosopia_client)] = None,
+    openalex_client: Annotated[object | None, Depends(get_import_openalex_client)] = None,
 ) -> ProsopiaWorksResponse:
     """The papers on a Prosopia profile, for the user to pick from.
 
     Read-only counterpart of the kick-off: same ref forms, same 400 /
     404 / 502, nothing created. Declared before ``/prosopia/{run_id}``
-    so "works" is not parsed as a run id.
+    so "works" is not parsed as a run id. Each paper's OpenAlex id is the
+    one OpenAlex has today (FUNCTIONAL_SPEC M.4 rule 6).
     """
+    from ...openalex_client import OpenAlexClient
     from ..services import prosopia as prosopia_service
 
     try:
         listing = prosopia_service.list_works(
             ref, base_url=base_url or settings.RADAR_PROSOPIA_BASE_URL,
             prosopia_client=prosopia_client,
+            openalex_client=openalex_client or OpenAlexClient(mailto=_users_repo.mailto_from_row(user, settings.RADAR_DEFAULT_MAILTO)),
         )
     except prosopia_service.ProsopiaError as exc:
         raise prosopia_http_error(exc, ref) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return ProsopiaWorksResponse(**listing)
+    return ProsopiaWorksResponse(**listing, saved_profile=_saved_profile(
+        db, user, "prosopia", listing["slug"], listing.get("orcid")))
+
+
+def _saved_profile(conn: sqlite3.Connection, user: sqlite3.Row, source: str, key: str,
+                   orcid: str | None) -> dict | None:
+    """The researcher profile the user already has for this person, for
+    the picker's "add to <name>'s researcher profile" (FUNCTIONAL_SPEC M.2a)."""
+    from ..services import researchers as researchers_service
+
+    row = researchers_service.saved_person(conn, user_id=int(user["id"]), source=source, key=key, orcid=orcid)
+    return None if row is None else {"id": int(row["id"]), "name": row["name"] or key}
 
 
 @router.get("/prosopia/{run_id}", response_model=ProsopiaImportStatus)

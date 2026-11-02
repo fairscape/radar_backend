@@ -75,6 +75,8 @@ class WorkCache:
 
     by_doi: dict[str, dict] = field(default_factory=dict)
     by_id: dict[str, dict] = field(default_factory=dict)
+    # Ids OpenAlex answered "no such work" for: not asked again.
+    absent: set[str] = field(default_factory=set)
 
     def __len__(self) -> int:  # pragma: no cover - diagnostics only
         return len(self.by_id) or len(self.by_doi)
@@ -197,28 +199,94 @@ def _best_title_match(
 # ----------------------------------------------------------------------
 
 
+def current_works(
+    oa_ids: Iterable[str | None],
+    client: Any,
+    *,
+    batch_size: int = DOI_BATCH_SIZE,
+) -> tuple[dict[str, dict], set[str]]:
+    """OpenAlex's work today for each id, keyed by the id asked for (bare,
+    upper case), and the ids it has no work for.
+
+    OpenAlex merges duplicate works; a merged-away id still answers, with
+    the work it went into. Prosopia keeps the id it was given, so its
+    records name such ids (FUNCTIONAL_SPEC M.4 rule 6): read here, as the
+    papers come in, the rest of the app sees only current ids.
+
+    One request per 50 ids; an id the batch does not answer by its own id
+    was merged (or is unknown) and is asked for alone. A batch that fails
+    is skipped (those ids are left to the caller's own lookup);
+    ``OpenAlexUnavailable`` is raised (FUNCTIONAL_SPEC F2).
+    """
+    wanted: list[str] = []
+    for raw in oa_ids:
+        code = _normalize_openalex_id(raw)
+        if code and code not in wanted:
+            wanted.append(code)
+    found: dict[str, dict] = {}
+    absent: set[str] = set()
+    n_merged = 0
+    for start in range(0, len(wanted), batch_size):
+        chunk = wanted[start:start + batch_size]
+        try:
+            works = client.paginate_filter("ids.openalex:" + "|".join(chunk), per_page=batch_size)
+        except OpenAlexUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — left to per-paper lookups
+            log.warning("prosopia.id_batch_failed", n=len(chunk),
+                        reason=type(exc).__name__, detail=str(exc)[:200])
+            continue
+        got = {_normalize_openalex_id(w.get("id")): w for w in works or []}
+        for code in chunk:
+            if code in got:
+                found[code] = got[code]
+                continue
+            work, unreachable = _get_work_retrying(client, code)
+            if work is not None:
+                found[code] = work
+                n_merged += _normalize_openalex_id(work.get("id")) != code
+            elif not unreachable:
+                absent.add(code)
+    log.info("prosopia.current_ids", n_ids=len(wanted), n_found=len(found),
+             n_merged=n_merged, n_absent=len(absent))
+    return found, absent
+
+
 def prefetch_works(
     records: Iterable[PaperRecord],
     client: Any,
     *,
     batch_size: int = DOI_BATCH_SIZE,
 ) -> WorkCache:
-    """One request per 50 DOIs instead of one request per paper.
+    """One request per 50 ids, then per 50 DOIs, instead of one per paper.
 
-    Every record that carries a DOI goes into the batch, so the
-    identifier rungs collapse into a handful of round trips. A batch that
-    fails is logged and skipped; the ladder then falls back to per-paper
-    lookups for those records, which is slower but not wrong.
+    Records with an OpenAlex id are read by id (:func:`current_works`,
+    which also turns a merged id into the work it went into); the rest go
+    into the DOI batch, so the identifier rungs collapse into a handful
+    of round trips. A batch that fails is logged and skipped; the ladder
+    then falls back to per-paper lookups for those records, which is
+    slower but not wrong.
     """
+    records = list(records)
+    cache = WorkCache()
+    by_code, cache.absent = current_works((r.openalex_id for r in records), client, batch_size=batch_size)
+    for code, work in by_code.items():
+        cache.by_id[code] = work
+        cache.by_id[_normalize_openalex_id(work.get("id"))] = work
+        doi = normalize_doi(work.get("doi"))
+        if doi:
+            cache.by_doi[doi] = work
+
     dois: list[str] = []
     seen: set[str] = set()
     for record in records:
+        if _normalize_openalex_id(record.openalex_id) in by_code:
+            continue
         doi = normalize_doi(record.doi)
         if doi and doi not in seen:
             seen.add(doi)
             dois.append(doi)
 
-    cache = WorkCache()
     for start in range(0, len(dois), batch_size):
         chunk = dois[start:start + batch_size]
         filter_str = "doi:" + "|".join(chunk)
@@ -242,6 +310,8 @@ def prefetch_works(
             if wid:
                 cache.by_id[wid] = work
 
+    # A work the DOI batch brought under an id asked for is not absent.
+    cache.absent -= set(cache.by_id)
     log.info(
         "prosopia.prefetch",
         n_dois=len(dois), n_works=len(cache.by_id), n_batches=-(-len(dois) // batch_size),
@@ -353,7 +423,7 @@ def resolve_seed(
 
     oa_id = _normalize_openalex_id(record.openalex_id)
     id_unreachable = False
-    if oa_id:
+    if oa_id and not (cache and oa_id in cache.absent):
         work = (cache.by_id.get(oa_id) if cache else None)
         if work is None:
             work, id_unreachable = _get_work_retrying(client, oa_id)

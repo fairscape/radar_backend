@@ -211,9 +211,8 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(ResearcherExists)
     async def _researcher_exists(request: Request, exc: ResearcherExists):
-        # The wizard's import of a person already stored: the draft does not
-        # change the stored researcher (FUNCTIONAL_SPEC D). ``researcher``
-        # lets the wizard link to that profile.
+        # The Profiles page's import of a person already stored (O.2 D).
+        # ``researcher`` lets the page open that profile.
         return JSONResponse(status_code=409, content={
             "detail": str(exc), "researcher": {"id": exc.researcher_id, "name": exc.name}})
 

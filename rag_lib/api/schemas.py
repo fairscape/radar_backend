@@ -144,6 +144,13 @@ class VaultDoc(_Model):
     # 'pdf': read from this user's uploaded file (OpenAlex has none);
     # None: OpenAlex's, or no abstract (FUNCTIONAL_SPEC P.5 Q2).
     abstractSource: str | None = None
+    # Listed as an interest's seed (tag / detail), sharing its title with
+    # another seed of it (FUNCTIONAL_SPEC M.4): "title" (title duplicate:
+    # one of them is an upload or an unmatched record) or "possible"
+    # (possible duplicate: OpenAlex works). ``sameTitleGroup``: the same for
+    # the seeds of one title. Both stay seeds; the user removes one.
+    sameTitle: str | None = None
+    sameTitleGroup: str | None = None
 
 
 class Seed(_Model):
@@ -162,6 +169,9 @@ class Seed(_Model):
     source: str | None = None
     sourceResearcherId: int | None = None
     sourceResearcherName: str | None = None
+    # As VaultDoc.sameTitle / sameTitleGroup.
+    sameTitle: str | None = None
+    sameTitleGroup: str | None = None
 
 
 class SeedUmlsStatus(_Model):
@@ -691,12 +701,20 @@ class ProsopiaWork(_Model):
     n_authors: int | None = None
 
 
+class SavedProfileRef(_Model):
+    id: int
+    name: str
+
+
 class ProsopiaWorksResponse(_Model):
     """``GET /api/import/prosopia/works`` — the profile's papers, to pick from."""
 
     slug: str
     name: str | None = None
     works: list[ProsopiaWork]
+    # The researcher profile the user already has for this person: the
+    # "save as a researcher profile" box adds to it (FUNCTIONAL_SPEC M.2a).
+    saved_profile: SavedProfileRef | None = None
 
 
 class OrcidWork(_Model):
@@ -740,6 +758,9 @@ class OrcidWorksResponse(_Model):
     orcid: str
     name: str | None = None
     works: list[OrcidWork]
+    # The researcher profile the user already has for this person: the
+    # "save as a researcher profile" box adds to it (FUNCTIONAL_SPEC M.2a).
+    saved_profile: SavedProfileRef | None = None
     # More works than are listed: the newest ``orcid.MAX_WORKS`` are.
     truncated: bool = False
     # The person's ORCID works list could be read. When not, nothing says
@@ -809,6 +830,13 @@ class ProsopiaImportResult(_Model):
     researcher_id: int | None = None
     name: str
     drafted: int
+    # New seeds of the interest: fewer than ``drafted`` where some were seeds
+    # already (FUNCTIONAL_SPEC M.4). None from a run recorded before this.
+    seeded: int | None = None
+    # Added to a researcher profile the user already had, and its name
+    # (FUNCTIONAL_SPEC M.2a); null otherwise.
+    added_to_profile: int | None = None
+    profile_name: str | None = None
     resolved_by: dict[str, int] = Field(default_factory=dict)
     unresolved: list[str] = Field(default_factory=list)
 

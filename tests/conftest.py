@@ -80,6 +80,56 @@ def _no_orcid_registry(request, monkeypatch):
     monkeypatch.setattr(orcid_service, "fetch_record", lambda *a, **k: reg.RegistryRecord())
 
 
+@pytest.fixture(autouse=True)
+def _no_default_paths(tmp_path, monkeypatch):
+    """Every test's database, vault and Chroma are under its tmp dir.
+
+    The defaults are ``data/radar.db`` and friends, relative to the cwd --
+    the repository, whose ``data`` is a link to a real data directory. A
+    test that built the app without the ``env`` fixture migrated and wrote
+    that database (2026-11-01). A fixture that sets its own paths (``env``)
+    runs after this and wins.
+    """
+    from rag_lib.api import settings as settings_module
+
+    # Read now: a test may replace ``get_settings`` with a plain function.
+    get_settings = settings_module.get_settings
+    monkeypatch.setenv("RADAR_DB_PATH", str(tmp_path / "default-radar.db"))
+    monkeypatch.setenv("RADAR_VAULT_DIR", str(tmp_path / "default-vault"))
+    monkeypatch.setenv("RADAR_CHROMA_DIR", str(tmp_path / "default-chroma"))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+class OfflineOpenAlex(RuntimeError):
+    """A test reached api.openalex.org with a client nobody stubbed."""
+
+
+@pytest.fixture(autouse=True)
+def _no_live_openalex(monkeypatch):
+    """A real ``OpenAlexClient`` cannot reach the network in a test.
+
+    A route that builds its own client when none is injected (the Prosopia
+    works listing reads ids from OpenAlex, FUNCTIONAL_SPEC M.4 rule 6) went
+    to the real service from a test that stubbed only Prosopia: slow, on
+    the shared quota, and answers that change. A test that wants OpenAlex
+    hands in a stub; this makes the real one fail like an unreachable
+    service, which the callers already handle. At the network layer, so a
+    test driving the client with a fake session is not affected.
+    """
+    import requests
+
+    real = requests.Session.request
+
+    def request(self, method, url, *args, **kwargs):
+        if "openalex.org" in str(url):
+            raise requests.ConnectionError(OfflineOpenAlex(f"offline test reached {url}"))
+        return real(self, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(requests.Session, "request", request)
+
+
 @pytest.fixture
 def live_orcid_registry():
     """Opt back in to the real pub.orcid.org. Marks the test as networked."""

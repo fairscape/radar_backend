@@ -455,8 +455,11 @@ def attach_seed(
     whose earlier file (or public record) is a seed is added beside it, and
     the user removes either if they want one (FUNCTIONAL_SPEC 1.7). The
     public record of a work one of whose files is a seed is not added: a
-    search or an import naming the paper again is the same seed.
+    search or an import naming the paper again is the same seed. Nor is an
+    OpenAlex work with the DOI of one that is a seed: OpenAlex has not
+    merged the two records yet (FUNCTIONAL_SPEC M.4).
     """
+    from ...seed_duplicates import doi_twin
     from .versions import is_version, same_work_seeds
 
     # Read the work's seeds under the write lock: two requests, one adding
@@ -464,6 +467,9 @@ def attach_seed(
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     if not is_version(openalex_id) and same_work_seeds(conn, profile_id, openalex_id):
+        conn.commit()
+        return 0
+    if doi_twin(conn, profile_id, openalex_id) is not None:
         conn.commit()
         return 0
     if source is not None and source not in SEED_SOURCES:

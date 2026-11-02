@@ -1,7 +1,7 @@
 """The wizard's imports and the draft sandbox (FUNCTIONAL_SPEC D, S5-S8):
-a draft never changes a stored researcher, a researcher and papers it
-imported go when it is discarded, and an import OpenAlex cannot answer
-leaves nothing behind."""
+papers a draft imported go when it is discarded, and an import OpenAlex
+cannot answer leaves nothing behind. A stored researcher is changed only
+when the import is ticked to save to it (M.2a)."""
 
 from __future__ import annotations
 
@@ -42,10 +42,12 @@ def _wizard_import(app, ids, orcid=ORCID, **body):
 
 
 class Unanswering(StubOrcidOpenAlex):
-    """Lists the author's works, then cannot answer for them (quota)."""
+    """Lists the author's works, then cannot answer for them (quota): every
+    lookup after the listing -- by id (the batch reading current ids, M.4
+    rule 6), by DOI, one by one -- is refused."""
 
     def paginate_filter(self, filter_str, **kw):
-        if filter_str.startswith("doi:"):
+        if not filter_str.startswith("author.orcid:"):
             raise OpenAlexUnavailable("quota", detail="429")
         return super().paginate_filter(filter_str, **kw)
 
@@ -92,35 +94,8 @@ def test_s6_a_draft_built_from_a_stored_researcher_leaves_it_as_it_was(env):
     assert _snapshot(env, ("papers", "paper_embeddings", "researchers", "researcher_papers")) == before
 
 
-def test_s7_the_wizard_does_not_import_a_stored_researcher_again(env):
-    app = _app(StubOrcidOpenAlex(WORKS))
-    rid = _stored_researcher(app)
-    before = _snapshot(env)
-    r = _wizard_import(app, ["W1"], name="Again")
-    assert r.status_code == 409, r.text
-    assert r.json()["researcher"]["id"] == rid and "Nothing was changed" in r.json()["detail"]
-    assert _snapshot(env) == before
-    # Nor into an existing draft.
-    d = _request(app, "POST", "/api/profiles/draft", json={"name": "Mine"}).json()["slug"]
-    before = _snapshot(env)
-    r = _wizard_import(app, ["W1"], into=d)
-    assert r.status_code == 409 and _snapshot(env) == before
-
-
-def test_the_same_person_under_prosopia_is_a_stored_researcher_too(env):
-    from rag_lib.db.repos import users as users_repo
-
-    conn = connect(env)
-    try:
-        uid = int(users_repo.get_by_email(conn, "demo@example.com")["id"])
-        conn.execute("INSERT INTO researchers (user_id, source, key, name, orcid) VALUES (?, 'prosopia', 'jn', 'J N', ?)",
-                     (uid, ORCID.lower()))
-        conn.commit()
-    finally:
-        conn.close()
-    app = _app(StubOrcidOpenAlex(WORKS))
-    r = _wizard_import(app, ["W1"])
-    assert r.status_code == 409, r.text
+# S7 and the same person under Prosopia (a stored researcher refused, 409)
+# gave way to M.2a: tests/test_m2a_saved_researcher.py (M-37, M-42).
 
 
 def test_more_papers_of_the_drafts_own_person_can_be_added(env):

@@ -52,7 +52,7 @@ from ...db.repos import (
     gather_runs as gather_runs_repo,
     versions as versions_repo,
 )
-from ... import content_topics, openalex_status
+from ... import content_topics, openalex_status, seed_duplicates
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
 from ...openalex_client import OpenAlexClient
@@ -460,10 +460,34 @@ def list_docs(
     # we don't re-open the persistent client per row.
     collection = _try_open_user_collection(settings, user_id) if settings else None
     numbers = versions_repo.version_numbers(conn, user_id)
-    return [
+    docs = [
         _row_to_vault_doc(conn, user_id, r, settings=settings, collection=collection, numbers=numbers)
         for r in rows
     ]
+    return _with_same_title(conn, user_id, tag, docs)
+
+
+def _with_same_title(conn: sqlite3.Connection, user_id: int, tag: str | None, docs: list[dict]) -> list[dict]:
+    """An interest's docs (``tag``) with its seeds sharing a title marked
+    and listed together (FUNCTIONAL_SPEC M.4)."""
+    if tag in (None, "", "all"):
+        return docs
+    row = conn.execute("SELECT id FROM profiles WHERE user_id = ? AND slug = ?", (user_id, tag)).fetchone()
+    if row is None:
+        return docs
+    same = seed_duplicates.marks(conn, int(row[0]))
+    # A mark only where its copy is listed too: the public record of a work
+    # whose upload is listed is not (list_docs above).
+    shown: dict[str, int] = {}
+    for d in docs:
+        if d["id"] in same:
+            shown[same[d["id"]]["group"]] = shown.get(same[d["id"]]["group"], 0) + 1
+    same = {k: m for k, m in same.items() if shown.get(m["group"], 0) >= 2}
+    for d in docs:
+        m = same.get(d["id"])
+        if m:
+            d["sameTitle"], d["sameTitleGroup"] = m["kind"], m["group"]
+    return seed_duplicates.grouped(docs, same, lambda d: d["id"])
 
 
 def stats(conn: sqlite3.Connection, user_id: int, settings: Any | None = None) -> dict:

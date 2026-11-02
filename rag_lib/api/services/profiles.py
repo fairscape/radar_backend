@@ -26,6 +26,7 @@ from rag_lib.db.repos import (
     profiles as profiles_repo,
     versions as versions_repo,
 )
+from rag_lib import seed_duplicates
 from rag_lib.feedback.log import format_event_line
 
 from ..mappers import (
@@ -141,6 +142,14 @@ def get_profile_detail(
             continue
         seed_rows.append(seed_row_to_seed(paper_row, idx=idx, coh_to_centroid=loo.get(oa_id),
                                           version=numbers.get(oa_id)))
+    # Seeds sharing a title are marked and listed together (M.4); idx
+    # numbers the list as shown.
+    same = seed_duplicates.marks(conn, profile_id)
+    seed_rows = [
+        s.model_copy(update={"idx": i, "sameTitle": same.get(s.id, {}).get("kind"),
+                             "sameTitleGroup": same.get(s.id, {}).get("group")})
+        for i, s in enumerate(seed_duplicates.grouped(seed_rows, same, lambda s: s.id), start=1)
+    ]
 
     # Topics from profile_filters; coherence histogram from seed embeddings.
     topic_filters = profiles_repo.topic_filters(conn, profile_id)

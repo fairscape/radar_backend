@@ -115,15 +115,8 @@ def test_m11_a_ticked_orcid_import_saves_the_researcher(env):
     assert set(_q(env, "SELECT source FROM profile_seeds")) == {("researcher",)}
 
 
-def test_m13_a_person_with_a_saved_profile_is_pointed_at_it_ticked_or_not(env):
-    app = _app(StubProsopia(_profile()), _stub_openalex())
-    assert _import(app, source="prosopia", ref="sheffield-nathan").status_code == 200
-    for ticked in (False, True):
-        r = _wizard(app, save_profile=ticked)
-        assert r.status_code == 409, r.text
-        assert r.json()["researcher"]["name"] == "Nathan C. Sheffield"
-    assert _q(env, "SELECT COUNT(*) FROM researchers") == [(1,)]
-    assert _q(env, "SELECT COUNT(*) FROM profiles") == [(0,)]
+# M-13 (a person with a saved profile refused, 409) gave way to M.2a: see
+# tests/test_m2a_saved_researcher.py.
 
 
 def test_m14_two_drafts_of_one_person_are_independent(env):

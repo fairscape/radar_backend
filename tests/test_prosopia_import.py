@@ -74,6 +74,11 @@ class StubOpenAlex:
     def paginate_filter(self, filter_str, *, limit=None, per_page=200, sort=None):
         self.api_calls += 1
         self.calls.append(("paginate_filter", filter_str))
+        if self.batched and filter_str.startswith("ids.openalex:"):
+            # As OpenAlex answers it: a merged-away id brings the work it
+            # went into, under that work's id.
+            wanted = filter_str[len("ids.openalex:"):].split("|")
+            return [self.by_id[w] for w in wanted if w in self.by_id]
         if not self.batched or not filter_str.startswith("doi:"):
             return []
         wanted = filter_str[len("doi:"):].split("|")
@@ -371,8 +376,10 @@ def test_prefetch_batches_dois_and_keys_both_ways():
     }
     client = StubOpenAlex(by_doi=works)
     cache = prefetch_works(records, client)
-    # Two DOIs (the PMC record carries none) in one request.
-    assert client.api_calls == 1
+    # Two DOIs (the PMC record carries none) in one request. (The id
+    # batch comes first; this stub knows its works by DOI only.)
+    assert [c for c in client.calls if c[0] == "paginate_filter" and c[1].startswith("doi:")] == [
+        ("paginate_filter", "doi:10.1101/2025.11.03.685753|10.1101/2023.09.19.558267")]
     assert set(cache.by_doi) == set(works)
     assert set(cache.by_id) == {"W4415881950", "W4386953349"}
 

@@ -589,15 +589,14 @@ def prepare_import(
     # re-embed the same papers on the same GPU and leave two half-built
     # drafts behind. Checked here rather than in the router so the CLI and
     # the test path get it too.
-    refuse_if_importing(conn, user_id, oid, into, key=f"orcid:{oid}")
-    # A person already stored is not imported again from a draft: the
-    # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
     from . import researchers as researchers_service
-    into_row = target_draft(conn, user_id, into)
-    new_researcher = researchers_service.refuse_if_known(
-        conn, user_id=user_id, source="orcid", key=oid, orcid=oid,
-        draft_id=int(into_row["id"]) if into_row is not None else None,
-    )
+    known = researchers_service.saved_person(conn, user_id=user_id, source="orcid", key=oid, orcid=oid)
+    refuse_if_importing(conn, user_id, oid, into, key=f"orcid:{oid}")
+    # A person already stored (FUNCTIONAL_SPEC M.2a): ticked, the papers go
+    # into that profile -- its name stays as it is; unticked, the profile
+    # is not touched.
+    new_researcher = known is None
+    target_draft(conn, user_id, into)  # a draft that is not theirs: before OpenAlex is asked
 
     client = openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO))
     # check_registry=False: records_for reads only id/title/doi/year/venue,
@@ -619,7 +618,7 @@ def prepare_import(
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     draft_row, researcher_id = open_draft_for_import(
         conn, settings, save_profile=save_profile, new_researcher=new_researcher,
-        record_researcher=lambda: researchers_service.record_orcid_researcher(
+        record_researcher=lambda: int(known["id"]) if known is not None else researchers_service.record_orcid_researcher(
             conn, user_id=user_id, orcid=oid, name=listing["name"],
         ),
         user_id=user_id, target=target,

@@ -71,7 +71,7 @@ from ...prosopia_client import (
     read_summary,
     looks_like_orcid,
 )
-from ...prosopia_seeds import RUNGS, Person, _paper_id, normalize_doi, prefetch_works, resolve_seed
+from ...prosopia_seeds import RUNGS, Person, _normalize_openalex_id, _paper_id, current_works, normalize_doi, prefetch_works, resolve_seed
 from . import wizard as wizard_service
 
 
@@ -255,15 +255,18 @@ def _resolve_profile(ref: str, base_url: str | None, prosopia_client: Any | None
     return slug, client.fetch_profile(slug)
 
 
-def _work_summary(record: Any) -> dict[str, Any]:
+def _work_summary(record: Any, current: dict[str, dict] | None = None) -> dict[str, Any]:
+    """``current``: OpenAlex's work for a record's id (:func:`current_works`);
+    the listing carries its id, not a merged-away one Prosopia kept."""
     authors = [a for a in (getattr(record, "authors", None) or []) if a]
+    work = (current or {}).get(_normalize_openalex_id(record.openalex_id))
     return {
         "id": _paper_id(record),
         "title": (record.name or "").strip() or _paper_id(record),
         "year": record.year,
         "venue": record.journal or record.venue,
         "doi": normalize_doi(record.doi),
-        "openalex_id": record.openalex_id or None,
+        "openalex_id": (work or {}).get("id") or record.openalex_id or None,
         "cited_by_count": getattr(record, "cited_by_count", None),
         "authors": authors[:3],
         "n_authors": len(authors) or None,
@@ -276,6 +279,7 @@ def list_works(
     base_url: str | None = None,
     prosopia_client: Any | None = None,
     refresh: bool = False,
+    openalex_client: Any | None = None,
 ) -> dict[str, Any]:
     """The papers on a profile, slimmed for a pick list.
 
@@ -284,14 +288,29 @@ def list_works(
     user decides which papers to keep. ``refresh``: the read is "check for
     new papers" on a stored profile; the result also carries the profile
     itself (``profile``), whose fields the caller stores.
+
+    With ``openalex_client`` each record's OpenAlex id is the one OpenAlex
+    has today (FUNCTIONAL_SPEC M.4 rule 6). OpenAlex not answering leaves
+    the ids as Prosopia has them: the list is still worth showing, and
+    the import stops on its own (F2).
     """
+    from ...openalex_status import OpenAlexUnavailable
+
     slug, profile = _resolve_profile(ref, base_url, prosopia_client)
     if not profile.papers:
         raise ProfileEmpty(slug, refresh=refresh)
-    works = [_work_summary(r) for r in profile.papers]
+    current: dict[str, dict] = {}
+    if openalex_client is not None:
+        try:
+            current, _ = current_works((r.openalex_id for r in profile.papers), openalex_client)
+        except OpenAlexUnavailable as exc:
+            log.warning("prosopia.list_works_ids_unchecked", slug=slug, reason=str(exc)[:200])
+    works = [_work_summary(r, current) for r in profile.papers]
     works.sort(key=lambda w: (-(w["year"] or 0), w["title"]))
     log.info("prosopia.list_works", slug=slug, n=len(works))
     out = {"slug": slug, "name": profile.name or None, "works": works}
+    rid = str(getattr(profile, "rid", "") or "").strip().upper()
+    out["orcid"] = rid if looks_like_orcid(rid) else None
     if refresh:
         out["profile"] = profile
     return out
@@ -425,25 +444,24 @@ def prepare_import(
     from . import orcid as orcid_service
     from ...db.repos import researchers as researchers_repo
     rid = str(getattr(profile, "rid", "") or "").strip().upper()
-    known = researchers_repo.get_by_key(conn, user_id, "prosopia", slug)
+    from . import researchers as researchers_service
+    known = researchers_service.saved_person(
+        conn, user_id=user_id, source="prosopia", key=slug, orcid=rid if looks_like_orcid(rid) else None,
+    )
     orcid_service.refuse_if_importing(
         conn, user_id, rid if looks_like_orcid(rid) else None, into,
         researcher_id=int(known["id"]) if known is not None else None, key=f"prosopia:{slug}",
     )
-    # A person already stored is not imported again from a draft: the
-    # draft never changes a stored researcher (FUNCTIONAL_SPEC D).
-    from . import researchers as researchers_service
-    new_researcher = researchers_service.refuse_if_known(
-        conn, user_id=user_id, source="prosopia", key=slug,
-        orcid=rid if looks_like_orcid(rid) else None,
-        draft_id=int(target["id"]) if target is not None else None,
-    )
+    # A person already stored (FUNCTIONAL_SPEC M.2a): ticked, the papers go
+    # into that profile -- its name and text stay as they are; unticked,
+    # the profile is not touched.
+    new_researcher = known is None
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
     draft_row, researcher_id = open_draft_for_import(
         conn, settings, save_profile=save_profile, new_researcher=new_researcher,
-        record_researcher=lambda: researchers_service.record_prosopia_researcher(
+        record_researcher=lambda: int(known["id"]) if known is not None else researchers_service.record_prosopia_researcher(
             conn, user_id=user_id, slug=slug, profile=profile,
             base_url=base_url or DEFAULT_BASE_URL,
         ),
@@ -646,7 +664,7 @@ def run_import(
             _tick(reporter, i, f"Embedded {i} / {len(resolved)} seeds")
 
     _step(reporter, "persisting", total=len(resolved), message=f"Saving {len(resolved)} seeds")
-    drafted = _persist(conn, plan, resolved, vectors, run_id=run_id)
+    drafted, seeded, linked = _persist(conn, plan, resolved, vectors, run_id=run_id)
     log.info(
         "prosopia.import.done",
         slug=plan.slug, draft_slug=plan.draft_slug,
@@ -661,14 +679,34 @@ def run_import(
         "researcher_id": plan.researcher_id,
         "name": plan.draft_name or plan.slug,
         "drafted": drafted,
+        # Seeds this import added to the interest: less than ``drafted`` where
+        # some already were (the same work, or one with its DOI; M.4).
+        "seeded": seeded,
         "resolved_by": resolved_by,
         "unresolved": unresolved,
+        # Papers this added to a researcher profile the user already had
+        # (FUNCTIONAL_SPEC M.2a), said in the wizard's message.
+        **_added_to_saved(conn, plan, linked),
     }
 
 
+def _adds_to_saved(plan: ImportPlan) -> bool:
+    """A wizard / Edit interest import into a profile that was there before."""
+    return plan.profile_id is not None and plan.researcher_id is not None and not plan.new_researcher
+
+
+def _added_to_saved(conn: sqlite3.Connection, plan: ImportPlan, linked: int) -> dict:
+    if not _adds_to_saved(plan):
+        return {}
+    row = researchers_repo.get(conn, int(plan.researcher_id))
+    return {"added_to_profile": linked, "profile_name": (row["name"] if row is not None else None)}
+
+
 def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors: dict[str, Any], *,
-             run_id: int | None) -> int:
-    """Write what the first half resolved; returns how many papers.
+             run_id: int | None) -> tuple[int, int, int]:
+    """Write what the first half resolved; returns how many papers, how
+    many of them became new seeds of the interest, and how many were
+    added to the researcher profile.
 
     Two records of one paper (the same OpenAlex work) are one paper: the
     first is stored, the rest marked ``duplicate`` (FUNCTIONAL_SPEC O.2 H);
@@ -685,7 +723,7 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
     if plan.researcher_id is not None:
         have = {r["openalex_id"]: r["paper_id"] for r in conn.execute(
             "SELECT openalex_id, paper_id FROM researcher_papers WHERE researcher_id = ?", (plan.researcher_id,))}
-    drafted = 0
+    drafted = seeded = 0
     try:
         for record, resolution in resolved:
             oa_id = resolution.openalex_id
@@ -729,9 +767,21 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
                 if profiles_repo.attach_seed(conn, plan.profile_id, oa_id, source=plan.seed_source,
                                              researcher_id=plan.researcher_id):
                     done.append(("seed", oa_id))
+                    seeded += 1
             drafted += 1
 
-        if plan.researcher_id is not None:
+        linked = sum(1 for kind, _ in done if kind == "link")
+        if plan.researcher_id is not None and _adds_to_saved(plan):
+            # Papers picked for an interest, added to a profile the user
+            # already had (FUNCTIONAL_SPEC M.2a): what was taken is marked,
+            # nothing else -- the rest of the listing was not turned down
+            # for the profile, and it was not checked for new papers.
+            researchers_repo.set_work_marks(
+                conn, plan.researcher_id, skipped=set(),
+                duplicate=duplicate, taken={res.paper_id for _r, res in resolved} - duplicate,
+            )
+            researchers_repo.count_papers(conn, plan.researcher_id)
+        elif plan.researcher_id is not None:
             taken = {res.paper_id for _r, res in resolved}
             # Offered and left unticked: the listing less what was taken and
             # what the researcher already had (a refresh lists those too;
@@ -751,7 +801,7 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
         conn.rollback()
         _take_back(conn, plan, done)
         raise
-    return drafted
+    return drafted, seeded, linked
 
 
 def _take_back(conn: sqlite3.Connection, plan: ImportPlan, done: list[tuple]) -> None:

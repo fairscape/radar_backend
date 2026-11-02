@@ -243,6 +243,17 @@ def mark_imported(
     conn.commit()
 
 
+def count_papers(conn: sqlite3.Connection, researcher_id: int) -> None:
+    """``n_papers`` after papers were added, without stamping an import:
+    "imported" says when the profile was last read from its source."""
+    conn.execute(
+        "UPDATE researchers SET n_papers = (SELECT COUNT(*) FROM researcher_papers WHERE researcher_id = ?), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (researcher_id, researcher_id),
+    )
+    conn.commit()
+
+
 def set_last_run(conn: sqlite3.Connection, researcher_id: int, run_id: int) -> None:
     """The run to watch, at kick-off. ``imported_at`` waits for ``mark_imported``:
     stamped here it read "imported just now" for an import still running."""

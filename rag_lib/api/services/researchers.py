@@ -119,18 +119,14 @@ def _json_or_none(value: Any) -> str | None:
 
 
 class ResearcherExists(RuntimeError):
-    """The wizard's import names a person already stored as a researcher.
-
-    A draft never changes a stored researcher (FUNCTIONAL_SPEC D, plan A):
-    the interest is built from the papers the researcher already has, and
-    newer papers are added on the Profiles page first. The router answers
-    409 with the researcher, so the wizard can link to it.
+    """The Profiles page's import names a person already stored as a
+    researcher (FUNCTIONAL_SPEC O.2 D). The router answers 409 with the
+    researcher, so the page can open it. A wizard or Edit interest import
+    is not refused (M.2a, :func:`saved_person`).
     """
 
-    def __init__(self, researcher_id: int, name: str, *, message: str | None = None):
-        super().__init__(message or (
-            f"{name} is already one of your researcher profiles. Build the interest from that "
-            "profile's papers, or update the profile on the Profiles page first. Nothing was changed."))
+    def __init__(self, researcher_id: int, name: str, *, message: str):
+        super().__init__(message)
         self.researcher_id = int(researcher_id)
         self.name = name
 
@@ -159,28 +155,19 @@ def refuse_a_second_profile(conn: sqlite3.Connection, *, user_id: int, source: s
         "Open that profile to check it for new papers."))
 
 
-def refuse_if_known(
+def saved_person(
     conn: sqlite3.Connection, *, user_id: int, source: str, key: str, orcid: str | None,
-    draft_id: int | None = None,
-) -> bool:
-    """Raise ``ResearcherExists`` when the wizard would import a stored person.
+) -> sqlite3.Row | None:
+    """The researcher profile the user already has for the person a wizard
+    or Edit interest import names, if any (FUNCTIONAL_SPEC M.2a).
 
-    Not for the person of draft ``draft_id`` itself (more of their papers
-    added to the draft being built): a researcher that draft imported --
-    part of its sandbox -- or the one it is built from, saved when the
-    import was asked to (FUNCTIONAL_SPEC M.2). Returns whether the person
-    is new.
+    Not a refusal any more: unticked, the import only adds papers to the
+    draft and leaves the profile alone; ticked, the papers it brings that
+    the profile lacks are added to this profile instead of a second one
+    being made. The same person is the same source and key, or the same
+    ORCID under either source (M-42).
     """
-    row = researchers_repo.find_person(conn, user_id, source, key, orcid)
-    if row is None:
-        return True
-    if draft_id is not None and conn.execute(
-        """SELECT 1 FROM draft_owned WHERE profile_id = ? AND kind = 'researcher' AND item = ?
-           UNION ALL SELECT 1 FROM profiles WHERE id = ? AND is_draft = 1 AND researcher_id = ?""",
-        (int(draft_id), str(row["id"]), int(draft_id), int(row["id"])),
-    ).fetchone() is not None:
-        return False
-    raise ResearcherExists(int(row["id"]), row["name"] or key)
+    return researchers_repo.find_person(conn, user_id, source, key, orcid)
 
 
 def record_prosopia_researcher(
@@ -521,6 +508,7 @@ def works_for_refresh(
         listing = prosopia_service.list_works(
             row["key"], base_url=row["base_url"] or DEFAULT_BASE_URL,
             prosopia_client=prosopia_client, refresh=True,
+            openalex_client=openalex_client or OpenAlexClient(mailto=users_repo.contact_mailto(conn, user_id, settings.RADAR_DEFAULT_MAILTO)),
         )
         record_prosopia_researcher(conn, user_id=user_id, slug=row["key"],
                                    profile=listing.pop("profile"), base_url=row["base_url"])
