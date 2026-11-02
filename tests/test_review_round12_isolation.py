@@ -5,6 +5,10 @@ interest with candidates, and an uploaded PDF. User B then hits every
 read and mutating endpoint with A's ids/slugs. Expected: 404 (or 400/409
 for list-shaped bodies), never a 2xx that touches A's data and never a 5xx.
 Afterwards A's state is re-read and must be byte-for-byte what it was.
+
+Every API route is either hit by B here or on ``NO_USER_DATA`` with its
+reason; a route added later without either fails the sweep
+(FUNCTIONAL_SPEC 2.4).
 """
 
 from __future__ import annotations
@@ -31,6 +35,74 @@ from tests.test_researchers import _app, _request, env  # noqa: F401 -- fixture
 
 A = {"X-User-Email": "alice@example.com"}
 B = {"X-User-Email": "bob@example.com"}
+
+
+# Routes that read nothing of a user's: what B gets is what A gets.
+NO_USER_DATA = {
+    ("GET", "/api/health"): "service health",
+    ("GET", "/api/openalex/status"): "OpenAlex reachability",
+    ("GET", "/api/profiles/wizard/options"): "the embedders and selectors installed",
+    ("GET", "/api/users/me"): "the caller's own row (test_api_auth.py)",
+    ("PATCH", "/api/users/me"): "the caller's own row (test_api_auth.py)",
+}
+
+# Routes left out on purpose, with the reason.
+NOT_TESTED = {
+    # Vault chat is not tested and is being closed before launch; without a
+    # vector store it 500s here for anyone (to be settled when it is closed).
+    ("POST", "/api/chat"): "Vault chat (FUNCTIONAL_SPEC: not tested, closed before launch)",
+}
+
+
+def _api_routes(app):
+    """Full API path of every route object, by ``id()``.
+
+    The routers are included with a prefix; the route that answers a
+    request (``scope["route"]``) carries only its path inside its router.
+    Checked against the OpenAPI listing so a FastAPI that lays its routes
+    out differently fails here, not silently.
+    """
+    from fastapi.routing import APIRoute
+
+    full = {}
+    for entry in app.routes:
+        if isinstance(entry, APIRoute):
+            full[id(entry)] = (entry, entry.path)
+        elif hasattr(entry, "original_router"):
+            prefix = entry.include_context.prefix
+            for r in entry.original_router.routes:
+                if isinstance(r, APIRoute):
+                    full[id(r)] = (r, prefix + r.path)
+    ops = {(m, path) for r, path in full.values() for m in r.methods if path.startswith("/api")}
+    import re
+
+    listed = {(m.upper(), path) for path, item in app.openapi()["paths"].items() for m in item}
+    assert {(m, re.sub(r":\w+}", "}", p)) for m, p in ops} == listed  # OpenAPI drops ":path"
+    return ops, {k: path for k, (_, path) in full.items()}
+
+
+def _request_served(app, method, path, **kwargs):
+    """``_request``, also returning the route that answered."""
+    import asyncio
+
+    import httpx
+
+    seen = {}
+
+    async def recorder(scope, receive, send):
+        await app(scope, receive, send)
+        if scope["type"] == "http":
+            seen["route"] = scope.get("route")
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=recorder),
+                                         base_url="http://test") as client:
+                return await client.request(method, path, **kwargs)
+
+    r = asyncio.run(run())
+    route = seen.get("route")
+    return r, route
 
 
 class _FakeScheduler:
@@ -139,7 +211,8 @@ def _snapshot(env):
             "profiles": q("SELECT id, user_id, slug, name, is_draft, threshold, year_from, year_to, "
                           "topic_filters_json, researcher_id, interest_terms_json FROM profiles ORDER BY id"),
             "seeds": q("SELECT profile_id, openalex_id FROM profile_seeds ORDER BY 1, 2"),
-            "cands": q("SELECT profile_id, openalex_id, saved_at, dismissed_at FROM profile_candidates ORDER BY 1, 2"),
+            "cands": q("SELECT profile_id, openalex_id, saved_at, dismissed_at, vaulted_at, unsaved_at "
+                       "FROM profile_candidates ORDER BY 1, 2"),
             "sched": q("SELECT profile_id, cron, tz, enabled FROM profile_schedules ORDER BY 1"),
             "rpapers": q("SELECT researcher_id, openalex_id FROM researcher_papers ORDER BY 1, 2"),
             "uploads": q("SELECT user_id, openalex_id FROM paper_uploads ORDER BY 1, 2"),
@@ -152,14 +225,30 @@ def _snapshot(env):
 def test_user_b_cannot_read_or_touch_user_a(world):
     app, env = world["app"], world["env"]
     rid, run_id = world["rid"], world["run_id"]
+    # A is mid-Edit interest on 'A live', and has an ORCID researcher saved.
+    r = _request(app, "POST", f"/api/profiles/{world['live']}/edit", headers=A)
+    assert r.status_code == 200, r.text
+    copy = r.json()["slug"]
+    r = _request(app, "POST", "/api/researchers/import", headers=A,
+                 json={"source": "orcid", "ref": ORCID, "paper_ids": [WORKS[0]["id"]]})
+    assert r.status_code == 200, r.text
+    orcid_rid = r.json()["researcher_id"]
+    # What A is told it already has; B must be told nothing.
+    r = _request(app, "GET", f"/api/import/orcid/{ORCID}/works", headers=A)
+    assert r.status_code == 200 and r.json()["saved_profile"], r.text
+    r = _request(app, "GET", "/api/import/prosopia/works?ref=sheffield-nathan", headers=A)
+    assert r.status_code == 200 and r.json()["saved_profile"], r.text
     before = _snapshot(env)
     a_profiles_before = _request(app, "GET", "/api/profiles", headers=A).json()
     a_researchers_before = _request(app, "GET", "/api/researchers", headers=A).json()
 
     bad: list[tuple[str, str, int, str]] = []
+    served: set[tuple[str, str]] = set()
+    ops, full_path = _api_routes(app)
 
     def hit(method, path, expect=(404,), **kw):
-        r = _request(app, method, path, headers=B, **kw)
+        r, route = _request_served(app, method, path, headers=B, **kw)
+        served.add((method, full_path.get(id(route))))
         if r.status_code not in expect:
             bad.append((method, path, r.status_code, r.text[:200]))
         return r
@@ -172,15 +261,26 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     hit("PUT", "/api/researchers/order", expect=(400,), json={"ids": [rid]})
     hit("POST", f"/api/researchers/{rid}/interests", json={"name": "stolen"})
     hit("DELETE", f"/api/researchers/{rid}")
+    hit("GET", f"/api/researchers/{orcid_rid}")
+    r = hit("GET", "/api/researchers", expect=(200,)); assert r.json() == []
 
     # ---- import runs / into A's draft ----------------------------------------
     hit("GET", f"/api/import/prosopia/{run_id}")
     hit("POST", "/api/import/prosopia", json={"ref": "sheffield-nathan", "into": world["draft"]})
     hit("POST", "/api/import/orcid",
         json={"orcid": ORCID, "openalex_ids": [WORKS[0]["id"]], "into": world["draft"]})
+    r = hit("GET", f"/api/import/orcid/{ORCID}/works", expect=(200,))
+    assert r.json()["saved_profile"] is None, r.text
+    r = hit("GET", "/api/import/prosopia/works?ref=sheffield-nathan", expect=(200,))
+    assert r.json()["saved_profile"] is None, r.text
 
     # ---- every /{key} route, for a draft and a live interest of A's ---------
-    for s in (world["draft"], world["live"], world["plain"]):
+    r = hit("GET", "/api/profiles", expect=(200,)); assert r.json() == []
+    r = hit("GET", "/api/profiles/drafts", expect=(200,)); assert r.json() == []
+    # B's "discard my left-behind edits" leaves A's open copy alone.
+    r = hit("POST", "/api/profiles/drafts/discard-edits", expect=(200,), json={"tab": ""})
+    assert r.json() == {"discarded": 0}
+    for s in (world["draft"], world["live"], world["plain"], copy):
         r = hit("GET", f"/api/profiles/{s}", expect=(200,))
         assert r.json() is None, (s, r.text)                       # by design: null, not A's row
         r = hit("GET", f"/api/profiles/{s}/detail", expect=(200,))
@@ -199,6 +299,10 @@ def test_user_b_cannot_read_or_touch_user_a(world):
         hit("GET", f"/api/profiles/{s}/researcher-topics")
         hit("PUT", f"/api/profiles/{s}/researcher-topics", json={"enabled": True})
         hit("PUT", f"/api/profiles/{s}/researcher-topics", json={"enabled": False})
+        hit("PUT", f"/api/profiles/{s}/researcher-topics/not-interest", json={"topic_id": "T1", "choice": "add"})
+        hit("POST", f"/api/profiles/{s}/llm-topics")
+        hit("GET", f"/api/profiles/{s}/scan-topics")
+        hit("POST", f"/api/profiles/{s}/edit")
         hit("POST", f"/api/profiles/{s}/refit")
         hit("POST", f"/api/profiles/{s}/dry-run")
         hit("POST", f"/api/profiles/{s}/gather-now?days=1&limit=10")
@@ -220,6 +324,13 @@ def test_user_b_cannot_read_or_touch_user_a(world):
         hit("DELETE", f"/api/profiles/draft/{s}/seeds/{world['seed']}")
         hit("POST", f"/api/profiles/draft/{s}/seeds", json={"openalex_ids": [world["seed"]]})
         hit("POST", "/api/profiles", json={"slug": s, "threshold": 0.7, "selected_topic_ids": []})
+        # Edit interest's copy routes
+        hit("POST", f"/api/profiles/draft/{s}/edit-alive", json={"tab": "t"})
+        hit("GET", f"/api/profiles/draft/{s}/edit-state")
+        hit("GET", f"/api/profiles/draft/{s}/feed-papers")
+        hit("POST", f"/api/profiles/draft/{s}/save-edit")
+        hit("POST", f"/api/profiles/draft/{s}/discard-edit", json={"tab": "t"})
+        hit("DELETE", f"/api/profiles/{s}")
 
     # ---- radar cards ----------------------------------------------------------
     for card in world["cards"][:2]:
@@ -237,6 +348,7 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     r = hit("GET", f"/api/vault/docs?tag={world['live']}", expect=(200,)); assert r.json() == []
     r = hit("GET", "/api/vault/tags", expect=(200,)); assert r.json() == {"all": 0}
     r = hit("GET", "/api/vault/stats", expect=(200,)); assert r.json()["docs"] == 0
+    r = hit("GET", "/api/vault/meta", expect=(200,)); assert world["upload"] not in r.text
     # Upload "into" A's interest: refused (404), nothing stored for B either.
     files = {"file": ("bob.pdf", io.BytesIO(b"%PDF-1.4\nbob-bytes"), "application/pdf")}
     r = hit("POST", "/api/vault/upload", expect=(404,), files=files, data={"profile_slug": world["live"]})
@@ -252,6 +364,22 @@ def test_user_b_cannot_read_or_touch_user_a(world):
 
     # ---- chat history is per user ---------------------------------------
     r = hit("GET", "/api/chat/history", expect=(200,)); assert r.json() == []
+    hit("DELETE", "/api/chat/history", expect=(200, 204))
+    hit("GET", "/api/chat/providers", expect=(200,))
+
+    # ---- last, as it gives B papers of B's own ------------------------------
+    # B importing the same person makes B's own profile (and is then told of that one), never refreshes A's.
+    r = hit("POST", "/api/researchers/import", expect=(200,),
+            json={"source": "prosopia", "ref": "sheffield-nathan"})
+    r_b = r.json()["researcher_id"]
+    assert r_b not in (rid, orcid_rid)
+    r = hit("GET", "/api/import/prosopia/works?ref=sheffield-nathan", expect=(200,))
+    assert r.json()["saved_profile"]["id"] == r_b, r.text
+
+    # ---- every route was hit or is listed as reading no user data ------------
+    assert set(NO_USER_DATA) | set(NOT_TESTED) <= ops, "a listed route does not exist"
+    missing = ops - served - set(NO_USER_DATA) - set(NOT_TESTED)
+    assert not missing, "routes B never tried: " + ", ".join(sorted(f"{m} {p}" for m, p in missing))
 
     assert not bad, "\n".join(f"{m} {p} -> {c}: {t}" for m, p, c, t in bad)
     assert not world["fake"].jobs, "B scheduled a job on A's interest"
@@ -262,9 +390,12 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     try:
         b_uid = int(users_repo.get_by_email(conn, "bob@example.com")["id"])
         b_pids = {int(r[0]) for r in conn.execute("SELECT id FROM profiles WHERE user_id = ?", (b_uid,))}
+        b_rids = {int(r[0]) for r in conn.execute("SELECT id FROM researchers WHERE user_id = ?", (b_uid,))}
     finally:
         conn.close()
     after["profiles"] = [r for r in after["profiles"] if r[1] != b_uid]
+    after["researchers"] = [r for r in after["researchers"] if r[1] != b_uid]
+    after["rpapers"] = [r for r in after["rpapers"] if r[0] not in b_rids]
     after["uploads"] = [r for r in after["uploads"] if r[0] != b_uid]
     after["seeds"] = [r for r in after["seeds"] if r[0] not in b_pids]
     after["sched"] = [r for r in after["sched"] if r[0] not in b_pids]
