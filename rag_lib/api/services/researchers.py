@@ -594,9 +594,9 @@ def reorder(conn: sqlite3.Connection, user_id: int, ids: list[int]) -> list[Rese
 def delete_researcher(
     conn: sqlite3.Connection, user_id: int, researcher_id: int
 ) -> None:
-    """Forget the person. Any interest built from them keeps its seeds (and
-    so those papers stay in the vault); it just no longer points back.
-    Their other papers leave the vault with them."""
+    """Forget the person. Any interest built from them keeps its seeds; it
+    just no longer points back. All their papers stay in the vault: only
+    the Vault's own delete takes a paper out (FUNCTIONAL_SPEC B2.2)."""
     _require(conn, user_id, researcher_id)
     # The import's run row hangs off the researcher: forgetting them mid-
     # import deleted it, the job then wrote to nothing, and the draft it was
@@ -610,6 +610,10 @@ def delete_researcher(
     # draft, still being built from them, loses their profile topics.
     drafts = [int(p["id"]) for p in researchers_repo.interests_for(conn, researcher_id)
               if wizard_service.is_new_draft(p)]
+    # Their papers stay in the vault: only the Vault's delete takes one out (B2.2).
+    from rag_lib.db.repos import vault as vault_repo
+
+    vault_repo.keep_researcher(conn, researcher_id)
     researchers_repo.delete(conn, researcher_id)
     # After the delete, so a delete that fails changes no list; a drop that
     # fails is met by the next aggregation, which finds the researcher gone.

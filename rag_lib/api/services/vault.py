@@ -1135,3 +1135,102 @@ def _try_extract_umls_unlocked(
             detail=str(exc)[:200],
         )
         return False
+
+
+class DeleteRefused(ValueError):
+    """A Vault delete that cannot go ahead now; ``status_code`` for the router."""
+
+    def __init__(self, message: str, status_code: int = 409):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def delete_upload(conn: sqlite3.Connection, settings: Any, *, user_id: int, doc_id: str) -> dict:
+    """Delete the user's uploaded PDF from the Vault (FUNCTIONAL_SPEC F1).
+
+    The file, its text and its vectors go, and the Vault no longer lists
+    it. Wherever it is a seed it stops being one: on a saved interest it
+    stays on the seed list, last and marked deleted (``deleted_seeds``);
+    its seeds no longer match its fit, so its next scan refits without it
+    (``jobs._refit_if_fit_stale``);
+    once that scan has scored without it the mark goes
+    (``gather_runs.finish``). Only the user's own upload; another user's
+    copy of the same file is theirs and stays (M.1).
+    """
+    upload = conn.execute(
+        "SELECT local_path FROM paper_uploads WHERE user_id = ? AND openalex_id = ?",
+        (int(user_id), doc_id),
+    ).fetchone()
+    if upload is None:
+        raise DeleteRefused("This PDF is not one of your uploads.", status_code=404)
+    seeded = conn.execute(
+        "SELECT p.id, p.name, p.is_draft, p.edit_of FROM profiles p"
+        " JOIN profile_seeds s ON s.profile_id = p.id WHERE s.openalex_id = ? AND p.user_id = ?",
+        (doc_id, int(user_id)),
+    ).fetchall()
+    for p in seeded:
+        if (gather_runs_repo.running_scan(conn, int(p["id"])) is not None
+                or gather_runs_repo.has_unfinished_import(conn, int(p["id"]))):
+            raise DeleteRefused(f"A scan or an import of '{p['name']}' is running. Delete the PDF once it has finished.")
+        n = conn.execute("SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?", (int(p["id"]),)).fetchone()[0]
+        if n <= 1 and not p["is_draft"]:
+            raise DeleteRefused(f"It is the only seed of '{p['name']}'. Add another seed there first.")
+    title = conn.execute("SELECT title FROM papers WHERE openalex_id = ?", (doc_id,)).fetchone()
+    paths = {r[0] for r in conn.execute(
+        "SELECT local_path FROM papers WHERE openalex_id = ? AND local_path IS NOT NULL "
+        "UNION SELECT local_path FROM paper_uploads WHERE openalex_id = ? AND local_path IS NOT NULL",
+        (doc_id, doc_id))}
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        for p in seeded:
+            if not p["is_draft"]:
+                conn.execute(
+                    "INSERT OR REPLACE INTO deleted_seeds (profile_id, openalex_id, title) VALUES (?, ?, ?)",
+                    (int(p["id"]), doc_id, title["title"] if title else None),
+                )
+        conn.execute(
+            "DELETE FROM profile_seeds WHERE openalex_id = ? AND profile_id IN (SELECT id FROM profiles WHERE user_id = ?)",
+            (doc_id, int(user_id)),
+        )
+        for p in seeded:
+            conn.execute("UPDATE profiles SET n_seed = (SELECT COUNT(*) FROM profile_seeds WHERE profile_id = ?) WHERE id = ?",
+                         (int(p["id"]), int(p["id"])))
+        conn.execute("DELETE FROM draft_owned WHERE kind = 'paper' AND item = ?", (doc_id,))
+        used = any(conn.execute(sql, (doc_id,)).fetchone() for sql in (
+            "SELECT 1 FROM profile_seeds WHERE openalex_id = ?",
+            "SELECT 1 FROM profile_candidates WHERE openalex_id = ?",
+            "SELECT 1 FROM feedback_events WHERE openalex_id = ?",
+            "SELECT 1 FROM researcher_papers WHERE openalex_id = ?",
+            "SELECT 1 FROM paper_uploads WHERE openalex_id = ? AND user_id != " + str(int(user_id)),
+        ))
+        if used:
+            # Something else still names the row: its content goes, the row stays.
+            conn.execute("DELETE FROM paper_uploads WHERE user_id = ? AND openalex_id = ?", (int(user_id), doc_id))
+            conn.execute("DELETE FROM vault_kept WHERE user_id = ? AND openalex_id = ?", (int(user_id), doc_id))
+            conn.execute("DELETE FROM paper_embeddings WHERE openalex_id = ?", (doc_id,))
+            conn.execute("UPDATE papers SET body_text = NULL, local_path = NULL WHERE openalex_id = ?", (doc_id,))
+        else:
+            # Its vectors, upload row, version record and kept row go by cascade.
+            conn.execute("DELETE FROM papers WHERE openalex_id = ?", (doc_id,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    for path in paths:
+        still = conn.execute(
+            "SELECT 1 FROM papers WHERE local_path = ? UNION SELECT 1 FROM paper_uploads WHERE local_path = ?",
+            (path, path)).fetchone()
+        if still is None:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("vault.delete.file_left", path=path, reason=str(exc)[:160])
+    collection = _try_open_user_collection(settings, user_id)
+    if collection is not None:
+        try:
+            collection.delete(where={"openalex_id": str(doc_id)})
+        except Exception as exc:  # noqa: BLE001 -- the chunks are only retrieval's
+            log.warning("vault.delete.chunks_left", openalex_id=doc_id, reason=str(exc)[:160])
+    log.info("vault.deleted", user_id=user_id, openalex_id=doc_id, n_interests=len(seeded))
+    return {"ok": True, "interests": [p["name"] for p in seeded if not p["is_draft"]]}

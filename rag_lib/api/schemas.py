@@ -174,6 +174,15 @@ class Seed(_Model):
     sameTitleGroup: str | None = None
 
 
+class DeletedSeed(_Model):
+    """A seed whose PDF was deleted from the Vault: listed last, marked
+    deleted, until a scan has scored without it (FUNCTIONAL_SPEC F1)."""
+
+    id: str
+    title: str | None = None
+    deletedAt: str
+
+
 class SeedUmlsStatus(_Model):
     """UMLS extraction over an interest's seeds (``/{key}/umls``).
 
@@ -390,6 +399,7 @@ class ProfileDetail(_Model):
 
     profile: Profile
     seeds: list[Seed] = Field(default_factory=list)
+    deletedSeeds: list[DeletedSeed] = Field(default_factory=list)
     topics: list[Topic] = Field(default_factory=list)
     sweep: list[SweepRow] = Field(default_factory=list)
     coherenceBins: list[int] = Field(default_factory=list)

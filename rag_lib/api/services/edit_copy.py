@@ -290,6 +290,10 @@ def save_copy(conn: sqlite3.Connection, *, user_id: int, slug: str) -> str:
             " WHERE id = ? AND is_draft = 0",
             (*[values[k] for k in _SAVED], copy_id, profile_id),
         )
+        # A seed removed in the copy stays in the vault (B2.2).
+        from rag_lib.db.repos import vault as vault_repo
+
+        vault_repo.keep_interest(conn, profile_id)
         conn.execute("DELETE FROM profile_seeds WHERE profile_id = ?", (profile_id,))
         conn.execute(
             "INSERT INTO profile_seeds (profile_id, openalex_id, added_at, source, source_researcher_id)"

@@ -36,6 +36,7 @@ from ..mappers import (
 )
 from ..schemas import (
     CoherenceStats,
+    DeletedSeed,
     Profile,
     ProfileDetail,
     SweepRow,
@@ -179,9 +180,14 @@ def get_profile_detail(
     feedback_log = [format_event_line(r) for r in fb_rows]
     feedback_more = max(0, fb_total - len(feedback_log))
 
+    deleted = [DeletedSeed(id=r["openalex_id"], title=r["title"], deletedAt=r["deleted_at"]) for r in conn.execute(
+        "SELECT openalex_id, title, deleted_at FROM deleted_seeds WHERE profile_id = ? ORDER BY deleted_at, openalex_id",
+        (profile_id,))]
+
     return ProfileDetail(
         profile=profile,
         seeds=seed_rows,
+        deletedSeeds=deleted,
         topics=topics,
         sweep=sweep,
         coherenceBins=bins,
@@ -260,6 +266,10 @@ def delete_profile(conn: sqlite3.Connection, user_id: int, slug: str) -> int | N
             if gather_runs_repo.has_unfinished_import(conn, int(copy["id"])):
                 raise ProfileBusy(slug)
             draft_owned_repo.discard(conn, int(copy["id"]))
+        # Its papers stay in the vault: only the Vault's delete takes one out (7).
+        from rag_lib.db.repos import vault as vault_repo
+
+        vault_repo.keep_interest(conn, profile_id)
         profiles_repo.delete(conn, profile_id)
     finally:
         lock.release()

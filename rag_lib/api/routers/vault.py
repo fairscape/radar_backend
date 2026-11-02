@@ -68,6 +68,22 @@ def upload(
     return VaultDoc.model_validate(doc)
 
 
+@router.delete("/docs/{doc_id:path}")
+def delete_doc(
+    doc_id: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Delete the user's uploaded PDF: file, text and vectors (FUNCTIONAL_SPEC F1).
+    404 for anything not their upload; 409 while a scan or import of an
+    interest it seeds runs, or when it is an interest's only seed."""
+    try:
+        return vault_service.delete_upload(db, settings, user_id=int(user["id"]), doc_id=doc_id)
+    except vault_service.DeleteRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
 @router.get("/docs", response_model=list[VaultDoc])
 def list_docs(
     user: Annotated[sqlite3.Row, Depends(get_current_user)],

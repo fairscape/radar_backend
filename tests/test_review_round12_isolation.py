@@ -349,6 +349,7 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     r = hit("GET", "/api/vault/tags", expect=(200,)); assert r.json() == {"all": 0}
     r = hit("GET", "/api/vault/stats", expect=(200,)); assert r.json()["docs"] == 0
     r = hit("GET", "/api/vault/meta", expect=(200,)); assert world["upload"] not in r.text
+    hit("DELETE", f"/api/vault/docs/{world['upload']}")
     # Upload "into" A's interest: refused (404), nothing stored for B either.
     files = {"file": ("bob.pdf", io.BytesIO(b"%PDF-1.4\nbob-bytes"), "application/pdf")}
     r = hit("POST", "/api/vault/upload", expect=(404,), files=files, data={"profile_slug": world["live"]})

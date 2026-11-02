@@ -20,6 +20,12 @@ two sources:
    vanished from the wizard's seed list (and from the vault) while
    still seeding the interest.
 
+4. Papers kept after what brought them in went (``vault_kept``):
+   deleting an interest or a researcher, or removing a seed in Edit
+   interest, records first what it would take out; only the Vault's own
+   delete removes a paper (FUNCTIONAL_SPEC 7, B2.2). They have no tag
+   until an interest takes them up again.
+
 Tags = profile slugs the paper is attached to in either way:
 ``profile_seeds`` (seed membership) ∪ ``profile_candidates`` rows whose
 ``vaulted_at`` is set. ``tags_for_paper`` returns the union, dedup'd.
@@ -89,9 +95,10 @@ def list_for_user(
                  WHERE ps.openalex_id = p.openalex_id
                    AND pr.user_id = ?
                )
+               OR EXISTS (SELECT 1 FROM vault_kept k WHERE k.openalex_id = p.openalex_id AND k.user_id = ?)
             ORDER BY added_at DESC, p.openalex_id
             """,
-            (user_id, user_id, user_id, user_id, user_id),
+            (user_id, user_id, user_id, user_id, user_id, user_id),
         ).fetchall()
     return conn.execute(
         f"""
@@ -170,6 +177,12 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           JOIN profile_seeds ps ON ps.openalex_id = p.openalex_id
           JOIN profiles pr      ON pr.id = ps.profile_id
           WHERE pr.user_id = ?
+          UNION
+          -- Kept after their interest, researcher or seed went (4.).
+          SELECT p.openalex_id, p.n_pages, p.first_seen_at, NULL AS event_at
+          FROM papers p
+          JOIN vault_kept k ON k.openalex_id = p.openalex_id
+          WHERE k.user_id = ?
         ),
         deduped AS (
           SELECT openalex_id,
@@ -191,7 +204,7 @@ def stats_for_user(conn: sqlite3.Connection, user_id: int) -> dict:
           MAX(last_event)           AS last_ingest
         FROM deduped
         """,
-        (user_id, user_id, user_id, user_id),
+        (user_id, user_id, user_id, user_id, user_id),
     ).fetchone()
     return {
         "docs": int(row["docs"]),
@@ -293,3 +306,26 @@ def added_at(conn: sqlite3.Connection, user_id: int, openalex_id: str, first_see
         (openalex_id, user_id),
     ).fetchone()
     return row["uploaded_at"] if row is not None else first_seen_at
+
+
+def keep_interest(conn: sqlite3.Connection, profile_id: int) -> None:
+    """Before a saved interest is deleted or its seeds replaced: its seeds
+    and saved papers stay in the user's vault (``vault_kept``). Not for a
+    draft or a copy being edited, whose papers were never the vault's."""
+    for sql in (
+        "SELECT pr.user_id, ps.openalex_id FROM profile_seeds ps JOIN profiles pr ON pr.id = ps.profile_id"
+        " WHERE pr.id = ? AND pr.is_draft = 0",
+        "SELECT pr.user_id, pc.openalex_id FROM profile_candidates pc JOIN profiles pr ON pr.id = pc.profile_id"
+        " WHERE pr.id = ? AND pr.is_draft = 0 AND pc.vaulted_at IS NOT NULL",
+    ):
+        conn.execute("INSERT OR IGNORE INTO vault_kept (user_id, openalex_id) " + sql, (int(profile_id),))
+
+
+def keep_researcher(conn: sqlite3.Connection, researcher_id: int) -> None:
+    """Before a researcher is forgotten: their papers stay in the user's vault."""
+    conn.execute(
+        "INSERT OR IGNORE INTO vault_kept (user_id, openalex_id)"
+        " SELECT r.user_id, rp.openalex_id FROM researcher_papers rp JOIN researchers r ON r.id = rp.researcher_id"
+        " WHERE r.id = ?",
+        (int(researcher_id),),
+    )

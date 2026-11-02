@@ -95,6 +95,15 @@ def finish(
          json.dumps(sorted(topic_ids)) if topic_ids is not None else None,
          json.dumps(sorted(seed_ids)) if seed_ids is not None else None, run_id),
     )
+    if error is None and seed_ids is not None:
+        # A scan that scored without a seed deleted from the Vault before it
+        # began: its mark on the seed list goes (FUNCTIONAL_SPEC F1).
+        conn.execute(
+            "DELETE FROM deleted_seeds WHERE profile_id = (SELECT profile_id FROM gather_runs WHERE id = ?)"
+            " AND deleted_at <= (SELECT started_at FROM gather_runs WHERE id = ?)"
+            " AND openalex_id NOT IN (SELECT value FROM json_each(?))",
+            (run_id, run_id, json.dumps(list(seed_ids))),
+        )
     conn.commit()
 
 
