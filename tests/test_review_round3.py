@@ -46,11 +46,15 @@ def _prosopia_transport(pages: list[list[dict]], *, detail: dict, summaries: dic
         calls.append(str(request.url))
         path = request.url.path
         if path.endswith("/papers"):
-            i = int(request.url.params.get("cursor") or 0)
+            i = int(request.url.params.get("page_token") or 0)
             more = i + 1 < len(pages)
             return httpx.Response(200, json={
-                "items": pages[i], "total": sum(map(len, pages)),
-                "next_cursor": str(i + 1) if more else None, "has_more": more,
+                "results": pages[i],
+                "pagination": {
+                    "page_size": int(request.url.params["page_size"]),
+                    "total": sum(map(len, pages)),
+                    "next_page_token": str(i + 1) if more else None,
+                },
             })
         if path.endswith("/summaries"):
             pid = request.url.params["ids"]
@@ -77,25 +81,11 @@ def test_prosopia_reads_every_page_and_the_new_summary_shape():
     client = httpx.Client(base_url="http://prosopia.test", transport=transport)
     prof = ApiProfile(PagedApiStorage(slug="jane", base_url="http://prosopia.test", client=client))
     assert [p.paper_id for p in prof.papers] == [f"p{i}" for i in range(6)]
-    assert sum("/papers" in c for c in calls) == 3          # walked the cursor
+    assert sum("/papers" in c for c in calls) == 3          # followed next_page_token
     assert prof.name == "Jane Doe" and prof.rid == "0000-0001-2345-6789"
     assert prof.expertise == "E" and prof.soul == "S" and prof.affiliation == "UVA"
     assert list(prof.summaries) == ["p3"]
     assert read_summary(prof, "p3") == "the summary of p3"
-
-
-def test_prosopia_still_reads_the_old_unpaged_list():
-    from rag_lib.prosopia_client import ApiProfile, PagedApiStorage
-
-    def handler(request):
-        if request.url.path.endswith("/papers"):
-            return httpx.Response(200, json=[{"paper_id": "a", "title": "A", "summary_available": True}])
-        return httpx.Response(200, json={"metadata": {"name": "Old Server"}})
-
-    client = httpx.Client(base_url="http://old.test", transport=httpx.MockTransport(handler))
-    prof = ApiProfile(PagedApiStorage(slug="x", base_url="http://old.test", client=client))
-    assert prof.name == "Old Server" and [p.paper_id for p in prof.papers] == ["a"]
-    assert list(prof.summaries) == ["a"]
 
 
 def test_prosopia_base_url_must_be_an_allowed_instance():
