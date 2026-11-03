@@ -90,7 +90,7 @@ class ProsopiaFormatChanged(ProsopiaError):
 # The server caps a page of works at 100, and a summaries read at 20 ids.
 PAPERS_PAGE_SIZE = 100
 SUMMARIES_BATCH = 20
-# A runaway cursor (one that never says has_more=false) stops here.
+# A runaway walk (a server that never ends the token chain) stops here.
 MAX_PAPER_PAGES = 100
 
 
@@ -102,35 +102,30 @@ class PagedApiStorage(ApiArtifactStorage):
 
     - ``GET /profiles/{slug}`` carries the profile in ``fields`` where it
       used to be ``metadata``;
-    - ``GET /profiles/{slug}/papers`` is an envelope (``items``,
-      ``next_cursor``, ``has_more``; 20 a page by default) where it was a
-      bare list, which the SDK iterated key by key;
+    - ``GET /profiles/{slug}/papers`` is a token-paged envelope
+      (``results``, ``pagination.next_page_token``; ``page_size`` 20 by
+      default, 100 at most) where it was a bare list, which the SDK
+      iterated key by key;
     - each work's ``summary`` is ``{"available": bool, ...}`` where it was a
       ``summary_available`` flag, and the bodies come from
       ``GET /summaries?ids=`` (``/summary/{id}`` is gone).
-
-    The old shapes are still read, so a server on either side works.
     """
 
     def _paper_entries(self) -> list[dict]:
         if self._paper_index_cache is not None:
             return self._paper_index_cache
         entries: list[dict] = []
-        cursor: str | None = None
+        token: str | None = None
         for _ in range(MAX_PAPER_PAGES):
-            params: dict[str, Any] = {"limit": PAPERS_PAGE_SIZE}
-            if cursor:
-                params["cursor"] = cursor
+            params: dict[str, Any] = {"page_size": PAPERS_PAGE_SIZE}
+            if token:
+                params["page_token"] = token
             data = self._request("GET", self._api_path("papers"), params=params)
-            if isinstance(data, list):  # the unpaged server
-                entries = [e for e in data if isinstance(e, dict)]
-                break
-            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                raise ProsopiaFormatChanged(
-                    "the papers list is not a list or an 'items' envelope")
-            entries.extend(e for e in data["items"] if isinstance(e, dict))
-            cursor = data.get("next_cursor")
-            if not data.get("has_more") or not cursor:
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ProsopiaFormatChanged("the papers list has no 'results'")
+            entries.extend(e for e in data["results"] if isinstance(e, dict))
+            token = (data.get("pagination") or {}).get("next_page_token")
+            if not token:
                 break
         else:
             raise RuntimeError(f"papers list did not end after {MAX_PAPER_PAGES} pages")
@@ -310,41 +305,34 @@ class ProsopiaClient:
     def resolve_orcid(self, orcid: str) -> str:
         """The slug of the profile whose researcher id is ``orcid``.
 
-        Prosopia has no lookup-by-ORCID route, but every entry in the
-        public profile list carries its ``rid``, which is the ORCID for
-        every profile published so far. One list read is cheap and the
-        list is short, so this scans it. Raises ``ProfileNotFound`` when
-        nobody with that ORCID has published a profile here.
+        ``GET /api/v1/profiles/{orcid}`` reads a profile by its rid, which
+        is the bare ORCID for every profile published so far: one small
+        read, no listing. Raises ``ProfileNotFound`` when nobody with that
+        ORCID has published a profile here.
         """
         want = _bare_orcid(orcid)
-        url: str | None = f"{self.base_url}/api/v1/profiles"
-        params: dict[str, Any] | None = None
-        for _ in range(MAX_PAPER_PAGES):
-            try:
-                resp = requests.get(url, params=params, timeout=self.timeout)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:  # noqa: BLE001
-                raise ProsopiaError(
-                    f"could not list profiles at {self.base_url}: {exc}"
-                ) from exc
-            if not isinstance(data, dict) or not isinstance(data.get("profiles", data.get("items")), list):
-                raise ProsopiaFormatChanged("the profile list has no 'profiles'")
-            for entry in data.get("profiles", data.get("items")) or []:
-                if not isinstance(entry, dict):
-                    continue
-                # The rid may be stored as an orcid.org URL.
-                rid = _bare_orcid(str(entry.get("rid") or ""))
-                slug = entry.get("slug")
-                if rid == want and slug:
-                    log.info("prosopia.resolve_orcid", orcid=want, slug=slug)
-                    return str(slug)
-            # Today the list is one page; should it ever be paged, follow it.
-            cursor = data.get("next_cursor")
-            if not data.get("has_more") or not cursor:
-                break
-            params = {"cursor": cursor}
-        raise ProfileNotFound(f"no prosopia profile with ORCID '{want}'")
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/v1/profiles/{want}", timeout=self.timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ProsopiaError(
+                f"could not read profile {want} at {self.base_url}: {exc}"
+            ) from exc
+        if resp.status_code == 404:
+            raise ProfileNotFound(f"no prosopia profile with ORCID '{want}'")
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise ProsopiaError(
+                f"could not read profile {want} at {self.base_url}: {exc}"
+            ) from exc
+        slug = data.get("slug") if isinstance(data, dict) else None
+        if not slug:
+            raise ProsopiaFormatChanged("the profile record has no 'slug'")
+        log.info("prosopia.resolve_orcid", orcid=want, slug=slug)
+        return str(slug)
 
 
 def read_summary(profile: Any, paper_id: str) -> str:

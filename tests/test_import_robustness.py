@@ -160,9 +160,9 @@ def _storage(papers_json, detail_json):
 
 
 @pytest.mark.parametrize("papers, detail", [
-    ({"results": [{"paper_id": "a", "title": "A"}]}, {"fields": {"name": "Jane"}}),   # 'items' renamed
-    ({"items": [{"paper_id": "a", "title": "A"}]}, {"profile": {"name": "Jane"}}),     # no fields / metadata
-    ({"items": [{"paper_id": "a", "title": 3}, {"paper_id": "b", "title": ["x"]}]}, {"fields": {"name": "Jane"}}),   # none readable
+    ({"items": [{"paper_id": "a", "title": "A"}]}, {"fields": {"name": "Jane"}}),     # no 'results'
+    ({"results": [{"paper_id": "a", "title": "A"}]}, {"profile": {"name": "Jane"}}),   # no fields / metadata
+    ({"results": [{"paper_id": "a", "title": 3}, {"paper_id": "b", "title": ["x"]}]}, {"fields": {"name": "Jane"}}),   # none readable
 ])
 def test_o6_a_shape_change_is_an_error_not_an_empty_profile(papers, detail):
     with pytest.raises(ProsopiaFormatChanged, match="interface has changed"):
@@ -354,16 +354,13 @@ def test_the_registry_record_reads_works_and_affiliations(monkeypatch, live_orci
 # --- Prosopia by ORCID: a rid stored as a URL, a paged list ----------------------------------------
 
 
-def test_resolve_orcid_reads_a_url_rid_and_follows_pages(monkeypatch):
-    pages = [
-        {"profiles": [{"slug": "a", "rid": "0000-0002-1825-0097"}], "has_more": True, "next_cursor": "2"},
-        {"profiles": [{"slug": "sheffield-nathan", "rid": "https://orcid.org/0000-0001-5643-4068"}], "has_more": False},
-    ]
+def test_resolve_orcid_is_one_read_by_rid(monkeypatch):
+    """A URL-form ORCID is reduced to the bare id and read in one GET; no listing."""
     calls = []
 
     class R:
-        def __init__(self, data):
-            self._data = data
+        def __init__(self, status, data):
+            self.status_code, self._data = status, data
 
         def raise_for_status(self):
             return None
@@ -372,13 +369,18 @@ def test_resolve_orcid_reads_a_url_rid_and_follows_pages(monkeypatch):
             return self._data
 
     def get(url, params=None, timeout=None):
-        calls.append(params)
-        return R(pages[1] if params else pages[0])
+        calls.append(url)
+        if url.endswith("/0000-0001-5643-4068"):
+            return R(200, {"slug": "sheffield-nathan", "rid": "0000-0001-5643-4068"})
+        return R(404, {"detail": "not found"})
 
     import rag_lib.prosopia_client as pc
     monkeypatch.setattr(pc.requests, "get", get)
-    assert pc.ProsopiaClient("http://p.test").resolve_orcid("0000-0001-5643-4068") == "sheffield-nathan"
-    assert calls == [None, {"cursor": "2"}]
+    client = pc.ProsopiaClient("http://p.test")
+    assert client.resolve_orcid("https://orcid.org/0000-0001-5643-4068") == "sheffield-nathan"
+    assert calls == ["http://p.test/api/v1/profiles/0000-0001-5643-4068"]
+    with pytest.raises(pc.ProfileNotFound):
+        client.resolve_orcid("0000-0002-1825-0097")
 
 
 # --- a failure part-way through the writes takes them back ----------------------------------------
