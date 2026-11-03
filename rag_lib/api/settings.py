@@ -11,6 +11,7 @@ class attribute.
 
 from __future__ import annotations
 
+import secrets
 from functools import lru_cache
 from pathlib import Path
 
@@ -113,7 +114,8 @@ class Settings(BaseSettings):
     # The one callback every provider returns to; register it with each
     # (https://<host>/auth/login/callback).
     BIOXPLORER_OIDC_REDIRECT_URI: str | None = None
-    # HMAC key for the session cookie. Required when any provider is on.
+    # HMAC key for the session cookie. Unset: a random key per process, so
+    # a restart signs everyone out (fine for one replica).
     BIOXPLORER_SESSION_SECRET: str | None = None
     BIOXPLORER_SESSION_DAYS: int = 14
     # True behind https; False lets the cookie ride plain-http dev.
@@ -207,12 +209,10 @@ class Settings(BaseSettings):
         if bool(self.BIOXPLORER_GOOGLE_CLIENT_ID) != bool(self.BIOXPLORER_GOOGLE_CLIENT_SECRET):
             raise ValueError("set both BIOXPLORER_GOOGLE_CLIENT_ID and BIOXPLORER_GOOGLE_CLIENT_SECRET, or neither")
         if self.BIOXPLORER_PROSOPIA_CLIENT_SECRET or self.BIOXPLORER_GOOGLE_CLIENT_SECRET:
-            missing = [
-                name for name in ("BIOXPLORER_OIDC_REDIRECT_URI", "BIOXPLORER_SESSION_SECRET")
-                if not getattr(self, name)
-            ]
-            if missing:
-                raise ValueError(f"sign-in is on but {', '.join(missing)} is not set")
+            if not self.BIOXPLORER_OIDC_REDIRECT_URI:
+                raise ValueError("sign-in is on but BIOXPLORER_OIDC_REDIRECT_URI is not set")
+        if not self.BIOXPLORER_SESSION_SECRET:
+            self.BIOXPLORER_SESSION_SECRET = secrets.token_urlsafe(32)
         return self
 
 
