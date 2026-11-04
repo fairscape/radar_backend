@@ -445,35 +445,41 @@ SEED_SOURCES = ("upload", "researcher", "vault", "feed", "orcid", "prosopia")
 def attach_seed(
     conn: sqlite3.Connection, profile_id: int, openalex_id: str, *,
     source: str | None = None, researcher_id: int | None = None,
+    commit: bool = True,
 ) -> int:
     """Idempotent. Returns 1 if the seeds changed, 0 if already present.
 
     ``source`` (``SEED_SOURCES``) and, for ``researcher``, ``researcher_id``
     say where the seed came from; a seed added again keeps its first.
 
-    Every uploaded file is a seed of its own: a revised file of a paper
-    whose earlier file (or public record) is a seed is added beside it, and
-    the user removes either if they want one (FUNCTIONAL_SPEC 1.7). The
-    public record of a work one of whose files is a seed is not added: a
-    search or an import naming the paper again is the same seed. Nor is an
-    OpenAlex work with the DOI of one that is a seed: OpenAlex has not
-    merged the two records yet (FUNCTIONAL_SPEC M.4).
+    A paper is a seed of an interest once (FUNCTIONAL_SPEC CR.10, which
+    replaced 1.7's "both files are seeds"): nothing is added when the
+    interest already has the same OpenAlex work as a seed -- its public
+    record or any uploaded file of it -- or, for a file OpenAlex has no
+    record of, a file with the same bytes. Nor an OpenAlex work with the
+    DOI of one that is a seed: OpenAlex has not merged the two records yet
+    (FUNCTIONAL_SPEC M.4). ``commit=False`` leaves the write to the
+    caller's transaction.
     """
     from ...seed_duplicates import doi_twin
-    from .versions import is_version, same_work_seeds
+    from .versions import same_file_seeds, same_work_seeds
+
+    def done(value: int) -> int:
+        if commit:
+            conn.commit()
+        return value
 
     # Read the work's seeds under the write lock: two requests, one adding
     # the public record and one a file of it, each saw no other.
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
-    if not is_version(openalex_id) and same_work_seeds(conn, profile_id, openalex_id):
-        conn.commit()
-        return 0
+    if same_work_seeds(conn, profile_id, openalex_id) or same_file_seeds(conn, profile_id, openalex_id):
+        return done(0)
     if doi_twin(conn, profile_id, openalex_id) is not None:
-        conn.commit()
-        return 0
+        return done(0)
     if source is not None and source not in SEED_SOURCES:
-        conn.rollback()
+        if commit:
+            conn.rollback()
         raise ValueError(f"unknown seed source {source!r}")
     cur = conn.execute(
         """
@@ -495,8 +501,7 @@ def attach_seed(
         """,
         (profile_id, profile_id),
     )
-    conn.commit()
-    return changed
+    return done(changed)
 
 
 def detach_seed(

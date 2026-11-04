@@ -21,6 +21,7 @@ required at construction — no baked-in default.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import requests
@@ -36,6 +37,35 @@ DEFAULT_BASE_URL = "https://api.openalex.org"
 MAX_PAGED_RESULTS = 10_000
 
 log = structlog.get_logger("rag_lib.openalex_client")
+
+# OpenAlex: a filter that ORs more than WIDE_OR_TERMS topic values is
+# limited to one request a second. Counted for the whole process (CR.11
+# L8): each client used to pace only itself, so two users' backfills or
+# trial scans sent theirs in the same instant and drew a 429 that paused
+# OpenAlex for everyone.
+WIDE_OR_TERMS = 10
+WIDE_OR_SECONDS = 1.0
+_wide_lock = threading.Lock()
+_wide_next = 0.0
+
+
+def is_wide(filter_str: str | None) -> bool:
+    """A filter with a topic condition ORing more than WIDE_OR_TERMS values."""
+    for clause in (filter_str or "").split(","):
+        key, _, values = clause.partition(":")
+        if "topic" in key and values.count("|") + 1 > WIDE_OR_TERMS:
+            return True
+    return False
+
+
+def _wait_for_wide_slot() -> None:
+    """Block until a wide query may go: one a second, across all clients."""
+    global _wide_next
+    with _wide_lock:      # held while waiting: the waiters go one by one
+        wait = _wide_next - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _wide_next = time.monotonic() + WIDE_OR_SECONDS
 
 
 class OpenAlexClient:
@@ -65,6 +95,9 @@ class OpenAlexClient:
     def _get(self, path: str, params: dict | None = None) -> dict:
         # Paused by an earlier 429 or 401: refused without spending a call.
         openalex_status.check()
+        if is_wide((params or {}).get("filter")):
+            _wait_for_wide_slot()
+            openalex_status.check()      # a 429 may have paused it meanwhile
         self._api_calls += 1
         p = dict(params or {})
         p["mailto"] = self.mailto
@@ -89,15 +122,18 @@ class OpenAlexClient:
                 pass
             if str(remaining).strip() == "0":
                 # The day's quota: paused until OpenAlex says it resets.
+                kind = "quota"
                 try:
                     reset_s = float(reset)
                 except (TypeError, ValueError):
                     reset_s = None
             else:
+                # Requests left: a burst limit, told as such (CR.11 L9).
+                kind = "busy"
                 reset_s = openalex_status.BURST_PAUSE_SECONDS
-            until = openalex_status.pause("quota", reset_seconds=reset_s)
+            until = openalex_status.pause(kind, reset_seconds=reset_s)
             raise OpenAlexUnavailable(
-                "quota", until=until, response=r,
+                kind, until=until, response=r,
                 detail=(f"OpenAlex 429: rate-limited. "
                         f"X-RateLimit-Remaining={remaining}, X-RateLimit-Reset={reset}s. "
                         f"Body: {body!r}"),

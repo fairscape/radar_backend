@@ -11,9 +11,16 @@ Three dependencies the rest of the service hangs off:
     ``RADAR_REQUIRE_AUTH`` is False; 401s when the header is absent and
     auth is required.
 
-Identity is email-only: there are no tokens or passwords. The header is
-trusted — the surface is the same as a public API behind a reverse
-proxy, which is the demo's threat model. CSRF is N/A (no cookies).
+Identity is email-only. Two models, picked by whether any sign-in
+provider is on (``oidc.providers``):
+
+  - one or more (production): the session cookie that the
+    ``/auth`` routes issue after a Google or Prosopia sign-in names the
+    user. The header is ignored and there is no demo-user fallback.
+  - none: the header is trusted. Only for dev, tests and the test site,
+    where the proxy in front fills it in; with ``RADAR_REQUIRE_AUTH`` on,
+    Settings refuses to start this way unless ``RADAR_TRUST_EMAIL_HEADER``
+    says so (a missing client secret must not reopen the header).
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from rag_lib.db import connect
 from rag_lib.db.repos import users
 
+from . import oidc
 from .settings import Settings, get_settings
 
 
@@ -60,6 +68,7 @@ def get_scheduler(request: Request):
 
 
 def get_current_user(
+    request: Request,
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     x_user_email: Annotated[str | None, Header(alias="X-User-Email")] = None,
@@ -71,6 +80,8 @@ def get_current_user(
     - Header present → lowercase, validate it looks like an email,
       ``users.upsert(email)`` to ensure the row exists, return it.
       ``upsert`` defaults ``mailto = email`` on first insert.
+    - Header present but empty (or only spaces) → 400, whatever
+      ``RADAR_REQUIRE_AUTH`` says (L12).
     - Header absent + ``RADAR_REQUIRE_AUTH=False`` → fall back to the
       demo user (id 1). 500s if that row is missing (migrations
       not run / DB wiped without re-init).
@@ -81,9 +92,29 @@ def get_current_user(
     backend can claim any email". Phase 13's docker-compose puts the
     backend behind localhost only; production deployments must add a
     real auth proxy on top.
+
+    With a sign-in provider on, none of the above applies: only a valid
+    session cookie names the user, and anything else is 401.
     """
-    if x_user_email:
+    if oidc.providers(settings):
+        session = oidc.request_session(settings, request)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="not signed in",
+            )
+        return users.upsert(db, session["email"])
+
+    # Present but empty is a broken proxy, not "no proxy" (L12): Caddy sends
+    # an empty header when Cloudflare Access supplied no identity, and that
+    # must never fall back to the default user.
+    if x_user_email is not None:
         email = x_user_email.strip().lower()
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="X-User-Email is empty",
+            )
         if not _EMAIL_RE.match(email):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

@@ -76,9 +76,9 @@ if [ -d "$NVIDIA_PKG" ]; then
 fi
 
 # Loopback only. The public entry point is Caddy on :8080 (behind the
-# Cloudflare tunnel), and that is also where the verified identity header
-# gets set. Binding 0.0.0.0 would let anyone on the campus network reach
-# the API directly and bypass that.
+# Cloudflare tunnel), which drops any identity header a client sends.
+# Binding 0.0.0.0 would let anyone on the campus network reach the API
+# directly and skip that.
 # ~/.local/lib/python3.12 holds 187 user-level packages that would
 # otherwise shadow this env's. pip already mistook one for "already
 # satisfied" once and left pydantic out, which only surfaced at runtime.

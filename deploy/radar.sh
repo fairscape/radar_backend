@@ -12,7 +12,7 @@
 #
 #   ollama      127.0.0.1:11434  embeddings for UMLS concepts (GPU 0)
 #   backend     127.0.0.1:8000   FastAPI, conda env, runs inside tmux
-#   caddy       :8080            serves the SPA, proxies /api, sets identity
+#   caddy       :8080            serves the SPA, proxies /api and /auth
 #   cloudflared                  publishes :8080 as radar.bioxplorer.org
 #
 # Nothing here needs root. `watchdog` is what cron calls every 5 minutes;
@@ -63,6 +63,17 @@ backup_age_min() {
 	echo $((($(date +%s) - $(stat -c %Y "$newest")) / 60))
 }
 
+# The vault's daily mirror to R2 (backup.sh vault_sync) leaves a marker
+# when it succeeds. A sync that fails (R2 unreachable, a listing error)
+# fails every hour in backup.log and nowhere else, so its age is reported
+# too (review L3).
+vault_sync_age_h() {
+	local marker
+	marker=$(ls -1t "$DEPLOY/backups"/.vault-synced-* 2>/dev/null | head -1)
+	[ -n "$marker" ] || return 1
+	echo $((($(date +%s) - $(stat -c %Y "$marker")) / 3600))
+}
+
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
 # --- start -----------------------------------------------------------------
@@ -91,7 +102,7 @@ start_ollama() {
 start_backend() {
 	backend_up && return 0
 	log "starting backend (SciSpacy UMLS index load takes ~4 min)"
-	tmux kill-session -t "$SESSION" 2>/dev/null
+	tmux kill-session -t "=$SESSION" 2>/dev/null
 	# 9>&- so the tmux server does not inherit the lock: it outlives this
 	# script, and on 2026-09-28 it held the lock for an hour, silently
 	# turning every watchdog tick and every restart into a no-op.
@@ -106,7 +117,7 @@ start_backend() {
 		}
 		sleep 5
 	done
-	log "backend did not come up — see: tmux attach -t $SESSION"
+	log "backend did not come up — see: tmux attach -t =$SESSION"
 	return 1
 }
 
@@ -185,7 +196,7 @@ do_stop() {
 	(cd "$DEPLOY" && "$DEPLOY/bin/caddy" stop 2>/dev/null)
 
 	log "stopping backend"
-	tmux kill-session -t "$SESSION" 2>/dev/null
+	tmux kill-session -t "=$SESSION" 2>/dev/null
 
 	log "stopping ollama"
 	pkill -f "ollama serve" 2>/dev/null
@@ -203,34 +214,37 @@ do_status() {
 
 	local code verdict
 	code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' https://radar.bioxplorer.org/ 2>/dev/null)
-	# 302 is the healthy answer from outside: Cloudflare Access redirecting
-	# an unauthenticated request to the login page. A 200 is NOT better --
-	# it means Access is no longer in front of the origin, and since the
-	# backend trusts X-User-Email with nothing behind it, that is the whole
-	# trust model gone. Printing the bare number made the worst state look
-	# like the best one.
+	# Since 2026-11 the site signs people in itself (Google / Prosopia
+	# buttons), so the healthy answer from outside is 200: the SPA, whose
+	# login page has the buttons. 302 means Cloudflare Access is still in
+	# front, which is harmless but no longer the setup.
 	case "$code" in
-	302) verdict="(Access is enforcing)" ;;
-	200) verdict="** Access is NOT enforcing -- anyone can reach the origin **" ;;
+	200) verdict="(sign-in page)" ;;
+	302) verdict="(Cloudflare Access is still in front)" ;;
 	"")  verdict="(no answer)" ;;
 	*)   verdict="(unexpected)" ;;
 	esac
 	printf '%-12s %s\n' "public" "https://radar.bioxplorer.org -> ${code:-no answer} $verdict"
 
-	# The identity rewrite is the only thing standing between the network and
-	# every account, and it has failed silently before: the listener was
-	# bound to every interface, so a client could send the Cf-Access header
-	# itself and be whoever it liked. Assert it rather than assume it.
+	# Identity is the sign-in cookie. A request that names someone with the
+	# old headers instead must be refused: Caddy drops them and the backend
+	# ignores them. 200 here means anyone can be anyone. Assert it rather
+	# than assume it.
 	local ident
 	ident=$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
 		-H "Cf-Access-Authenticated-User-Email: probe@invalid.test" \
+		-H "X-User-Email: probe@invalid.test" \
 		"http://127.0.0.1:8080/api/users/me" 2>/dev/null)
 	local bound
 	bound=$(ss -lntH 2>/dev/null | awk '$4 ~ /:8080$/ {print $4}' | head -1)
+	case "$ident" in
+	401) printf '%-12s %s\n' "auth" "forged identity headers refused (probe -> 401), proxy bound to ${bound:-?}" ;;
+	200) printf '%-12s %s\n' "auth" "** forged identity header ACCEPTED (probe -> 200) -- anyone can be anyone **" ;;
+	*)   printf '%-12s %s\n' "auth" "probe -> ${ident:-no answer} (expected 401), proxy bound to ${bound:-none}" ;;
+	esac
 	case "$bound" in
-	127.0.0.1:*) printf '%-12s %s\n' "auth" "proxy bound to $bound, identity header injected (probe -> $ident)" ;;
-	"")          printf '%-12s %s\n' "auth" "** :8080 has no listener **" ;;
-	*)           printf '%-12s %s\n' "auth" "** proxy listening on $bound -- reachable off-host, identity can be forged **" ;;
+	127.0.0.1:*|"") ;;
+	*) printf '%-12s %s\n' "" "** proxy listening on $bound -- reachable off-host **" ;;
 	esac
 
 	local age
@@ -238,6 +252,14 @@ do_status() {
 		printf '%-12s %s\n' "backup" "$age 分钟前  ($DB_PATH)"
 	else
 		printf '%-12s %s\n' "backup" "NONE  ($DB_PATH 没有任何备份)"
+	fi
+	if [ -s "$DEPLOY/backups/pinned.log" ]; then
+		printf '%-12s %s\n' "pinned" "$(wc -l <"$DEPLOY/backups/pinned.log") 次；最近：$(tail -1 "$DEPLOY/backups/pinned.log")"
+	fi
+	if age=$(vault_sync_age_h); then
+		printf '%-12s %s\n' "vault sync" "$age 小时前"
+	else
+		printf '%-12s %s\n' "vault sync" "从未成功（或 R2 未配置）"
 	fi
 }
 
@@ -256,6 +278,16 @@ do_watchdog() {
 		[ "$age" -gt 180 ] && log "WARN: 最近一次数据库备份是 $age 分钟前 -- 见 backup.log"
 	else
 		log "WARN: 一份数据库备份都没有 -- 见 backup.log"
+	fi
+	# Daily, so two days without one is a real stop, not a slow night.
+	if age=$(vault_sync_age_h) && [ "$age" -gt 48 ]; then
+		log "WARN: vault 已经 $age 小时没有同步到 R2 -- 见 backup.log"
+	fi
+	# A shrink backup.sh pinned the pre-shrink copy for: said once per entry.
+	local pins="$DEPLOY/backups/pinned.log" seen="$DEPLOY/backups/.pinned-reported"
+	if [ -s "$pins" ] && [ "$pins" -nt "$seen" ]; then
+		log "WARN: 备份发现数据变少，变少前的一份已永久保留 -- $(tail -1 "$pins")（全部见 $pins）"
+		touch "$seen"
 	fi
 
 	[ "$acted" = 1 ] && log "watchdog finished repairs"

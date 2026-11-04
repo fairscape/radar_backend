@@ -40,7 +40,7 @@ def test_delete_a_saved_interest(app, env):
     assert _one(env, "SELECT COUNT(*) AS n FROM papers")["n"] == n_papers
     assert _ok(_request(app, "GET", f"/api/researchers/{rid}"))["papers"]
     assert [p["key"] for p in _ok(_request(app, "GET", "/api/profiles"))] == [keep]
-    assert _request(app, "GET", f"/api/profiles/{slug}/detail").json() is None
+    assert _request(app, "GET", f"/api/profiles/{slug}/detail").status_code == 404
     # B's interest of the same slug is untouched; A can make the name again.
     assert [p["key"] for p in _ok(_request(app, "GET", "/api/profiles", headers=B))] == [other]
     assert _go_live(app, env, name="Gone")[0] == slug

@@ -616,7 +616,7 @@ def prepare_import(
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
-    draft_row, researcher_id = open_draft_for_import(
+    draft_row, researcher_id, link_researcher = open_draft_for_import(
         conn, settings, save_profile=save_profile, new_researcher=new_researcher,
         record_researcher=lambda: int(known["id"]) if known is not None else researchers_service.record_orcid_researcher(
             conn, user_id=user_id, orcid=oid, name=listing["name"],
@@ -637,6 +637,7 @@ def prepare_import(
         draft_name=draft["name"],
         profile_id=int(draft_row["id"]),
         researcher_id=researcher_id,
+        link_researcher=link_researcher,
         user_id=user_id,
         embedding_model=model,
         records=records,

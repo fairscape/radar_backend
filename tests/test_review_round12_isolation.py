@@ -44,6 +44,17 @@ NO_USER_DATA = {
     ("GET", "/api/profiles/wizard/options"): "the embedders and selectors installed",
     ("GET", "/api/users/me"): "the caller's own row (test_api_auth.py)",
     ("PATCH", "/api/users/me"): "the caller's own row (test_api_auth.py)",
+    # Sign-in (records/21). None takes a user id or returns anyone's data;
+    # who the cookie names is tested in test_signin_identity.py and
+    # test_api_oidc.py.
+    ("GET", "/auth/config"): "which sign-in buttons are on, and the provider of the caller's own cookie",
+    ("GET", "/auth/login/{provider}"): "starts a sign-in: nobody is signed in yet",
+    ("GET", "/auth/login/callback"): "finishes a sign-in into the address the provider verified",
+    ("GET", "/auth/logout"): "clears the caller's own cookie",
+    # Needs a sign-in session (self_rid), which this header-model world
+    # has none of; B-cannot-see-A's-import is test_api_my_prosopia.py::
+    # test_another_users_import_is_not_mine.
+    ("GET", "/api/users/me/prosopia"): "the caller's own Prosopia profile (tested for isolation in test_api_my_prosopia.py)",
 }
 
 # Routes left out on purpose, with the reason.
@@ -73,7 +84,7 @@ def _api_routes(app):
             for r in entry.original_router.routes:
                 if isinstance(r, APIRoute):
                     full[id(r)] = (r, prefix + r.path)
-    ops = {(m, path) for r, path in full.values() for m in r.methods if path.startswith("/api")}
+    ops = {(m, path) for r, path in full.values() for m in r.methods if path.startswith(("/api", "/auth"))}
     import re
 
     listed = {(m.upper(), path) for path, item in app.openapi()["paths"].items() for m in item}
@@ -217,6 +228,13 @@ def _snapshot(env):
             "rpapers": q("SELECT researcher_id, openalex_id FROM researcher_papers ORDER BY 1, 2"),
             "uploads": q("SELECT user_id, openalex_id FROM paper_uploads ORDER BY 1, 2"),
             "feedback": q("SELECT user_id, profile_id, openalex_id, action FROM feedback_events ORDER BY id"),
+            # CR.1: what keeps a paper in a Vault, and the papers themselves.
+            "kept": q("SELECT user_id, openalex_id FROM vault_kept ORDER BY 1, 2"),
+            "deleted": q("SELECT profile_id, openalex_id FROM deleted_seeds ORDER BY 1, 2"),
+            "owned": q("SELECT profile_id, kind, item FROM draft_owned ORDER BY 1, 2, 3"),
+            "versions": q("SELECT version_id, user_id, canonical_openalex_id, file_hash FROM paper_versions ORDER BY 1"),
+            "papers": q("SELECT openalex_id FROM papers ORDER BY 1"),
+            "vectors": q("SELECT openalex_id, embedding_model FROM paper_embeddings ORDER BY 1, 2"),
         }
     finally:
         conn.close()
@@ -281,10 +299,11 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     r = hit("POST", "/api/profiles/drafts/discard-edits", expect=(200,), json={"tab": ""})
     assert r.json() == {"discarded": 0}
     for s in (world["draft"], world["live"], world["plain"], copy):
-        r = hit("GET", f"/api/profiles/{s}", expect=(200,))
-        assert r.json() is None, (s, r.text)                       # by design: null, not A's row
-        r = hit("GET", f"/api/profiles/{s}/detail", expect=(200,))
-        assert r.json() is None, (s, r.text)
+        # L11: 404, as for a key that does not exist -- not A's row.
+        r = hit("GET", f"/api/profiles/{s}", expect=(404,))
+        assert r.json() == {"detail": "No such interest."}, (s, r.text)
+        r = hit("GET", f"/api/profiles/{s}/detail", expect=(404,))
+        assert r.json() == {"detail": "No such interest."}, (s, r.text)
         hit("PATCH", f"/api/profiles/{s}", json={"threshold": 0.25})
         hit("PATCH", f"/api/profiles/{s}", json={"years": {"year_from": 2000, "year_to": 2010}})
         hit("POST", f"/api/profiles/{s}/recompute-coherence")
@@ -400,6 +419,15 @@ def test_user_b_cannot_read_or_touch_user_a(world):
     after["uploads"] = [r for r in after["uploads"] if r[0] != b_uid]
     after["seeds"] = [r for r in after["seeds"] if r[0] not in b_pids]
     after["sched"] = [r for r in after["sched"] if r[0] not in b_pids]
+    after["kept"] = [r for r in after["kept"] if r[0] != b_uid]
+    after["deleted"] = [r for r in after["deleted"] if r[0] not in b_pids]
+    after["owned"] = [r for r in after["owned"] if r[0] not in b_pids]
+    after["versions"] = [r for r in after["versions"] if r[1] != b_uid]
+    # Papers and their vectors are shared: B may add public ones; none of
+    # A's may go (CR.1).
+    for shared in ("papers", "vectors"):
+        assert set(before[shared]) <= set(after.pop(shared)), shared
+        before.pop(shared)
     assert after == before
     assert _request(app, "GET", "/api/profiles", headers=A).json() == a_profiles_before
     assert _request(app, "GET", "/api/researchers", headers=A).json() == a_researchers_before

@@ -9,6 +9,7 @@ is a single-dep change.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from typing import Annotated
 
 import structlog
@@ -425,18 +426,31 @@ def start_seed_umls(
     if scheduler is None:
         extract_seed_umls_job(profile_id, settings)
     else:
-        SEED_UMLS_RUNNING.add(profile_id)    # visible to the poll before the job starts
-        try:
-            scheduler.add_job(
-                extract_seed_umls_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
-                args=[profile_id], id=f"seed-umls:{profile_id}", replace_existing=True, max_instances=1,
-            )
-        except Exception:
-            # Not left set: every later request would have seen "running"
-            # for an extraction that never started.
-            SEED_UMLS_RUNNING.discard(profile_id)
-            raise
+        _start_seed_umls(scheduler, profile_id)
     return _seed_umls_status(db, settings, profile_id)
+
+
+def _start_seed_umls(scheduler, profile_id: int) -> None:
+    """Hand the seed extraction to the scheduler, its "running" flag set
+    first so the poll sees it before the job starts."""
+    from rag_lib.scheduler import runner as scheduler_runner
+    from rag_lib.scheduler.jobs import SEED_UMLS_RUNNING, extract_seed_umls_job
+
+    job_id = f"seed-umls:{profile_id}"
+    SEED_UMLS_RUNNING.add(profile_id)
+    # Dropped unrun, the flag said "running" until the next restart (CR.6).
+    scheduler_runner.on_missed(job_id, lambda: SEED_UMLS_RUNNING.discard(profile_id))
+    try:
+        scheduler.add_job(
+            extract_seed_umls_job, trigger="date", run_date=datetime.now(tz=timezone.utc),
+            args=[profile_id], id=job_id, replace_existing=True, max_instances=1,
+        )
+    except Exception:
+        scheduler_runner.forget_missed(job_id)
+        # Not left set: every later request would have seen "running"
+        # for an extraction that never started.
+        SEED_UMLS_RUNNING.discard(profile_id)
+        raise
 
 
 @router.get("/draft/{slug}/topics", response_model=list[Topic])
@@ -586,13 +600,17 @@ def _schedule_run(scheduler, db: sqlite3.Connection, run_id: int, tier: str, fun
     it counted as running for up to two hours, 409-ing every "Scan now"
     and keeping the wizard's trial polling until the next restart."""
     from rag_lib.db.repos import gather_runs as gather_runs_repo
+    from rag_lib.scheduler import runner as scheduler_runner
 
+    # Dropped unrun (queued past the grace time): the row closes (CR.6).
+    scheduler_runner.close_run_if_missed(id, run_id, what="scan")
     try:
         scheduler.add_job(
             func, trigger="date", run_date=datetime.now(tz=timezone.utc),
             args=args, kwargs=kwargs, id=id, replace_existing=False, max_instances=1,
         )
     except Exception as exc:  # noqa: BLE001
+        scheduler_runner.forget_missed(id)
         gather_runs_repo.finish(
             db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
             error=f"could not schedule: {type(exc).__name__}: {exc}",
@@ -863,6 +881,19 @@ def remove_seed(
     return {"ok": True}
 
 
+# One save of a draft at a time, from the running-scan check to its run row
+# (CR.11 L7): two saves in the seconds commit_draft fits both opened a run,
+# and the second's job, skipped as "another scan was running", deleted the
+# first's recommendations.
+_save_locks: dict[int, threading.Lock] = {}
+_save_locks_guard = threading.Lock()
+
+
+def _save_lock(profile_id: int) -> threading.Lock:
+    with _save_locks_guard:
+        return _save_locks.setdefault(profile_id, threading.Lock())
+
+
 @router.post("", response_model=SavedDraft)
 def commit_draft(
     body: CommitDraftRequest,
@@ -925,32 +956,40 @@ def commit_draft(
         # saved with save-edit (spec E).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"draft '{body.slug}' not found")
     profile_id = int(row["id"])
-    running = gather_runs_repo.running_scan(db, profile_id)
-    if running is not None:
-        return answer(int(running["id"]))            # a save of it is running: follow that one
+    lock = _save_lock(profile_id)
+    if not lock.acquire(blocking=False):
+        # Another save of this draft is fitting it right now.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"'{body.slug}' is being saved in another tab.")
     try:
-        done = wizard_service.commit_draft(
-            db, user_id=uid, slug=body.slug, threshold=body.threshold,
-            selected_topic_ids=body.selected_topic_ids,
-        )
-    except wizard_service.ImportInProgress as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"an import is still filling draft '{exc.slug}'; save once it has finished",
-        ) from exc
-    except LookupError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ValueError as exc:   # no topic left on
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    if done.get("already_live"):
-        return answer(None)
-    years = (body.years.year_from, body.years.year_to) if body.years is not None else None
-    profiles_repo.update_year_range(db, profile_id, *(years or (None, None)))
-    since = None
-    if years is not None:
-        since = f"{years_rules.fetch_span(*years)[0]}-01-01"
-    run_id = _open_scan_run(db, body.slug, profile_id=profile_id, user_id=uid, since_date=since,
-                            tier_used="backfill" if years else "first_scan")
+        running = gather_runs_repo.running_scan(db, profile_id)
+        if running is not None:
+            return answer(int(running["id"]))            # a save of it is running: follow that one
+        try:
+            done = wizard_service.commit_draft(
+                db, user_id=uid, slug=body.slug, threshold=body.threshold,
+                selected_topic_ids=body.selected_topic_ids,
+            )
+        except wizard_service.ImportInProgress as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"an import is still filling draft '{exc.slug}'; save once it has finished",
+            ) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:   # no topic left on
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if done.get("already_live"):
+            return answer(None)
+        years = (body.years.year_from, body.years.year_to) if body.years is not None else None
+        profiles_repo.update_year_range(db, profile_id, *(years or (None, None)))
+        since = None
+        if years is not None:
+            since = f"{years_rules.fetch_span(*years)[0]}-01-01"
+        run_id = _open_scan_run(db, body.slug, profile_id=profile_id, user_id=uid, since_date=since,
+                                tier_used="backfill" if years else "first_scan")
+    finally:
+        lock.release()
 
     # Not Depends(get_scheduler): that 503s when the scheduler is off, and a
     # save works either way (below, without one).
@@ -1000,22 +1039,31 @@ def list_profiles(
     return profiles_service.list_profiles(db, int(user["id"]))
 
 
-@router.get("/{key}", response_model=Profile | None)
+def _found(value):
+    """404 for a key that is not one of this user's interests (L11): one
+    that does not exist and someone else's read the same, so the answer
+    says nothing about other users' keys (FUNCTIONAL_SPEC 2.2)."""
+    if value is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such interest.")
+    return value
+
+
+@router.get("/{key}", response_model=Profile)
 def get_profile(
     key: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-) -> Profile | None:
-    return profiles_service.get_profile(db, int(user["id"]), key)
+) -> Profile:
+    return _found(profiles_service.get_profile(db, int(user["id"]), key))
 
 
-@router.get("/{key}/detail", response_model=ProfileDetail | None)
+@router.get("/{key}/detail", response_model=ProfileDetail)
 def get_profile_detail(
     key: str,
     user: Annotated[sqlite3.Row, Depends(get_current_user)],
     db: Annotated[sqlite3.Connection, Depends(get_db)],
-) -> ProfileDetail | None:
-    return profiles_service.get_profile_detail(db, int(user["id"]), key)
+) -> ProfileDetail:
+    return _found(profiles_service.get_profile_detail(db, int(user["id"]), key))
 
 
 @router.patch("/{key}", response_model=Profile)

@@ -13,6 +13,8 @@ second copy that can drift.
 from __future__ import annotations
 
 import logging
+import threading
+from typing import Callable
 
 import structlog
 
@@ -21,6 +23,69 @@ from ..db.repos import schedules as schedules_repo
 from .jobs import gather_for_profile
 
 log = structlog.get_logger("rag_lib.scheduler")
+
+
+# What to do if a job is dropped unrun (CR.6). A job queued behind busy
+# workers past ``misfire_grace_time`` is skipped by APScheduler: its body
+# never runs, so whatever the request opened for it -- a run row, a
+# "running" flag -- stayed open (a scan read as running for two hours,
+# 409-ing every "Scan now"). Whoever hands a job over says here how to
+# close what it opened; the listener does it when the job is missed.
+_on_missed: dict[str, Callable[[], None]] = {}
+_on_missed_lock = threading.Lock()
+
+MISSED = {
+    "scan": "This scan did not start: the server was too busy. Nothing was changed. Please try again.",
+    "import": "This import did not start: the server was too busy. Nothing was changed. Please try again.",
+}
+
+
+def on_missed(job_id: str, callback: Callable[[], None]) -> None:
+    """Run ``callback`` if job ``job_id`` is dropped without running.
+    Register before ``add_job``; ``forget_missed`` if ``add_job`` fails."""
+    with _on_missed_lock:
+        _on_missed[job_id] = callback
+
+
+def forget_missed(job_id: str) -> None:
+    with _on_missed_lock:
+        _on_missed.pop(job_id, None)
+
+
+def close_run_if_missed(job_id: str, run_id: int, *, what: str = "scan",
+                        undo: Callable | None = None) -> None:
+    """``on_missed`` for a job whose run row the request opened: the row is
+    closed with ``MISSED[what]``, and ``undo(conn)`` removes what the
+    request made for the job (an import's new draft or researcher)."""
+    def close() -> None:
+        from ..api.settings import get_settings
+        from ..db.repos import gather_runs as gather_runs_repo
+
+        conn = connect(get_settings().RADAR_DB_PATH)
+        try:
+            row = gather_runs_repo.get(conn, run_id)
+            if row is None or row["finished_at"] is not None:
+                return
+            gather_runs_repo.finish(conn, run_id, n_fetched=0, n_new=0, n_redup=0, error=MISSED[what])
+            if undo is not None:
+                undo(conn)
+        finally:
+            conn.close()
+    on_missed(job_id, close)
+
+
+def _job_event(event) -> None:
+    from apscheduler.events import EVENT_JOB_MISSED
+
+    with _on_missed_lock:
+        callback = _on_missed.pop(event.job_id, None)
+    if callback is None or event.code != EVENT_JOB_MISSED:
+        return
+    log.warning("scheduler.job_missed", job_id=event.job_id)
+    try:
+        callback()
+    except Exception:  # noqa: BLE001 -- the scheduler thread must go on
+        log.exception("scheduler.job_missed_close_failed", job_id=event.job_id)
 
 
 def build_scheduler(settings):
@@ -48,6 +113,10 @@ def build_scheduler(settings):
             "misfire_grace_time": 600,  # 10 min grace after a missed fire
         },
     )
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
+
+    # Ran (or failed) -> its callback is dropped; missed -> it runs (CR.6).
+    scheduler.add_listener(_job_event, EVENT_JOB_MISSED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     return scheduler
 
 

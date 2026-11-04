@@ -5,11 +5,12 @@ not stored as "not on OpenAlex" because OpenAlex did not reply, an interest
 is not saved without its first scan. ``OpenAlexUnavailable`` is the one
 error that says so, raised by ``OpenAlexClient._get`` for
 
-  quota    429: the day's requests are used up (or too many at once)
+  quota    429 with no requests left: the day's are used up
+  busy     429 with requests left: too many at once (CR.11 L9); a minute
   auth     401/403: OpenAlex wants an API key
   down     a 5xx, a timeout, no connection
 
-``quota`` and ``auth`` pause OpenAlex for this process until the time
+``quota``, ``busy`` and ``auth`` pause OpenAlex for this process until the time
 OpenAlex gave (the next UTC midnight when it gave none): every request in
 between would be refused the same way and spend nothing but time. While
 paused, ``_get`` refuses without calling, and the frontend shows a banner
@@ -34,6 +35,7 @@ BURST_PAUSE_SECONDS = 60
 
 _MESSAGES = {
     "quota": "OpenAlex's daily request limit has been reached.",
+    "busy": "OpenAlex is busy (too many requests at once).",
     "auth": "OpenAlex is refusing requests without an API key.",
     "down": "OpenAlex could not be reached.",
 }
@@ -62,7 +64,10 @@ class OpenAlexUnavailable(requests.HTTPError):
 
 def message(kind: str, until: float | None = None) -> str:
     text = _MESSAGES.get(kind, _MESSAGES["down"])
-    if until is not None:
+    if kind == "busy":
+        # Paused a minute: a time to the minute says nothing more.
+        text += " Try again in a minute."
+    elif until is not None:
         at = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         text += f" Paused until {at}."
     else:

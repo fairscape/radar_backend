@@ -1,5 +1,11 @@
 """Review round 12 (reviewer a): seeds attached while a scan runs are fitted only when
-*that* scan ends cleanly and nothing else has opened a run by then."""
+*that* scan ends cleanly and nothing else has opened a run by then.
+
+Since the 2026-11-02 review (FUNCTIONAL_SPEC CR.5, user: "失败的扫描不该改分数") a scan
+fits only once OpenAlex has answered it: a failed scan changes no fit and no score,
+and the next scan that gets its papers fits the seeds that arrived meanwhile. The
+first test here used to require the failed scan to fit; it is rewritten to the
+new rule."""
 
 from __future__ import annotations
 
@@ -56,7 +62,7 @@ def _count_refits(monkeypatch):
     return calls
 
 
-def test_a_seed_added_during_a_scan_that_fails_is_fitted_by_the_next_scan(monkeypatch, db_path, settings, profile_id):
+def test_a_seed_added_during_a_scan_that_fails_is_fitted_by_the_next_scan_not_the_failed_one(monkeypatch, db_path, settings, profile_id):
     _make_live(db_path, profile_id)
     calls = _count_refits(monkeypatch)
 
@@ -73,10 +79,13 @@ def test_a_seed_added_during_a_scan_that_fails_is_fitted_by_the_next_scan(monkey
 
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", _AttachThenBoom)
     scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings)
-    # The failed scan fits W2 itself once its row is closed as failed: the
-    # feed is scored against the seeds the user has, not after the next
-    # scan happens to run.
-    assert calls, "the failed scan closed without fitting the seed that arrived under it"
+    # The failed scan leaves the fit as it was (CR.5).
+    assert calls == [], "a failed scan refitted the interest"
+    conn = connect(db_path)
+    try:
+        assert wizard.fit_seed_ids(profiles_repo.get(conn, profile_id)) == ["W1"]
+    finally:
+        conn.close()
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: _StubGatherer([_candidate_paper("W100")]))
     scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings)
     conn = connect(db_path)
@@ -86,6 +95,11 @@ def test_a_seed_added_during_a_scan_that_fails_is_fitted_by_the_next_scan(monkey
     finally:
         conn.close()
     assert calls, "W2 was attached under a scan and no scan since has fitted it: the centroid is stale for good"
+    conn = connect(db_path)
+    try:
+        assert wizard.fit_seed_ids(profiles_repo.get(conn, profile_id)) == ["W1", "W2"]
+    finally:
+        conn.close()
 
 
 def test_a_seed_added_during_a_scan_is_fitted_even_when_scan_now_lands_as_it_closes(monkeypatch, db_path, settings, profile_id):
@@ -145,8 +159,15 @@ def test_a_seed_added_after_scan_now_was_accepted_but_before_the_job_started_is_
 
     monkeypatch.setattr(scheduler_jobs, "OpenAlexGatherer", lambda **kw: _NotingGatherer([_candidate_paper("W100")]))
     assert scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, run_id=run_id, tier="manual") == run_id
-    # Fitted before the fetch: this scan scores its candidates against W1+W2.
-    assert calls and calls[0] != "fetch", f"the scan fetched before fitting the seed that arrived: {calls}"
+    # Fitted once OpenAlex answered, before scoring (CR.5): this scan scores
+    # its candidates against W1+W2, and says so.
+    assert calls[:1] == ["fetch"] and len(calls) == 2, f"fetch, then one refit: {calls}"
+    conn = connect(db_path)
+    try:
+        seeds = conn.execute("SELECT seed_ids_json FROM gather_runs WHERE id = ?", (run_id,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert seeds == '["W1", "W2"]', seeds
 
 
 def test_a_legacy_fit_with_a_different_seed_count_is_refitted(monkeypatch, db_path, settings, profile_id):

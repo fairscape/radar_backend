@@ -235,10 +235,10 @@ def test_j1_wizard_to_feed_and_back(app, env):
     up1 = _ok(_upload(app, b"paper-one", "one.pdf", slug))
     up2 = _ok(_upload(app, b"paper-two", "two.pdf", slug))
     assert up1["id"].startswith("local:") and up2["id"].startswith("local:") and up1["id"] != up2["id"]
-    assert slug in up1["tags"] and up1["duplicate"] is not True
-    # The same PDF again is a duplicate, still tagged, still one seed.
-    again = _ok(_upload(app, b"paper-one", "one-copy.pdf", slug))
-    assert again["id"] == up1["id"] and again["duplicate"] is True
+    assert slug in up1["tags"]
+    # The same PDF again in the same interest is refused (CR.10): still one seed.
+    again = _upload(app, b"paper-one", "one-copy.pdf", slug)
+    assert again.status_code == 409, again.text
     docs = _ok(_request(app, "GET", "/api/vault/docs", params={"tag": slug}))
     assert {d["id"] for d in docs} == {up1["id"], up2["id"]}
 
@@ -805,7 +805,7 @@ def test_j4_two_users_do_not_see_each_other(app, env):
                                  ("POST", f"/api/profiles/draft/{copy_a}/save-edit", {}),
                                  ("DELETE", f"/api/profiles/draft/{copy_a}", {})):
             r = _request(app, method, path, headers=B, **kw)
-            assert r.status_code == 404 or (r.status_code == 200 and r.json() is None), (method, path, r.status_code, r.text)
+            assert r.status_code == 404, (method, path, r.status_code, r.text)     # L11: never 200 null
         # A adds the paper as a seed: B's interest does not change.
         fit_b = _one(env, "SELECT selector_config_json, n_seed FROM profiles WHERE id = ?", idb)
         _ok(_request(app, "POST", f"/api/profiles/{copy_a}/seeds", json={"openalex_ids": [paper]}))
@@ -827,7 +827,7 @@ def test_j4_two_users_do_not_see_each_other(app, env):
         da = _ok(_upload(app, b"the-same-pdf", "same.pdf", copy_a))
     with edit(B) as copy_b:
         db_ = _ok(_upload(app, b"the-same-pdf", "same.pdf", copy_b, headers=B))
-    assert da["id"] != db_["id"] and da["duplicate"] is not True and db_["duplicate"] is not True
+    assert da["id"] != db_["id"]
     mine = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}))}
     theirs = {d["id"] for d in _ok(_request(app, "GET", "/api/vault/docs", params={"tag": "shared"}, headers=B))}
     assert da["id"] in mine and db_["id"] not in mine and db_["id"] in theirs and da["id"] not in theirs
@@ -847,7 +847,7 @@ def test_j4_two_users_do_not_see_each_other(app, env):
     d_a = _ok(_request(app, "POST", "/api/profiles/draft", json={"name": "Only A"}))["slug"]
     assert _request(app, "GET", f"/api/profiles/draft/{d_a}/topics", headers=B).status_code == 404
     assert _request(app, "DELETE", f"/api/profiles/draft/{d_a}", headers=B).status_code == 404
-    assert _ok(_request(app, "GET", f"/api/profiles/{d_a}/detail", headers=B)) is None
+    assert _request(app, "GET", f"/api/profiles/{d_a}/detail", headers=B).status_code == 404
     assert _request(app, "POST", f"/api/profiles/{d_a}/seeds", json={"openalex_ids": [paper]}, headers=B).status_code == 404
     assert _ok(_request(app, "GET", "/api/profiles/drafts", headers=B)) == []
     # B forgetting their researcher leaves A's interest's researcher link alone.

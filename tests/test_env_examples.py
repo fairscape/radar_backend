@@ -48,9 +48,9 @@ ENVIRON_ONLY = {"RADAR_SQLITE_JOURNAL_MODE"}
 # start_backend.sh's own switch, not a backend setting.
 SCRIPT_ONLY = {"RADAR_ALLOW_EMPTY_DB"}
 
-ANY_KEY = re.compile(r"\bRADAR_[A-Z0-9_]+\b")
+ANY_KEY = re.compile(r"\b(?:RADAR|BIOXPLORER)_[A-Z0-9_]+\b")
 # "# RADAR_X=value" -- a commented-out line documents the default.
-COMMENTED = re.compile(r"^#\s*(RADAR_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
+COMMENTED = re.compile(r"^#\s*((?:RADAR|BIOXPLORER)_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
 
 
 def _text(name: str) -> str:
@@ -106,6 +106,11 @@ def test_deploy_env_example_loads_as_the_live_site(monkeypatch):
     assert path.is_file()
     for key in FIELDS:
         monkeypatch.delenv(key, raising=False)
+    # The live .env adds the sign-in secrets the template must not hold;
+    # without them the backend refuses to start (RADAR_REQUIRE_AUTH on).
+    monkeypatch.setenv("BIOXPLORER_GOOGLE_CLIENT_ID", "id.apps.googleusercontent.com")
+    monkeypatch.setenv("BIOXPLORER_GOOGLE_CLIENT_SECRET", "test-secret")
+    monkeypatch.setenv("BIOXPLORER_SESSION_SECRET", "x" * 48)
     s = Settings(_env_file=path)
     # Values that differ from the code defaults, so a file that failed to
     # load would not pass.
@@ -115,6 +120,9 @@ def test_deploy_env_example_loads_as_the_live_site(monkeypatch):
     assert s.RADAR_LOG_JSON is False
     assert s.RADAR_HOST == "127.0.0.1"
     assert s.RADAR_NIGHTLY_GATHER_ENABLED is False
+    assert s.BIOXPLORER_OIDC_REDIRECT_URI == "https://radar.bioxplorer.org/auth/login/callback"
+    assert s.BIOXPLORER_COOKIE_SECURE is True
+    assert s.RADAR_TRUST_EMAIL_HEADER is False
 
 
 def test_deploy_env_example_has_no_comment_after_a_value():

@@ -10,9 +10,8 @@
 # Identity: this file sets no X-User-Email, so every request is the
 # default user (single-user mode, RADAR_REQUIRE_AUTH=false). It strips a
 # client-sent one, or anyone could pick an account. For several users,
-# put a proxy that signs people in in front of this and have it set
-# X-User-Email (deploy/Caddyfile shows how the live site does it with
-# Cloudflare Access).
+# turn on the sign-in buttons instead (DEPLOY.md, "Users"; the /auth/*
+# block below is already here for them), as the live site does.
 {
 	admin off
 	auto_https off
@@ -24,6 +23,21 @@ http://:8080 {
 	encode gzip
 
 	handle /api/* {
+		# L4: a body over 55 MB (Caddy's MB is 10^6 bytes) is refused here
+		# with 413 before any of it reaches the backend, which would spool
+		# it to disk first. The vault takes PDFs up to RADAR_UPLOAD_MAX_MB
+		# (50 MiB = 52,428,800 bytes); the margin is the multipart envelope.
+		# Raise both together.
+		# By the declared length: `request_body max_size` alone only cuts
+		# the stream off, and the first 55 MB still went to the backend
+		# (measured). It stays for a body sent without a length.
+		@too_big expression `{http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 55000000`
+		respond @too_big "This request is larger than the server accepts." 413 {
+			close
+		}
+		request_body {
+			max_size 55MB
+		}
 		reverse_proxy 127.0.0.1:8000 {
 			header_up -X-User-Email
 			header_down Cache-Control "no-store"
@@ -32,6 +46,14 @@ http://:8080 {
 				read_timeout 600s
 				write_timeout 600s
 			}
+		}
+	}
+
+	# Sign-in buttons: /auth/login/<provider>, its
+	# callback and logout run in the backend and set its session cookie.
+	handle /auth/* {
+		reverse_proxy 127.0.0.1:8000 {
+			header_down Cache-Control "no-store"
 		}
 	}
 

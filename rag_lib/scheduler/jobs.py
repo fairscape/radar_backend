@@ -593,18 +593,22 @@ SCAN_BUSY = "Skipped: another scan of this interest was running."
 _scan_locks: dict[int, threading.Lock] = {}
 
 
-def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseException) -> None:
+def _close_failed_scan(conn, profile_id: int, run_id: int, settings, exc: BaseException,
+                       *, fetched: bool = True) -> None:
     """Close a scan's run as failed, with the pool on one scale.
 
     The candidates are committed a hundred at a time, each chunk carrying
     the batch's own ``score_pct``/``score_blended``; a failure between
     chunks left those rows ranked against the pool on another scale until
-    the next clean scan. The pool is re-scored first, best effort.
+    the next clean scan. The pool is re-scored first, best effort -- only
+    when the scan got its papers: one OpenAlex refused wrote nothing and
+    changes no score (CR.5).
     """
-    try:
-        rescore_pool(conn, profile_id, settings)
-    except Exception:  # noqa: BLE001 -- the failure being reported comes first
-        log.exception("scheduler.gather_failed.rescore_failed", profile_id=profile_id, run_id=run_id)
+    if fetched:
+        try:
+            rescore_pool(conn, profile_id, settings)
+        except Exception:  # noqa: BLE001 -- the failure being reported comes first
+            log.exception("scheduler.gather_failed.rescore_failed", profile_id=profile_id, run_id=run_id)
     for attempt in (1, 2):
         try:
             gather_runs_repo.finish(
@@ -628,8 +632,9 @@ def _refit_if_fit_stale(conn, user_id: int, profile_id: int, run_id: int | None,
     other seeds. A seed attached or removed while a scan runs (an upload,
     "add as seeds") is not fitted then -- the refit refuses under a running
     scan -- and no scan fits it on its own: every scan hydrates the stored
-    fit. Called at the start of a scan (under the scan lock, with the own
-    run row open) and when it closes, clean or failed. Best effort."""
+    fit. Called once OpenAlex has answered a scan (under the scan lock, with
+    the own run row open) and when a clean scan closes; never for a failed
+    one (CR.5). Best effort."""
     try:
         row = profiles_repo.get(conn, profile_id)
         if row is None or row["is_draft"]:
@@ -713,11 +718,8 @@ def _gather_for_profile_locked(
             )
 
         reporter = _ProgressReporter(conn, run_id)
+        fetched = False
         try:
-            # Seeds that arrived since the fit (under an earlier scan, or
-            # between "Scan now" and this job) are fitted before scoring.
-            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="start")
-            profile_row = profiles_repo.get(conn, profile_id) or profile_row
             reporter.step(
                 "loading_profile",
                 message="Loading profile and seed embeddings",
@@ -744,6 +746,14 @@ def _gather_for_profile_locked(
                     f"All {len(topics)} topics are switched off — "
                     f"enable at least one to gather."
                 )
+                # A clean run, OpenAlex not asked: seeds changed since the
+                # fit are fitted here, as a scan that fetched would (review
+                # B2-1). Without it the fit stayed on the old seeds while
+                # every topic was off.
+                _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="no-enabled-topics")
+                profile_row = profiles_repo.get(conn, profile_id) or profile_row
+                scored_with = (wizard_service.fit_seed_ids(profile_row)
+                               or sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id)))
                 reporter.step("done", message=msg)
                 if on_success is not None:
                     on_success(conn)
@@ -759,7 +769,6 @@ def _gather_for_profile_locked(
                 )
                 return run_id
 
-            selector = _build_selector(profile_row, profile)
             gatherer = OpenAlexGatherer(mailto=mailto)
 
             reporter.step("fetching", message="Querying OpenAlex")
@@ -770,6 +779,17 @@ def _gather_for_profile_locked(
                 )
             else:
                 candidates = gatherer.fetch(profile, since=since, limit=limit)
+            fetched = True
+            # OpenAlex answered: only now are seeds that arrived since the
+            # fit (under an earlier scan, or between "Scan now" and this
+            # job) fitted, before scoring. A scan OpenAlex refused changes
+            # no fit and no score (CR.5: "失败的扫描不该改分数").
+            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="fetched")
+            profile_row = profiles_repo.get(conn, profile_id) or profile_row
+            profile = _load_profile(conn, profile_row)
+            scored_with = (wizard_service.fit_seed_ids(profile_row)
+                           or sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id)))
+            selector = _build_selector(profile_row, profile)
             # An interest's own seeds are not news to it.
             candidates = profiles_repo.without_seeds(
                 candidates, profiles_repo.seed_keys(conn, profile_id))
@@ -940,8 +960,9 @@ def _gather_for_profile_locked(
             _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="end")
             return run_id
         except Exception as exc:  # noqa: BLE001 — surface into audit row
-            _close_failed_scan(conn, profile_id, run_id, settings, exc)
-            _refit_if_fit_stale(conn, user_id, profile_id, run_id, when="failed")
+            # No refit here: a failed scan leaves the fit and the scores as
+            # they were (CR.5); the next scan fits what has changed.
+            _close_failed_scan(conn, profile_id, run_id, settings, exc, fetched=fetched)
             return run_id
     finally:
         conn.close()
@@ -986,7 +1007,12 @@ def save_draft(
     conn = connect(settings.RADAR_DB_PATH)
     try:
         row = profiles_repo.get(conn, profile_id)
-        if row is not None and row["is_draft"]:
+        run = gather_runs_repo.get(conn, run_id) if run_id is not None else None
+        if run is not None and run["error"] == SCAN_BUSY:
+            # Skipped: another scan of this draft holds it (a second save);
+            # the rows are that scan's, not this one's to remove (CR.11 L7).
+            log.info("save_draft.skipped", profile_id=profile_id, run_id=run_id)
+        elif row is not None and row["is_draft"]:
             conn.execute("DELETE FROM profile_candidates WHERE profile_id = ?", (profile_id,))
             conn.commit()
             log.info("save_draft.failed", profile_id=profile_id, run_id=run_id)

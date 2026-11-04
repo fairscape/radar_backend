@@ -13,6 +13,7 @@ import math
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 import structlog
@@ -23,8 +24,9 @@ from fastapi.responses import JSONResponse
 from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
 
+from . import oidc
 from .logging import configure_logging
-from .routers import chat, health, profiles, prosopia, radar, researchers, users, vault
+from .routers import auth, chat, health, profiles, prosopia, radar, researchers, users, vault
 from .settings import get_settings
 
 
@@ -121,6 +123,29 @@ async def lifespan(app: FastAPI):
         log.info("api.shutdown")
 
 
+
+_SECRET_FIELDS = {"api_key"}
+
+
+def _holds_secret(tp, depth: int = 0) -> bool:
+    """``tp`` (a body annotation) has a secret field at any depth: one
+    named in ``_SECRET_FIELDS`` or typed ``SecretStr``."""
+    import typing
+
+    from pydantic import BaseModel, SecretStr
+
+    if depth > 6 or tp is None:
+        return False
+    if tp is SecretStr:
+        return True
+    if any(_holds_secret(a, depth + 1) for a in typing.get_args(tp)):
+        return True
+    if isinstance(tp, type) and issubclass(tp, BaseModel):
+        return any(name in _SECRET_FIELDS or _holds_secret(f.annotation, depth + 1)
+                   for name, f in tp.model_fields.items())
+    return False
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(
@@ -136,12 +161,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Dev-only: allow any origin. Switch back to an explicit allow-list
-    # before exposing this service publicly.
+    # CORS: only the origins RADAR_CORS_ORIGINS lists (live: the vite dev
+    # server; the SPA itself is same-origin and needs none). This used to
+    # allow every origin with credentials, which was harmless while the
+    # identity was a header a page elsewhere could not set, and is not with
+    # the sign-in cookie: any page the browser sends that cookie from could
+    # have read the answers. "*" stays possible for a header-model dev box,
+    # but never with credentials.
+    _origins = [o for o in settings.RADAR_CORS_ORIGINS if o != "*"]
+    _any_origin = "*" in settings.RADAR_CORS_ORIGINS
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
+        allow_origins=["*"] if _any_origin else _origins,
+        allow_credentials=not _any_origin,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["*"],
@@ -151,11 +183,36 @@ def create_app() -> FastAPI:
     # the Anthropic key typed in for one topic generation -- that would hand
     # the key back in the response and to anything that records responses.
     # SecretStr masks a valid string only; a key sent in the wrong shape (a
-    # list, a number) came back verbatim. Drop input/ctx from those errors.
+    # list, a number) came back verbatim. And an error about the body as a
+    # whole (not an object, a missing field) echoes all of it, key
+    # included (L16). So: when the route's body model holds a secret field
+    # anywhere, no error of that request carries input or ctx.
     from fastapi.exceptions import RequestValidationError
     from fastapi.encoders import jsonable_encoder
 
-    _SECRET_FIELDS = {"api_key"}
+    _secret_routes: dict[int, bool] = {}
+
+    def _body_params(dependant, depth: int = 0):
+        """The route's body parameters, its sub-dependencies' included."""
+        yield from getattr(dependant, "body_params", None) or ()
+        if depth < 8:
+            for sub in getattr(dependant, "dependencies", None) or ():
+                yield from _body_params(sub, depth + 1)
+
+    def _route_holds_secret(request: Request) -> bool:
+        route = request.scope.get("route")
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            return False
+        if id(route) not in _secret_routes:
+            try:
+                _secret_routes[id(route)] = any(
+                    p.name in _SECRET_FIELDS or _holds_secret(p.field_info.annotation)
+                    for p in _body_params(dependant)
+                )
+            except Exception:     # unreadable: say less, never 500 a 422
+                _secret_routes[id(route)] = True
+        return _secret_routes[id(route)]
 
     def _json_safe(value, depth: int = 0):
         """An echoed input JSON can encode: NaN / inf as text, long text cut.
@@ -176,8 +233,9 @@ def create_app() -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
         errors = []
+        secret_body = _route_holds_secret(request)
         for err in exc.errors():
-            if _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}:
+            if secret_body or _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}:
                 err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
             errors.append(_json_safe(jsonable_encoder(err)))
         return JSONResponse(status_code=422, content={"detail": errors})
@@ -249,6 +307,52 @@ def create_app() -> FastAPI:
             "request.conflict", method=request.method, path=request.url.path, error=str(exc))
         return JSONResponse(status_code=409, content={"detail": "conflicting change; reload and try again"})
 
+    # Cross-site writes. With the sign-in cookie the browser attaches the
+    # identity by itself, so a page on another site (or another
+    # *.bioxplorer.org subdomain, which SameSite=Lax counts as the same
+    # site) could submit a form or fetch that deletes an interest as the
+    # person viewing it. The SPA only ever writes same-origin, so a write
+    # the browser marks cross-origin, or whose Origin is not ours, is
+    # refused before any route runs. Reads are left alone: CORS keeps
+    # their answers from other origins.
+    _own_origins = set(_origins)
+    if settings.BIOXPLORER_OIDC_REDIRECT_URI:
+        _u = urlsplit(settings.BIOXPLORER_OIDC_REDIRECT_URI)
+        _own_origins.add(f"{_u.scheme}://{_u.netloc}")
+
+    @app.middleware("http")
+    async def refuse_cross_site_writes(request: Request, call_next):
+        if (request.method not in ("GET", "HEAD", "OPTIONS")
+                and oidc.providers(settings)):
+            site = request.headers.get("sec-fetch-site")
+            origin = request.headers.get("origin")
+            if (site is not None and site not in ("same-origin", "none")) or (
+                    origin is not None and origin not in _own_origins):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "cross-site request refused"},
+                )
+        return await call_next(request)
+
+    # Sliding session (records/21 M1): a successful API request on a session
+    # past half its lifetime gets a fresh cookie, so only
+    # BIOXPLORER_SESSION_DAYS without a visit signs someone out, never day
+    # 14 of daily use.
+    # Not on errors, and not where the route set a cookie itself: that is
+    # what keeps /auth/logout's clearing (and sign-in's own cookie) from
+    # being overwritten by a renewal.
+    @app.middleware("http")
+    async def renew_session(request: Request, call_next):
+        response = await call_next(request)
+        if (oidc.providers(settings)
+                and response.status_code < 400
+                and "set-cookie" not in response.headers):
+            session = oidc.request_session(settings, request)
+            token = oidc.renewed_session(settings, session) if session else None
+            if token:
+                oidc.set_session_cookie(settings, response, token)
+        return response
+
     access_log = structlog.get_logger("rag_lib.api.access")
 
     @app.middleware("http")
@@ -289,6 +393,7 @@ def create_app() -> FastAPI:
     app.include_router(users.router, prefix="/api/users", tags=["users"])
     app.include_router(prosopia.router, prefix="/api/import", tags=["import"])
     app.include_router(researchers.router, prefix="/api/researchers", tags=["researchers"])
+    app.include_router(auth.router, prefix="/auth", tags=["auth"])
 
     # Top-level liveness for load-balancer / docker healthcheck use.
     @app.get("/health", include_in_schema=False)

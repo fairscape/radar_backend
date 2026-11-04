@@ -41,7 +41,7 @@ from ...db.repos import (
     users as users_repo,
 )
 from ...openalex_client import OpenAlexClient
-from ...prosopia_client import DEFAULT_BASE_URL
+from ...prosopia_client import DEFAULT_BASE_URL, looks_like_orcid
 from ..mappers import profile_row_to_profile
 from ..schemas import (
     Draft,
@@ -179,10 +179,11 @@ def record_prosopia_researcher(
     base_url: str | None,
 ) -> int:
     """Upsert the person behind a Prosopia profile; returns the row id."""
-    rid = str(_read(profile, "rid", "") or "").strip()
-    # Upper-cased as the ORCID import stores it: the in-flight check and
-    # the dedup of one person under both sources compare this column.
-    orcid = rid.upper() if rid and not rid.lower().startswith("local:") else None
+    # The rid was made one form where the profile was read (CR.8): the
+    # bare upper-case ORCID the ORCID import stores, which the in-flight
+    # check and the dedup of one person under both sources compare.
+    rid = str(_read(profile, "rid", "") or "")
+    orcid = rid if looks_like_orcid(rid) else None
     metadata = _read(profile, "metadata")
     url = getattr(metadata, "url", None) if metadata is not None else None
     expertise = _read(profile, "expertise", "") or None
@@ -309,11 +310,11 @@ def prepare_researcher_import(
         _refuse_if_importing(
             conn, user_id,
             researcher_id=int(existing["id"]) if existing is not None else None,
-            orcid=rid.upper() if rid and not rid.lower().startswith("local:") else None,
+            orcid=rid if looks_like_orcid(rid) else None,
         )
         refuse_a_second_profile(
             conn, user_id=user_id, source="prosopia", key=slug,
-            orcid=rid.upper() if rid and not rid.lower().startswith("local:") else None,
+            orcid=rid if looks_like_orcid(rid) else None,
             refresh_of=refresh_of,
         )
         records = select_records(profile, slug, paper_ids)

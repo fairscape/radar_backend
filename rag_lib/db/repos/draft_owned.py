@@ -9,9 +9,10 @@ stay like anything else in the database.
 
 What the draft only used is never the draft's: a paper or researcher
 already in the database, a file uploaded before. And an item the draft
-brought in is kept when something else has come to use it meanwhile:
-another interest's seed, a feed row, feedback, a researcher's paper list,
-another file of the same work, an interest linked to the researcher.
+brought in is kept when something else has come to use it meanwhile, for
+any user: another interest's seed, a feed row, feedback, a researcher's
+paper list, another file of the same work, a paper kept in a Vault
+(``paper_rows``), an interest linked to the researcher.
 
 Only ``own`` and ``clear`` are called outside this module; neither commits.
 """
@@ -56,20 +57,6 @@ def owned(conn: sqlite3.Connection, profile_id: int) -> dict[str, list[str]]:
     return out
 
 
-_PAPER_USES = (
-    "SELECT 1 FROM profile_seeds WHERE openalex_id = :id",
-    "SELECT 1 FROM profile_candidates WHERE openalex_id = :id",
-    "SELECT 1 FROM feedback_events WHERE openalex_id = :id",
-    "SELECT 1 FROM researcher_papers WHERE openalex_id = :id",
-    "SELECT 1 FROM paper_versions WHERE canonical_openalex_id = :id AND version_id != :id",
-    "SELECT 1 FROM draft_owned WHERE kind = 'paper' AND item = :id",
-)
-
-
-def _paper_in_use(conn: sqlite3.Connection, openalex_id: str) -> bool:
-    return any(conn.execute(sql, {"id": openalex_id}).fetchone() for sql in _PAPER_USES)
-
-
 def _researcher_in_use(conn: sqlite3.Connection, researcher_id: int) -> bool:
     return any(conn.execute(sql, (researcher_id,)).fetchone() for sql in (
         "SELECT 1 FROM profiles WHERE researcher_id = ?",
@@ -104,18 +91,18 @@ def discard(conn: sqlite3.Connection, profile_id: int) -> dict[str, list[str]]:
                 gone["researcher"].append(rid)
         # Versions before the public records: a version is the use that
         # keeps its public record.
+        from . import paper_rows
         from .versions import is_version
 
         for oa in sorted(items["paper"], key=lambda i: not is_version(i)):
-            if _paper_in_use(conn, oa):
-                continue
             paths = {r[0] for r in conn.execute(
                 "SELECT local_path FROM papers WHERE openalex_id = ? AND local_path IS NOT NULL "
                 "UNION SELECT local_path FROM paper_uploads WHERE openalex_id = ? AND local_path IS NOT NULL",
                 (oa, oa))}
             # Its vectors, upload row, version record and embed queue entry
             # go by cascade.
-            conn.execute("DELETE FROM papers WHERE openalex_id = ?", (oa,))
+            if not paper_rows.delete_if_unused(conn, oa):
+                continue
             gone["paper"].append(oa)
             gone["files"].extend(sorted(paths))
         conn.commit()

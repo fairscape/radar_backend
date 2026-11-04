@@ -20,23 +20,28 @@
 set -uo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin:${PATH:-}
 
-DB=/var/tmp/radar-nkw3mr/radar.db
-VAULT=/bigtemp/nkw3mr/radar_deployment/vault
+# Every path below may be overridden from the environment (BACKUP_DB,
+# BACKUP_VAULT, ...): tests/test_cr_backup.py runs this script against a
+# scratch database and a local directory standing in for R2. cron sets
+# none of them.
+DB=${BACKUP_DB:-/var/tmp/radar-nkw3mr/radar.db}
+VAULT=${BACKUP_VAULT:-/bigtemp/nkw3mr/radar_deployment/vault}
 DEPLOY=/bigtemp/nkw3mr/radar_deployment
-LOCAL="$DEPLOY/backups"
+LOCAL=${BACKUP_LOCAL:-"$DEPLOY/backups"}
 # The env the backend actually runs from. Pointed at conda_env while the
 # service moved to conda_env312, so deleting the orphaned env would have
 # silently broken every snapshot and the restore path's integrity check,
 # announced only by a WARN three hours later. Version skew matters too: the
 # backup CLI must not be older than the library that writes the file.
-SQ="$DEPLOY/conda_env312/bin/sqlite3"
-RCLONE="$DEPLOY/bin/rclone"
+SQ=${BACKUP_SQLITE3:-"$DEPLOY/conda_env312/bin/sqlite3"}
+RCLONE=${BACKUP_RCLONE:-"$DEPLOY/bin/rclone"}
 # The bucket is named for the org, not this app, so everything RADAR
 # writes lives under one prefix and other things can share the bucket.
-REMOTE=r2:bioxplorer/radar
+REMOTE=${BACKUP_REMOTE:-r2:bioxplorer/radar}
 
 KEEP_HOURLY=48   # ~2 days of hourly rollback points
 KEEP_DAILY=60    # ~2 months
+KEEP_VAULT_DELETED=60   # days a PDF the sync removed or replaced stays in vault-deleted/ (CR.9)
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
@@ -48,6 +53,8 @@ dirbytes() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{pri
 # R2 is optional: the script is installed before the bucket exists, and it
 # must keep making local snapshots until then rather than failing.
 r2_ready() {
+	# A test's local directory "remote" needs no config.
+	[ -n "${BACKUP_REMOTE:-}" ] && return 0
 	local cfg="$HOME/.config/rclone/rclone.conf"
 	[ -x "$RCLONE" ] && [ -f "$cfg" ] || return 1
 	# The config ships with <placeholders> before the token exists. Treating
@@ -57,6 +64,18 @@ r2_ready() {
 	# pattern reads its own documentation as an unconfigured remote.
 	grep -qE '^[[:space:]]*(access_key_id|secret_access_key|endpoint)[[:space:]]*=.*<' "$cfg" && return 1
 	"$RCLONE" listremotes 2>/dev/null | grep -q '^r2:'
+}
+
+# Keep $2 for good: copy it to pinned/ (never pruned; backed up to R2 by the
+# next push) and say so in backup.log and pinned.log, which radar.sh
+# watchdog reports once. $1 names what shrank, $3 says by how much.
+pin() {
+	local what=$1 file=$2 why=$3
+	mkdir -p "$LOCAL/pinned"
+	cp -n "$file" "$LOCAL/pinned/" || { log "FAILED: could not pin $(basename "$file")"; return 1; }
+	local line="$(date '+%Y-%m-%d %H:%M:%S') $what shrank: $why -- kept $(basename "$file") in pinned/"
+	echo "$line" >>"$LOCAL/pinned.log"
+	log "WARN: $line"
 }
 
 do_backup() {
@@ -96,10 +115,15 @@ do_backup() {
 	fi
 
 	# integrity_check says the file is well-formed, not that it is this
-	# database. An empty or truncated one is well-formed too, so compare the
-	# row counts against the newest snapshot we already trust: a real
-	# database only grows, and a sudden collapse means something is wrong
-	# upstream, not that the old backups should be pruned to make room.
+	# database: an empty or half-written one is well-formed too. Such a
+	# snapshot, kept hourly, would push every good one out of the rolling
+	# windows below (48 hourly, 60 daily) within days. A collapse in row
+	# count is not proof of that -- deleting interests or switching to an
+	# empty database shrink it too -- so it does not stop the backup
+	# (the user's choice, 2026-11-02). Instead the last snapshot from before
+	# the shrink is pinned: copied to pinned/, which nothing prunes, here and
+	# on R2, and reported. An accident leaves the full database there to
+	# restore; a deliberate shrink costs one file, deleted by hand.
 	local rows prev_rows prev
 	rows=$("$SQ" "$tmp" "SELECT (SELECT COUNT(*) FROM papers) + (SELECT COUNT(*) FROM profiles);" 2>/dev/null || echo 0)
 	prev=$(ls -1t "$LOCAL/hourly"/radar-*.db.gz 2>/dev/null | head -1)
@@ -118,23 +142,12 @@ do_backup() {
 			prev_rows=0
 		fi
 		rm -f "$prev_tmp"
-		# A tenth is generous: it tolerates a deliberate cleanup while still
-		# catching an empty or half-written database.
-		if [ "${prev_rows:-0}" -gt 0 ] && [ "$rows" -lt $((prev_rows / 10)) ]; then
-			# A deliberate wipe trips this on every run from then on, not
-			# just once: the newest trusted snapshot stays the pre-wipe one,
-			# so without a way to say "yes, on purpose" the backups stop for
-			# good (2026-09-29, clearing test data). ACCEPT_SHRINK=1 keeps
-			# this one snapshot anyway; it becomes the newest, and so the
-			# baseline the next run compares against. An env var rather
-			# than a flag so cron can never pass it by accident.
-			if [ "${ACCEPT_SHRINK:-0}" = 1 ]; then
-				log "ACCEPT_SHRINK: keeping a snapshot of $rows papers+profiles (previous had $prev_rows) as the new baseline"
-			else
-				log "FAILED: snapshot has $rows papers+profiles, previous had $prev_rows -- refusing to keep it or prune anything (ACCEPT_SHRINK=1 if the shrink was deliberate)"
-				rm -f "$tmp"
-				return 1
-			fi
+		# Below a tenth, or empty after non-empty (L14). Multiplied, not
+		# divided: with a small baseline `prev_rows / 10` rounds to 0, and
+		# 9 rows -> 0 rows went unnoticed.
+		rows=${rows:-0}
+		if [ "${prev_rows:-0}" -gt 0 ] && { [ "$rows" -eq 0 ] || [ $((rows * 10)) -lt "$prev_rows" ]; }; then
+			pin "database" "$prev" "snapshot has $rows papers+profiles, the previous one had $prev_rows"
 		fi
 	fi
 
@@ -178,6 +191,10 @@ do_backup() {
 		fi
 		"$RCLONE" copy "$LOCAL/daily/radar-$day.db.gz" "$REMOTE/daily/" --no-traverse -q ||
 			log "WARN: R2 push failed for daily"
+		# Never pruned, here or there (see pin).
+		if [ -d "$LOCAL/pinned" ]; then
+			"$RCLONE" copy "$LOCAL/pinned/" "$REMOTE/pinned/" -q || log "WARN: R2 push failed for pinned/"
+		fi
 		# Mirror the local retention window into the bucket.
 		"$RCLONE" delete "$REMOTE/hourly/" --min-age "$((KEEP_HOURLY))h" -q 2>/dev/null
 		"$RCLONE" delete "$REMOTE/daily/" --min-age "$((KEEP_DAILY))d" -q 2>/dev/null
@@ -186,17 +203,64 @@ do_backup() {
 		# change rarely -- a daily incremental is enough, and `sync` only
 		# moves what differs.
 		if [ ! -f "$LOCAL/.vault-synced-$day" ]; then
-			if "$RCLONE" sync "$VAULT" "$REMOTE/vault/" -q; then
+			if vault_sync "$day"; then
 				rm -f "$LOCAL"/.vault-synced-*
 				touch "$LOCAL/.vault-synced-$day"
-				log "vault synced to R2"
-			else
-				log "WARN: vault sync failed"
 			fi
 		fi
 	else
 		log "R2 not configured yet -- local snapshot only"
 	fi
+}
+
+# The daily vault mirror (CR.9). `sync` deletes on the remote whatever is
+# gone locally, so a vanished or emptied vault directory would have erased
+# the only other copy of every upload by the next morning. So a file the
+# sync removes or overwrites is moved aside instead (--backup-dir):
+#  - normally to vault-deleted/<day>/, kept KEEP_VAULT_DELETED days;
+#  - when the local vault has fewer than half the remote's files, to
+#    vault-pinned/<day>/, which nothing prunes, and reported -- as the
+#    database's pinned snapshot: the sync still runs (the user's choice,
+#    2026-11-02), and nothing it removed is lost.
+vault_sync() {
+	local day=$1 here there keep_in
+	here=$(find "$VAULT" -type f 2>/dev/null | wc -l)
+	if ! there=$("$RCLONE" lsf -R --files-only "$REMOTE/vault/" 2>/dev/null | wc -l); then
+		log "FAILED: vault sync: could not list $REMOTE/vault/ -- not syncing"
+		return 1
+	fi
+	keep_in="vault-deleted/$day"
+	if [ "$there" -gt 0 ] && [ $((here * 2)) -lt "$there" ]; then
+		keep_in="vault-pinned/$day"
+		local line="$(date '+%Y-%m-%d %H:%M:%S') vault shrank: $here files here, $there on R2 -- what the sync removes is kept in $keep_in/ on R2"
+		mkdir -p "$LOCAL"
+		echo "$line" >>"$LOCAL/pinned.log"
+		log "WARN: $line"
+	fi
+	if ! "$RCLONE" sync "$VAULT" "$REMOTE/vault/" --backup-dir "$REMOTE/$keep_in" -q; then
+		log "WARN: vault sync failed"
+		return 1
+	fi
+	log "vault synced to R2 ($here files; removed or replaced ones under $keep_in)"
+	prune_vault_deleted
+	return 0
+}
+
+# By the day in the directory's name, not --min-age: a moved file keeps
+# its own modification time, so a PDF uploaded months ago and deleted
+# today would be pruned the same night.
+prune_vault_deleted() {
+	local cutoff d
+	cutoff=$(date -d "-${KEEP_VAULT_DELETED} days" +%Y%m%d)
+	"$RCLONE" lsf --dirs-only "$REMOTE/vault-deleted/" 2>/dev/null | while read -r d; do
+		d=${d%/}
+		[[ "$d" =~ ^[0-9]{8}$ ]] || continue
+		if [ "$d" -lt "$cutoff" ]; then
+			"$RCLONE" purge "$REMOTE/vault-deleted/$d" -q && log "pruned vault-deleted/$d"
+		fi
+	done
+	# Nothing to list (no file was ever removed) is not a failure.
+	return 0
 }
 
 do_status() {
@@ -223,6 +287,14 @@ do_status() {
 
 do_restore() {
 	local src=${1:-} yes=${2:-}
+	# The paths above can be pointed elsewhere (tests), but this function
+	# also stops, pauses and restarts the live service, which they cannot
+	# redirect: with any override set it would restore a scratch file and
+	# still take the live backend down (review L5).
+	if [ -n "${BACKUP_DB:-}${BACKUP_VAULT:-}${BACKUP_LOCAL:-}${BACKUP_REMOTE:-}${BACKUP_RCLONE:-}${BACKUP_SQLITE3:-}" ]; then
+		echo "restore refuses to run with BACKUP_* overrides set: it acts on the live service" >&2
+		return 2
+	fi
 	[ -f "$src" ] || { echo "用法: $0 restore <快照文件.db.gz> [--yes]" >&2; exit 2; }
 
 	# Overwriting the live database is the most destructive thing here, and
@@ -256,7 +328,7 @@ do_restore() {
 	fi
 
 	log "停后端"
-	tmux kill-session -t radar-backend 2>/dev/null
+	tmux kill-session -t =radar-backend 2>/dev/null
 	sleep 2
 
 	# The -wal and -shm sidecars must go with the file they belong to. The
@@ -280,6 +352,9 @@ do_restore() {
 		log "watchdog 已恢复"
 	fi
 }
+
+# Sourced (tests), only the functions are defined.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 case "${1:-backup}" in
 backup) do_backup ;;

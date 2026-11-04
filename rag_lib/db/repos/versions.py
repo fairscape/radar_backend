@@ -1,7 +1,7 @@
 """Each user's upload of a PDF is its own paper: a private version.
 
-A version is a ``papers`` row under ``local:upload:<user_id>:<sha256>``
-(migration 0029). It holds what was read from that user's file -- body
+A version is a ``papers`` row under ``local:upload:<user_id>:<sha256>:<token>``
+(one per upload, CR.10; ``local:upload:<user_id>:<sha256>`` before, migration 0029). It holds what was read from that user's file -- body
 text, embeddings, UMLS concepts, content topics -- and a copy of the
 public record's metadata when OpenAlex matched it. The public row
 (``https://openalex.org/W...``) is bibliographic only: the same work
@@ -38,7 +38,18 @@ PROSOPIA_PREFIX = "local:prosopia:"
 
 
 def version_id(user_id: int, file_hash: str) -> str:
+    """The id an upload of ``file_hash`` had before CR.10, and still has
+    for a profile built from PDFs on the command line."""
     return f"{PREFIX}{int(user_id)}:{file_hash}"
+
+
+def new_upload_id(user_id: int, file_hash: str) -> str:
+    """A fresh id for one upload (FUNCTIONAL_SPEC CR.10): every upload is a
+    paper of its own, so the same file in two interests, or uploaded again
+    after a Vault delete, never shares a row with another upload."""
+    import secrets
+
+    return f"{PREFIX}{int(user_id)}:{file_hash}:{secrets.token_hex(6)}"
 
 
 def prosopia_copy_id(user_id: int, work_id: str) -> str:
@@ -96,14 +107,15 @@ def version_numbers(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[i
     The same paper: the same OpenAlex work; or, for a file OpenAlex has no
     record of, the same title (``_title_key``) as another of the user's
     files -- not when that title is only the file's name (the PDF had none)
-    or "Untitled PDF". Papers that came in any other way (ORCID, a search)
+    or "Untitled PDF" -- then the same file (``file_hash``), uploaded into
+    several interests (CR.10). Papers that came in any other way (ORCID, a search)
     are not uploads and take no number. Two files uploaded within the same
     second (``uploaded_at`` has no finer grain) are in the order they were
     registered.
     """
     rows = conn.execute(
         """
-        SELECT v.version_id, v.canonical_openalex_id, v.title_from_file, p.title,
+        SELECT v.version_id, v.canonical_openalex_id, v.title_from_file, p.title, v.file_hash,
                COALESCE(u.uploaded_at, p.first_seen_at, '') AS at
         FROM paper_versions v
         JOIN papers p ON p.openalex_id = v.version_id
@@ -117,7 +129,7 @@ def version_numbers(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[i
     by_title: dict[str, str] = {}
     # Matched files first: an unmatched file with a matched one's title
     # joins that work's group.
-    for vid, canonical, from_file, title, _at in sorted(rows, key=lambda r: r[1] is None):
+    for vid, canonical, from_file, title, file_hash, _at in sorted(rows, key=lambda r: r[1] is None):
         key = _title_key(title)
         named = bool(key) and not from_file and key != "untitled pdf"
         if canonical is not None:
@@ -127,9 +139,9 @@ def version_numbers(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[i
         elif named:
             group_of[vid] = by_title.setdefault(key, f"title:{key}")
         else:
-            group_of[vid] = f"file:{vid}"
+            group_of[vid] = f"file:{file_hash or vid}"
     members: dict[str, list[tuple[str, str]]] = {}
-    for vid, _c, _f, _t, at in rows:
+    for vid, _c, _f, _t, _h, at in rows:
         members.setdefault(group_of[vid], []).append((vid, at))
     return {vid: (n, at) for group in members.values() if len(group) > 1
             for n, (vid, at) in enumerate(group, start=1)}
@@ -195,6 +207,23 @@ def same_work_seeds(conn: sqlite3.Connection, profile_id: int, paper_id: str) ->
         ORDER BY s.openalex_id
         """,
         (profile_id, paper_id, work, work),
+    )]
+
+
+def same_file_seeds(conn: sqlite3.Connection, profile_id: int, paper_id: str) -> list[str]:
+    """The profile's seeds that are uploads of the same bytes as upload
+    ``paper_id`` (another upload of one file). Empty for any other paper."""
+    if not is_upload(paper_id):
+        return []
+    return [r[0] for r in conn.execute(
+        """
+        SELECT s.openalex_id FROM profile_seeds s
+        JOIN paper_versions v ON v.version_id = s.openalex_id
+        JOIN paper_versions me ON me.version_id = ?
+        WHERE s.profile_id = ? AND s.openalex_id != ? AND v.file_hash = me.file_hash
+        ORDER BY s.openalex_id
+        """,
+        (paper_id, profile_id, paper_id),
     )]
 
 

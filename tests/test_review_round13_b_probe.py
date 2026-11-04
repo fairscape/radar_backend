@@ -221,7 +221,8 @@ def test_probe_feed_add_to_seeds(app, env):
 def test_probe_vault(app, env):
     r1 = _ok(_upload(app, b"bytes-1", "first.pdf"))
     print("up1:", r1)
-    r2 = _ok(_upload(app, b"bytes-1", "first.pdf"))
+    # The same bytes into the same interest: refused (CR.10), not a duplicate.
+    r2 = _ok(_upload(app, b"bytes-1", "first.pdf"), 409)
     print("up1 again:", r2)
     r3 = _ok(_upload(app, b"bytes-2", "first.pdf"))
     print("changed file same name:", r3)

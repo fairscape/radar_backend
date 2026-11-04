@@ -12,7 +12,7 @@ from tests.test_researchers import env  # noqa: F401 -- fixture
 from tests.test_review_round12_isolation import A, B, _request, world  # noqa: F401 -- fixture
 
 TABLES = ("papers", "paper_embeddings", "paper_uploads", "paper_versions", "profile_seeds",
-          "researchers", "researcher_papers", "draft_owned")
+          "researchers", "researcher_papers", "draft_owned", "vault_kept", "deleted_seeds")
 
 
 def _draft(world, name, headers=A) -> str:
@@ -81,7 +81,9 @@ def test_s1_discarding_a_draft_removes_its_uploads(pdfs):
     assert set(_vault(pdfs)) == vault
 
 
-def test_s2_a_duplicate_upload_into_a_draft_is_not_the_drafts(pdfs):
+def test_s2_the_same_file_in_a_draft_is_the_drafts_own_copy(pdfs):
+    """Another interest already has the file: the draft gets its own copy,
+    and discarding the draft removes only that copy (CR.10, CR.2)."""
     x = _draft(pdfs, "X")
     p = _upload(pdfs, b"matched P", A, x)
     _save(pdfs, x)
@@ -89,7 +91,7 @@ def test_s2_a_duplicate_upload_into_a_draft_is_not_the_drafts(pdfs):
 
     d = _draft(pdfs, "S2")
     again = _upload(pdfs, b"matched P", A, d)
-    assert again["duplicate"] and again["id"] == p["id"]
+    assert not again.get("duplicate") and again["id"] != p["id"]
     _discard(pdfs, d)
     assert _snapshot(pdfs) == before
     assert _q(pdfs, "SELECT s.openalex_id FROM profile_seeds s JOIN profiles p ON p.id = s.profile_id "
@@ -111,25 +113,24 @@ def test_s3_only_the_version_uploaded_in_the_draft_goes(pdfs):
     assert _vault(pdfs)[v1["id"]]["version"] is None
 
 
-def test_s4_an_upload_another_interest_uses_stays(pdfs):
+def test_s4_another_interests_copy_of_the_file_stays(pdfs):
     y = _draft(pdfs, "Y")
     _save(pdfs, y)
     d = _draft(pdfs, "S4")
     n = _upload(pdfs, b"note N", A, d)
     # Y is saved: the upload goes into its Edit-interest copy, saved back
-    # onto Y (spec E).
+    # onto Y (spec E). Its own copy of the file (CR.10).
     with edit_saved(lambda m, p, **kw: _request(pdfs["app"], m, p, headers=A, **kw), y) as copy:
         again = _upload(pdfs, b"note N", A, copy)
-    assert again["duplicate"] and again["id"] == n["id"]
+    assert again["id"] != n["id"]
     assert _q(pdfs, "SELECT s.openalex_id FROM profile_seeds s JOIN profiles p ON p.id = s.profile_id "
-                    "WHERE p.slug = ?", y) == [(n["id"],)]
-    path = _q(pdfs, "SELECT local_path FROM paper_uploads WHERE openalex_id = ?", n["id"])[0][0]
+                    "WHERE p.slug = ?", y) == [(again["id"],)]
+    path = _q(pdfs, "SELECT local_path FROM paper_uploads WHERE openalex_id = ?", again["id"])[0][0]
 
     _discard(pdfs, d)
-    assert n["id"] in _vault(pdfs) and Path(path).is_file()
-    assert _q(pdfs, "SELECT 1 FROM paper_embeddings WHERE openalex_id = ?", n["id"])
-    # Nothing is the discarded draft's any more, so a later discard of
-    # some other draft cannot remove it either.
+    vault = _vault(pdfs)
+    assert again["id"] in vault and n["id"] not in vault and Path(path).is_file()
+    assert _q(pdfs, "SELECT 1 FROM paper_embeddings WHERE openalex_id = ?", again["id"])
     assert _q(pdfs, "SELECT * FROM draft_owned") == []
 
 
@@ -181,7 +182,7 @@ def test_an_upload_into_a_saved_interest_is_nobodys(pdfs):
 
 
 def test_a_discard_that_fails_keeps_the_draft_and_its_uploads(pdfs, monkeypatch):
-    from rag_lib.db.repos import draft_owned
+    from rag_lib.db.repos import paper_rows
 
     d = _draft(pdfs, "Kept")
     _upload(pdfs, b"matched P", A, d)
@@ -189,7 +190,7 @@ def test_a_discard_that_fails_keeps_the_draft_and_its_uploads(pdfs, monkeypatch)
 
     def boom(conn, oa):
         raise RuntimeError("disk")
-    monkeypatch.setattr(draft_owned, "_paper_in_use", boom)
+    monkeypatch.setattr(paper_rows, "delete_if_unused", boom)
     r = _request(pdfs["app"], "DELETE", f"/api/profiles/draft/{d}", headers=A)
     assert r.status_code == 500
     monkeypatch.undo()

@@ -37,7 +37,7 @@ def uploads(pdfs, monkeypatch):
     def enrich(record, *, mailto, filename, file_hash):
         if "bare" in record.body_text:
             return BARE, {"openalex_id": BARE, "title": "Bare Title", "abstract": "", "year": 2021,
-                          "doi": "10.1/w88", "source": "user_pdf"}
+                          "doi": "10.1/w88", "openalex_doi": "10.1/w88", "source": "user_pdf"}
         return real_enrich(record, mailto=mailto, filename=filename, file_hash=file_hash)
 
     from rag_lib import content_topics
@@ -88,12 +88,16 @@ def test_no_abstract_anywhere_stores_none(uploads):
     assert uploads["content_calls"] == [f"body of %PDF-1.4\nnothing known"]
 
 
-def test_the_same_file_again_keeps_its_pdf_abstract(uploads):
+def test_the_same_file_in_another_interest_reads_its_pdf_abstract_again(uploads):
+    """CR.10: a paper of its own, read like the first."""
+    from tests.test_private_upload_versions import _draft
+
     first = _upload(uploads, b"nothing known abs", A)
-    again = _upload(uploads, b"nothing known abs", A)
-    assert again["id"] == first["id"]
-    row = _row(uploads["env"], first["id"])
-    assert row["abstract"] == PDF_ABSTRACT and row["abstract_source"] == "pdf"
+    again = _upload(uploads, b"nothing known abs", A, slug=_draft(uploads, A))
+    assert again["id"] != first["id"]
+    for oid in (first["id"], again["id"]):
+        row = _row(uploads["env"], oid)
+        assert row["abstract"] == PDF_ABSTRACT and row["abstract_source"] == "pdf"
 
 
 def test_the_vault_says_where_the_abstract_came_from(uploads):

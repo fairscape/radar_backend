@@ -290,7 +290,9 @@ def seed_row_to_seed(
 ) -> Seed:
     return Seed(
         version=version[0] if version else None,
-        uploaded=version[1] if version else None,
+        # When this file was uploaded (CR.4): from paper_uploads when the
+        # row has it, else the time version_numbers ordered it by.
+        uploaded=_col(row, "uploaded_at") or (version[1] if version else None),
         source=_col(row, "source"),
         sourceResearcherId=_col(row, "source_researcher_id"),
         sourceResearcherName=_col(row, "source_researcher_name"),

@@ -29,7 +29,7 @@ def test_works_lists_the_profile_papers(env):
     assert len(body["works"]) == 5
     full = next(w for w in body["works"] if w["id"] == "leroy2025atacformer")
     assert full["doi"] == "10.1101/2025.11.03.685753"
-    assert full["openalex_id"] == "W4415881950"
+    assert full["openalex_id"] == "https://openalex.org/W4415881950"     # the seed form (L10)
     assert full["year"] == 2025
 
 

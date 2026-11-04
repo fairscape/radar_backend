@@ -133,11 +133,13 @@ def get_profile_detail(
     for idx, oa_id in enumerate(seed_oa_ids, start=1):
         paper_row = conn.execute(
             "SELECT p.openalex_id, p.title, p.year, v.canonical_openalex_id,"
-            " s.source, s.source_researcher_id, r.name AS source_researcher_name FROM papers p"
+            " s.source, s.source_researcher_id, r.name AS source_researcher_name, u.uploaded_at FROM papers p"
             " JOIN profile_seeds s ON s.openalex_id = p.openalex_id AND s.profile_id = ?"
             " LEFT JOIN researchers r ON r.id = s.source_researcher_id"
-            " LEFT JOIN paper_versions v ON v.version_id = p.openalex_id WHERE p.openalex_id = ?",
-            (profile_id, oa_id),
+            " LEFT JOIN paper_versions v ON v.version_id = p.openalex_id"
+            " LEFT JOIN paper_uploads u ON u.openalex_id = p.openalex_id AND u.user_id = ?"
+            " WHERE p.openalex_id = ?",
+            (profile_id, user_id, oa_id),
         ).fetchone()
         if paper_row is None:
             continue
@@ -180,8 +182,8 @@ def get_profile_detail(
     feedback_log = [format_event_line(r) for r in fb_rows]
     feedback_more = max(0, fb_total - len(feedback_log))
 
-    deleted = [DeletedSeed(id=r["openalex_id"], title=r["title"], deletedAt=r["deleted_at"]) for r in conn.execute(
-        "SELECT openalex_id, title, deleted_at FROM deleted_seeds WHERE profile_id = ? ORDER BY deleted_at, openalex_id",
+    deleted = [DeletedSeed(id=r["openalex_id"], title=r["title"], uploaded=r["uploaded_at"], deletedAt=r["deleted_at"]) for r in conn.execute(
+        "SELECT openalex_id, title, uploaded_at, deleted_at FROM deleted_seeds WHERE profile_id = ? ORDER BY deleted_at, openalex_id",
         (profile_id,))]
 
     return ProfileDetail(

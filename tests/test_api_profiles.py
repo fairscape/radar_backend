@@ -182,10 +182,11 @@ def test_get_profile_by_key(app):
     assert p["key"] == "provenance-fairscape"
 
 
-def test_get_profile_unknown_key_returns_null(app):
+def test_get_profile_unknown_key_is_404(app):
+    """L11: 404, as for someone else's key (was 200 null)."""
     resp = _request(app, "GET", "/api/profiles/does-not-exist")
-    assert resp.status_code == 200
-    assert resp.json() is None
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "No such interest."}
 
 
 def test_profile_detail_shape(app):
@@ -433,30 +434,10 @@ def test_committing_a_draft_with_daily_scans_on_registers_its_job_at_once(app, t
     assert registered == [pid]
 
 
-def test_a_seed_uploaded_into_a_live_interest_refits_it(app, tmp_path):
-    """The Seeds tab's PDF drop zone attaches through the upload path, which
-    wrote the seed row and never re-fitted -- listed, but not scored against."""
-    from rag_lib.api.services import vault as vault_service
-    from rag_lib.embedders import get_embedder
-
-    embed = get_embedder("placeholder-v1")
-    conn = connect(tmp_path / "radar.db")
-    for i in range(12):
-        embeddings_repo.upsert(conn, f"W{1000000 + i}", "placeholder-v1", embed(f"Seed paper {i + 1}"))
-    papers_repo.upsert(conn, {"openalex_id": "W5000000", "title": "An uploaded seed", "source": "user_pdf"})
-    embeddings_repo.upsert(conn, "W5000000", "placeholder-v1", embed("An uploaded seed"))
-    conn.close()
-    _request(app, "POST", f"/api/profiles/{SLUG}/refit")
-    before, _, _ = _profile_row(tmp_path)
-
-    conn = connect(tmp_path / "radar.db")
-    uid = conn.execute("SELECT id FROM users WHERE email = 'demo@example.com'").fetchone()[0]
-    vault_service._attach_to_profile(conn, uid, SLUG, "W5000000")
-    conn.close()
-
-    after, n_seed, seeds = _profile_row(tmp_path)
-    assert "W5000000" in seeds and n_seed == 13
-    assert after != before
+# test_a_seed_uploaded_into_a_live_interest_refits_it went with the 2026-11-02
+# review: no upload goes into a live interest (spec E: through its Edit copy);
+# the copy's save leaves the fit stale and the next scan refits it
+# (tests/test_review_round12_scan_refit.py, CR.5).
 
 
 def test_a_commit_with_a_bad_cron_is_refused_before_anything_changes(app, tmp_path):
@@ -751,3 +732,27 @@ def test_an_interests_years_bound_its_feed_and_its_ranking_pool(app, tmp_path):
     assert _request(app, "GET", "/api/radar/daily?year_from=2027").json()["cards"] == []
     with _edit(app, SLUG, save=False) as copy:
         assert _request(app, "PATCH", f"/api/profiles/{copy}", json={"years": {"year_from": 2021, "year_to": 2019}}).status_code == 400
+
+
+def test_l7_a_save_while_another_save_of_the_draft_is_fitting_is_refused(app, tmp_path):
+    """CR.11 L7: the second of two saves landing in the seconds the first
+    fits is refused, not given a run of its own."""
+    from rag_lib.api.routers import profiles as profiles_router
+
+    slug = _request(app, "POST", "/api/profiles/draft",
+                    json={"name": "twice", "embedding_model": "placeholder-v1"}).json()["slug"]
+    _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": ["W2000004"]})
+    conn = connect(tmp_path / "radar.db")
+    pid = int(conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0])
+    runs_before = conn.execute("SELECT COUNT(*) FROM gather_runs WHERE profile_id = ?", (pid,)).fetchone()[0]
+    conn.close()
+    lock = profiles_router._save_lock(pid)
+    lock.acquire()
+    try:
+        r = _request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.5, "selected_topic_ids": []})
+    finally:
+        lock.release()
+    assert r.status_code == 409 and "being saved" in r.json()["detail"], r.text
+    conn = connect(tmp_path / "radar.db")
+    assert conn.execute("SELECT COUNT(*) FROM gather_runs WHERE profile_id = ?", (pid,)).fetchone()[0] == runs_before
+    conn.close()

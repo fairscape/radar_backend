@@ -157,15 +157,17 @@ def _live_interest(conn, uid, name="Live"):
     return pid, profiles_repo.get_by_slug(conn, uid, name.lower())["slug"]
 
 
-def test_a_refit_is_refused_while_a_scan_runs_and_an_upload_still_lands(tmp_path):
+def test_a_refit_is_refused_while_a_scan_runs(tmp_path):
+    """The upload half of this test went with the 2026-11-02 review: an
+    upload goes only into a draft or an Edit copy, and is refused while
+    the interest's scan runs (CR.11 L3, tests/test_cr_upload.py)."""
     conn, uid = _db(tmp_path)
     pid, slug = _live_interest(conn, uid)
     papers_repo.upsert(conn, {"openalex_id": "local:abc", "title": "Notes", "body_text": "words " * 20, "source": "user_pdf"})
     gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")   # still running
     with pytest.raises(wizard.ScanRunning):
         wizard.refit_profile(conn, user_id=uid, slug=slug)
-    vault_service._attach_to_profile(conn, uid, slug, "local:abc")                 # no 500 for a stored upload
-    assert "local:abc" in profiles_repo.list_seed_openalex_ids(conn, pid)
+    assert "local:abc" not in profiles_repo.list_seed_openalex_ids(conn, pid)
     conn.close()
 
 

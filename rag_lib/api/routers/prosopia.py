@@ -269,16 +269,7 @@ def launch_import(
             detail="scheduler disabled (set RADAR_SCHEDULER_ENABLED=true)",
         )
     try:
-        scheduler.add_job(
-            import_prosopia_profile,
-            trigger="date",
-            run_date=datetime.now(tz=timezone.utc),
-            args=[plan],
-            kwargs={"run_id": run_id},
-            id=f"{tier}:{plan.profile_id or 0}:{plan.researcher_id or 0}:{run_id}",
-            replace_existing=False,
-            max_instances=1,
-        )
+        _schedule_import(scheduler, plan, run_id=run_id, tier=tier)
     except Exception as exc:  # noqa: BLE001 -- open, the row showed "importing" for 30 minutes
         gather_runs_repo.finish(
             db, run_id, n_fetched=0, n_new=0, n_redup=0, tier_used=tier,
@@ -290,6 +281,35 @@ def launch_import(
             detail="the background scheduler refused the job; try again in a moment",
         ) from exc
     return ProsopiaImportStart(draft_slug=plan.draft_slug, run_id=run_id)
+
+
+def _schedule_import(scheduler, plan, *, run_id: int, tier: str) -> str:
+    """Hand the import to the scheduler. Dropped unrun (queued past the
+    grace time), its row closes and what the request made for it goes, as
+    when the scheduler refuses it (CR.6). Returns the job id."""
+    from ...scheduler import runner as scheduler_runner
+    from ...scheduler.jobs import import_prosopia_profile
+    from ..services import prosopia as prosopia_service
+
+    job_id = f"{tier}:{plan.profile_id or 0}:{plan.researcher_id or 0}:{run_id}"
+    scheduler_runner.close_run_if_missed(
+        job_id, run_id, what="import",
+        undo=lambda conn: prosopia_service.undo_import(conn, plan, run_id=run_id))
+    try:
+        scheduler.add_job(
+            import_prosopia_profile,
+            trigger="date",
+            run_date=datetime.now(tz=timezone.utc),
+            args=[plan],
+            kwargs={"run_id": run_id},
+            id=job_id,
+            replace_existing=False,
+            max_instances=1,
+        )
+    except Exception:
+        scheduler_runner.forget_missed(job_id)
+        raise
+    return job_id
 
 
 # The old private name, for anything that imported it.

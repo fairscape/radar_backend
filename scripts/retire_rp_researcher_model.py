@@ -172,7 +172,7 @@ def _require_exclusive(db: Path) -> None:
         "restart it in the middle of the cutover:\n"
         "    crontab -l > /tmp/radar.cron.bak\n"
         "    crontab -l | grep -v watchdog | crontab -\n"
-        "    tmux kill-session -t radar-backend\n"
+        "    tmux kill-session -t =radar-backend\n"
         "Restore the crontab afterwards with: crontab /tmp/radar.cron.bak"
     )
 

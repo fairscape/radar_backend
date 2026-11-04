@@ -296,19 +296,8 @@ def test_m31_an_import_into_a_draft_counts_only_the_seeds_it_added(env):
     assert (result["drafted"], result["seeded"]) == (2, 1)
 
 
-def test_m32_the_wizard_list_marks_nothing_whose_copy_it_does_not_list(env):
-    """The public record of a work whose upload is a seed is not listed
-    beside the upload (vault.list_docs): the upload alone is not marked,
-    the detail page, listing both, marks both."""
-    conn = _conn(env)
-    uid = _user(conn)
-    pid = _profile(conn, uid)
-    _paper(conn, "https://openalex.org/W1")
-    profiles_repo.attach_seed(conn, pid, "https://openalex.org/W1")
-    vid = _upload(conn, uid, canonical="https://openalex.org/W1")
-    assert profiles_repo.attach_seed(conn, pid, vid) == 1
-    conn.close()
-    docs = _request(_app(), "GET", "/api/vault/docs", params={"tag": "int-a"}).json()
-    assert [(d["id"], d.get("sameTitle")) for d in docs] == [(vid, None)]
-    seeds = _request(_app(), "GET", "/api/profiles/int-a/detail").json()["seeds"]
-    assert {s["sameTitle"] for s in seeds} == {"title"}
+# test_m32_the_wizard_list_marks_nothing_whose_copy_it_does_not_list was
+# removed (CR.10): an upload of a work and that work's public record can no
+# longer both be seeds of one interest -- attach_seed refuses the second
+# (tests/test_private_upload_versions.py), so the listing it checked cannot
+# arise.

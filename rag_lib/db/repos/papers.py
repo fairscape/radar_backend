@@ -48,8 +48,9 @@ def get_by_doi(conn: sqlite3.Connection, doi: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
-    """Insert (or update on conflict) a paper row.
+def upsert(conn: sqlite3.Connection, paper: dict[str, Any], *, commit: bool = True) -> str:
+    """Insert (or update on conflict) a paper row. ``commit=False`` leaves
+    it to the caller's transaction.
 
     Required keys: ``openalex_id``, ``title``, ``source``.
     Optional: ``doi``, ``abstract``, ``year``, ``venue``,
@@ -130,7 +131,8 @@ def upsert(conn: sqlite3.Connection, paper: dict[str, Any]) -> str:
     from .versions import follow_public
 
     follow_public(conn, paper["openalex_id"])
-    conn.commit()
+    if commit:
+        conn.commit()
     return paper["openalex_id"]
 
 
@@ -180,7 +182,7 @@ def get_by_user_hash(
 
 def record_upload(
     conn: sqlite3.Connection, *, user_id: int, openalex_id: str,
-    file_hash: str, local_path: str | None, n_pages: int | None,
+    file_hash: str, local_path: str | None, n_pages: int | None, commit: bool = True,
 ) -> None:
     """This user uploaded this paper (``paper_uploads``; migration 0020).
 
@@ -199,7 +201,8 @@ def record_upload(
         """,
         (user_id, openalex_id, file_hash, local_path, n_pages),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def decode_authors(row: sqlite3.Row | None) -> list[str]:

@@ -3,8 +3,9 @@
 Before migration 0029 an upload was stored on the paper's public row: a
 second user uploading the same paper was scored with the first user's
 text and vectors, and a revised file replaced the old one. Now the public
-row is bibliographic only and every upload is ``local:upload:<user>:<hash>``
-(``rag_lib.db.repos.versions``).
+row is bibliographic only and every upload is a version of its own,
+``local:upload:<user>:<hash>:<token>`` (``rag_lib.db.repos.versions``; one
+per upload since FUNCTIONAL_SPEC CR.10).
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ def pdfs(world, monkeypatch):
         d = {"title": record.title, "doi": None, "source": "user_pdf"}
         if "matched" in record.body_text:
             d.update(openalex_id=W, title="Public Title", abstract="public abstract", year=2020,
-                     doi="10.1/w77", primary_topic=TOPIC, topics=[TOPIC])
+                     doi="10.1/w77", openalex_doi="10.1/w77", primary_topic=TOPIC, topics=[TOPIC])
             return W, d
         d["openalex_id"] = f"local:{file_hash}"
         return d["openalex_id"], d
@@ -88,6 +89,13 @@ def _post(world, data: bytes, headers, slug=None):
     files = {"file": ("p.pdf", io.BytesIO(b"%PDF-1.4\n" + data), "application/pdf")}
     return _request(world["app"], "POST", "/api/vault/upload", files=files,
                     data={"profile_slug": slug or _inbox(world, headers)}, headers=headers)
+
+
+def _draft(world, headers, name="Another") -> str:
+    """A new draft: another interest to upload into."""
+    r = _request(world["app"], "POST", "/api/profiles/draft", json={"name": name}, headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()["slug"]
 
 
 def _upload(world, data: bytes, headers, slug=None):
@@ -133,8 +141,9 @@ def test_two_users_uploading_the_same_paper_get_their_own_versions(pdfs):
     assert public["title"] == "Public Title"
     assert [public[k] for k in ("body_text", "local_path", "file_hash", "uploaded_by_user_id")] == [None] * 4
     assert _vector(env, W) is None
-    # Identical bytes from two users are still two versions.
-    c = _upload(pdfs, b"matched alice", B)
+    # Identical bytes from two users are still two versions (into another
+    # of B's interests: this one has the paper already, CR.10).
+    c = _upload(pdfs, b"matched alice", B, slug=_draft(pdfs, B))
     assert c["id"] not in (a["id"], b["id"]) and not c.get("duplicate")
 
 
@@ -170,16 +179,42 @@ def test_a_revised_file_is_a_new_version_and_the_old_one_stays_a_seed(pdfs):
     assert (docs[v1["id"]]["version"], docs[v2["id"]]["version"]) == (1, 2)
 
 
-def test_the_same_bytes_again_are_a_duplicate_unless_the_file_is_gone(pdfs):
+def test_the_same_file_is_refused_in_one_interest_and_its_own_paper_in_another(pdfs):
+    """FUNCTIONAL_SPEC CR.10: one seed per paper in an interest -- the same
+    bytes, or the same OpenAlex work -- and every upload into another
+    interest stored on its own, sharing nothing but the file's bytes."""
     env = pdfs["env"]
     first = _upload(pdfs, b"matched alice", A)
-    assert _upload(pdfs, b"matched alice", A)["duplicate"] is True
-    path = Path(_row(env, first["id"])["local_path"])
-    path.unlink()
-    again = _upload(pdfs, b"matched alice", A)
-    assert again["id"] == first["id"] and not again.get("duplicate")
-    assert path.is_file()
-    assert _upload(pdfs, b"matched alice", A)["duplicate"] is True
+    for again in (b"matched alice", b"matched alice, revised"):      # the same bytes; the same work
+        r = _post(pdfs, again, A)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == "This paper is already a seed of this interest (from an uploaded PDF)."
+    other = _upload(pdfs, b"matched alice", A, slug=_draft(pdfs, A))
+    assert other["id"] != first["id"] and other["canonicalId"] == first["canonicalId"] == W
+    a, b = _row(env, first["id"]), _row(env, other["id"])
+    # Its own file too (review R1): deleting one leaves the other its PDF.
+    assert a["local_path"] != b["local_path"] and all(Path(p).is_file() for p in (a["local_path"], b["local_path"]))
+    # Unmatched: the same bytes, the same rule.
+    loose = _upload(pdfs, b"nothing known", A)
+    assert _post(pdfs, b"nothing known", A).status_code == 409
+    assert _upload(pdfs, b"nothing known", A, slug=_draft(pdfs, A, "Third"))["id"] != loose["id"]
+
+
+def test_an_upload_already_a_seed_from_elsewhere_is_refused_and_says_where(pdfs):
+    """CR.10 (a): the interest has the work from ORCID; its PDF adds no
+    second seed, and nothing is written."""
+    slug = _inbox(pdfs, A)
+    conn = connect(pdfs["env"])
+    try:
+        papers_repo.upsert(conn, {"openalex_id": W, "title": "Public Title", "source": "openalex"})
+        pid = int(conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0])
+        assert profiles_repo.attach_seed(conn, pid, W, source="orcid") == 1
+    finally:
+        conn.close()
+    before, files = _state(pdfs["env"]), _files(pdfs)
+    r = _post(pdfs, b"matched alice", A, slug)
+    assert r.status_code == 409 and r.json()["detail"].endswith("(from ORCID).")
+    assert _state(pdfs["env"]) == before and _files(pdfs) == files
 
 
 def test_a_seeded_version_keeps_its_public_work_out_of_the_feed(pdfs):
@@ -198,23 +233,25 @@ def test_a_seeded_version_keeps_its_public_work_out_of_the_feed(pdfs):
     assert W not in shown and pdfs["cards"][0] in shown
 
 
-def test_an_upload_is_a_seed_beside_its_works_public_record(pdfs):
-    """FUNCTIONAL_SPEC 1.7: both stay seeds, the user removes one if they
-    want; the public record named again (a search, an import) adds nothing."""
+def test_a_works_public_record_and_a_file_of_it_are_one_seed(pdfs):
+    """CR.10 replaced 1.7's "both stay seeds": the interest seeds the
+    public record, so the file of it is refused; the record named again (a
+    search, an import) adds nothing either."""
     env, live_id = pdfs["env"], pdfs["live_id"]
     conn = connect(env)
     try:
         papers_repo.upsert(conn, {"openalex_id": W, "title": "Public Title", "source": "openalex"})
         assert profiles_repo.attach_seed(conn, live_id, W) == 1
+        seeds = profiles_repo.list_seed_openalex_ids(conn, live_id)
     finally:
         conn.close()
-    v = _upload_saved(pdfs, b"matched alice", A, pdfs["live"])
+    with edit_saved(lambda m, p, **kw: _request(pdfs["app"], m, p, headers=A, **kw), pdfs["live"]) as copy:
+        r = _post(pdfs, b"matched alice", A, copy)
+        assert r.status_code == 409 and r.json()["detail"] == "This paper is already a seed of this interest."
     conn = connect(env)
     try:
-        seeds = profiles_repo.list_seed_openalex_ids(conn, live_id)
-        assert v["id"] in seeds and W in seeds
-        assert profiles_repo.attach_seed(conn, live_id, W) == 0
         assert profiles_repo.list_seed_openalex_ids(conn, live_id) == seeds
+        assert profiles_repo.attach_seed(conn, live_id, W) == 0
     finally:
         conn.close()
 
@@ -540,39 +577,34 @@ def test_0029_cli_pdfs_and_one_file_under_two_papers(tmp_path):
         conn.close()
 
 
-def test_each_uploaded_file_is_a_seed_of_its_own(env):
+def test_a_paper_is_a_seed_of_an_interest_once(env):
+    """CR.10: the public record, any file of the work, or -- OpenAlex not
+    knowing it -- the same bytes again: one seed, whichever came first."""
     conn = connect(env)
     try:
         uid = int(users_repo.get_by_email(conn, "demo@example.com")["id"])
         w = "https://openalex.org/W10"
         papers_repo.upsert(conn, {"openalex_id": w, "title": "ten", "source": "openalex"})
-        v1, v2 = versions_repo.version_id(uid, "h1"), versions_repo.version_id(uid, "h2")
-        for v, h in ((v1, "h1"), (v2, "h2")):
+        v1, v2 = versions_repo.new_upload_id(uid, "h1"), versions_repo.new_upload_id(uid, "h2")
+        u1, u2 = versions_repo.new_upload_id(uid, "hx"), versions_repo.new_upload_id(uid, "hx")
+        for v, h, c in ((v1, "h1", w), (v2, "h2", w), (u1, "hx", None), (u2, "hx", None)):
             papers_repo.upsert(conn, {"openalex_id": v, "title": "ten", "source": "user_pdf_version"})
-            versions_repo.register(conn, user_id=uid, paper_id=v, canonical_id=w, file_hash=h)
+            versions_repo.register(conn, user_id=uid, paper_id=v, canonical_id=c, file_hash=h)
         pid = profiles_repo.upsert(conn, user_id=uid, name="rev", embedding_model="placeholder-v1", n_seed=0,
                                    threshold=0.4, topic_filters={"topics": [{"id": "T1", "seeds": [w]}]})
         conn.commit()
         seeds = lambda: profiles_repo.list_seed_openalex_ids(conn, pid)  # noqa: E731
-        topic_seeds = lambda: json.loads(conn.execute(  # noqa: E731
-            "SELECT topic_filters_json FROM profiles WHERE id = ?", (pid,)).fetchone()[0])["topics"][0]["seeds"]
+        clear = lambda: (conn.execute("DELETE FROM profile_seeds WHERE profile_id = ?", (pid,)), conn.commit())  # noqa: E731
         assert profiles_repo.attach_seed(conn, pid, w) == 1 and seeds() == [w]
-        # A file of the work, then a revised file: each added beside the
-        # others, nothing renamed (FUNCTIONAL_SPEC 1.7).
-        assert profiles_repo.attach_seed(conn, pid, v1) == 1 and seeds() == [w, v1] and topic_seeds() == [w]
-        assert profiles_repo.attach_seed(conn, pid, v2) == 1 and seeds() == [w, v1, v2] and topic_seeds() == [w]
-        assert profiles_repo.attach_seed(conn, pid, v2) == 0
-        assert profiles_repo.attach_seed(conn, pid, w) == 0 and seeds() == [w, v1, v2]
-        assert conn.execute("SELECT n_seed FROM profiles WHERE id = ?", (pid,)).fetchone()[0] == 3
-        # The public record is held back while a file of it is a seed (a
-        # search or import naming the paper again), and only then.
-        conn.execute("DELETE FROM profile_seeds WHERE profile_id = ?", (pid,))
-        conn.commit()
+        assert profiles_repo.attach_seed(conn, pid, v1) == 0 and profiles_repo.attach_seed(conn, pid, v2) == 0
+        assert seeds() == [w] and conn.execute("SELECT n_seed FROM profiles WHERE id = ?", (pid,)).fetchone()[0] == 1
+        clear()
         assert profiles_repo.attach_seed(conn, pid, v2) == 1
-        assert profiles_repo.attach_seed(conn, pid, w) == 0 and seeds() == [v2]
-        conn.execute("DELETE FROM profile_seeds WHERE profile_id = ?", (pid,))
-        conn.commit()
-        assert profiles_repo.attach_seed(conn, pid, w) == 1 and seeds() == [w]
+        assert profiles_repo.attach_seed(conn, pid, v1) == 0 and profiles_repo.attach_seed(conn, pid, w) == 0
+        assert seeds() == [v2]
+        clear()
+        assert profiles_repo.attach_seed(conn, pid, u1) == 1 and profiles_repo.attach_seed(conn, pid, u2) == 0
+        assert profiles_repo.attach_seed(conn, pid, v1) == 1 and sorted(seeds()) == sorted([u1, v1])
         assert versions_repo.rename_ids(["a", "b", "c", 1], {"a": "v", "b": "v"}) == ["v", "c", 1]
     finally:
         conn.close()
@@ -601,7 +633,7 @@ def test_vault_stats_count_a_work_once(env):
         conn.close()
 
 
-def test_a_file_added_beside_its_works_seed_leaves_the_fit_stale(env, monkeypatch):
+def test_a_seed_added_after_the_fit_leaves_the_fit_stale(env, monkeypatch):
     """The fit was made without the new file: the end-of-scan check must
     refit, also when the attach's own refit was skipped."""
     from rag_lib.api.services import wizard as wizard_service
@@ -612,10 +644,12 @@ def test_a_file_added_beside_its_works_seed_leaves_the_fit_stale(env, monkeypatc
         uid = int(users_repo.get_by_email(conn, "demo@example.com")["id"])
         w = "https://openalex.org/W10"
         papers_repo.upsert(conn, {"openalex_id": w, "title": "ten", "source": "openalex"})
-        v1, v2 = versions_repo.version_id(uid, "h1"), versions_repo.version_id(uid, "h2")
+        # Files OpenAlex does not know, of other bytes: papers of their own
+        # (a file of the same work would not be added, CR.10).
+        v1, v2 = versions_repo.new_upload_id(uid, "h1"), versions_repo.new_upload_id(uid, "h2")
         for v, h in ((v1, "h1"), (v2, "h2")):
             papers_repo.upsert(conn, {"openalex_id": v, "title": "ten", "source": "user_pdf_version"})
-            versions_repo.register(conn, user_id=uid, paper_id=v, canonical_id=w, file_hash=h)
+            versions_repo.register(conn, user_id=uid, paper_id=v, canonical_id=None, file_hash=h)
         calls = []
         monkeypatch.setattr(wizard_service, "refit_profile", lambda *a, **k: calls.append(k) or {})
         for n, (old, new, cfg) in enumerate(((w, v1, {"type": "centroid", "fit_seed_ids": [w]}),
@@ -637,27 +671,28 @@ def test_a_file_added_beside_its_works_seed_leaves_the_fit_stale(env, monkeypatc
         conn.close()
 
 
-def test_uploading_the_file_again_reads_a_version_without_its_text(pdfs, monkeypatch):
+def test_uploading_the_file_again_elsewhere_is_a_new_version_with_its_own_text(pdfs):
+    """No repair of an old version in place (CR.10): a version whose read
+    failed stays as it is, and the file uploaded again into another
+    interest is a paper of its own, read from scratch."""
     a = _upload(pdfs, b"matched alice", A)
     vid = a["id"]
     conn = connect(pdfs["env"])
     try:
-        # As a failed read leaves it: no text, marked unreadable, file intact.
         conn.execute("UPDATE papers SET body_text = NULL WHERE openalex_id = ?", (vid,))
         conn.execute("UPDATE paper_versions SET parsed = -1 WHERE version_id = ?", (vid,))
         conn.commit()
     finally:
         conn.close()
-    again = _upload(pdfs, b"matched alice", A)
+    again = _upload(pdfs, b"matched alice", A, slug=_draft(pdfs, A))
     conn = connect(pdfs["env"])
     try:
-        assert again["id"] == vid and not again.get("duplicate")
-        assert conn.execute("SELECT parsed FROM paper_versions WHERE version_id = ?", (vid,)).fetchone()[0] == 1
-        assert conn.execute("SELECT body_text FROM papers WHERE openalex_id = ?", (vid,)).fetchone()[0]
+        assert again["id"] != vid
+        assert conn.execute("SELECT parsed FROM paper_versions WHERE version_id = ?", (vid,)).fetchone()[0] == -1
+        assert conn.execute("SELECT parsed FROM paper_versions WHERE version_id = ?", (again["id"],)).fetchone()[0] == 1
+        assert conn.execute("SELECT body_text FROM papers WHERE openalex_id = ?", (again["id"],)).fetchone()[0]
     finally:
         conn.close()
-    # With its text, the same bytes again are a duplicate.
-    assert _upload(pdfs, b"matched alice", A).get("duplicate") is True
 
 
 def test_the_vault_shows_a_work_once_with_all_its_interests(pdfs):
@@ -791,22 +826,6 @@ def test_a_version_follows_its_public_records_bibliography(env):
         conn.close()
 
 
-def test_a_repaired_upload_reads_its_topics_from_its_text(pdfs):
-    v = _upload(pdfs, b"nothing on openalex", A)["id"]
-    conn = connect(pdfs["env"])
-    try:
-        # As a read that failed left it: no text, topics from the title alone.
-        title_only = json.dumps({"source": "pdf_content", "topics": [{"id": "T-title", "display_name": "x"}]})
-        conn.execute("UPDATE papers SET body_text = NULL, topics_json = ? WHERE openalex_id = ?", (title_only, v))
-        conn.execute("UPDATE paper_versions SET parsed = -1 WHERE version_id = ?", (v,))
-        conn.commit()
-    finally:
-        conn.close()
-    _upload(pdfs, b"nothing on openalex", A)
-    raw = _row(pdfs["env"], v)["topics_json"]
-    assert [t["id"] for t in json.loads(raw)["topics"]] == ["T-content"]
-
-
 def test_a_profile_file_naming_another_users_upload_is_refused_before_any_write(tmp_path):
     """Codex review, MEDIUM 1: the refusal came from the seed trigger, after
     the paper rows (another user's text) had been overwritten and committed."""
@@ -896,85 +915,20 @@ def test_a_rescore_that_fails_keeps_the_paper_queued(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_a_repair_openalex_no_longer_matches_keeps_the_confirmed_match(pdfs, monkeypatch):
-    """Codex review, LOW 3: the title was overwritten with the page's while
-    the vector made from the confirmed title stayed. (OpenAlex answering
-    "no match" now; not answering is refused, see the test below.)"""
-    from rag_lib.api.services import vault as vault_service
-
-    first = _upload(pdfs, b"matched original", A)
-    conn = connect(pdfs["env"])
-    try:
-        row = dict(conn.execute("SELECT * FROM papers WHERE openalex_id = ?", (first["id"],)).fetchone())
-        vec = lambda: conn.execute("SELECT vector FROM paper_embeddings WHERE openalex_id = ?",  # noqa: E731
-                                   (first["id"],)).fetchone()
-        old_vector = bytes(vec()[0])
-    finally:
-        conn.close()
-    Path(row["local_path"]).unlink()
-    monkeypatch.setattr(vault_service, "_enrich_via_openalex", lambda record, *, mailto, filename, file_hash: (
-        f"local:{file_hash}", {"openalex_id": f"local:{file_hash}", "title": record.title, "source": "user_pdf"}))
-    repaired = _upload(pdfs, b"matched original", A)
-    after = _row(pdfs["env"], first["id"])
-    assert repaired["canonicalId"] == W and not repaired.get("duplicate")
-    assert [after[k] for k in ("title", "abstract", "doi", "year", "topics_json")] == \
-        [row[k] for k in ("title", "abstract", "doi", "year", "topics_json")]
-    conn = connect(pdfs["env"])
-    try:
-        assert bytes(vec()[0]) == old_vector               # nothing it was made from changed
-    finally:
-        conn.close()
-
-
-def test_a_reupload_that_changes_what_the_vector_is_made_of_makes_a_new_one(pdfs, monkeypatch):
-    from rag_lib.api.services import vault as vault_service
-
-    first = _upload(pdfs, b"matched original", A)
-    conn = connect(pdfs["env"])
-    try:
-        vec = lambda: conn.execute("SELECT vector FROM paper_embeddings WHERE openalex_id = ?",  # noqa: E731
-                                   (first["id"],)).fetchone()
-        old_vector = bytes(vec()[0])
-        conn.execute("UPDATE papers SET abstract = 'an abstract from before' WHERE openalex_id = ?", (first["id"],))
-        conn.commit()
-    finally:
-        conn.close()
-    Path(_row(pdfs["env"], first["id"])["local_path"]).unlink()
-    texts = []
+def test_an_upload_is_embedded_from_what_is_stored(pdfs, monkeypatch):
+    """The vector is made before anything is written (CR.3), from the
+    fields the version row then holds: OpenAlex's title and abstract and
+    the file's text."""
     import rag_lib.api.services.vault as vs
+
+    texts = []
     real = vs.get_embedder
     monkeypatch.setattr(vs, "get_embedder", lambda m: (lambda e: (lambda t: texts.append(t) or e(t)))(real(m)))
-    _upload(pdfs, b"matched original", A)      # OpenAlex's abstract again replaces the edited one
-    conn = connect(pdfs["env"])
-    try:
-        assert texts and "public abstract" in texts[0]
-        assert vec() is not None
-    finally:
-        conn.close()
-
-
-def test_a_version_embedded_when_openalex_no_longer_matches_uses_its_confirmed_metadata(pdfs, monkeypatch):
-    from rag_lib.api.services import vault as vault_service
-
-    first = _upload(pdfs, b"matched original", A)
-    conn = connect(pdfs["env"])
-    try:
-        # A version whose read failed: no text, no vector, its file intact.
-        conn.execute("UPDATE papers SET body_text = NULL WHERE openalex_id = ?", (first["id"],))
-        conn.execute("DELETE FROM paper_embeddings WHERE openalex_id = ?", (first["id"],))
-        conn.execute("UPDATE paper_versions SET parsed = -1 WHERE version_id = ?", (first["id"],))
-        conn.commit()
-    finally:
-        conn.close()
-    monkeypatch.setattr(vault_service, "_enrich_via_openalex", lambda record, *, mailto, filename, file_hash: (
-        f"local:{file_hash}", {"openalex_id": f"local:{file_hash}", "title": record.title, "source": "user_pdf"}))
-    texts = []
-    real = vault_service.get_embedder
-    monkeypatch.setattr(vault_service, "get_embedder", lambda m: (lambda e: (lambda t: texts.append(t) or e(t)))(real(m)))
-    again = _upload(pdfs, b"matched original", A)
-    assert again["id"] == first["id"] and again["canonicalId"] == W
+    v = _upload(pdfs, b"matched original", A)
+    row = _row(pdfs["env"], v["id"])
     assert len(texts) == 1 and "Public Title" in texts[0] and "public abstract" in texts[0]
-    assert "body of" in texts[0]                       # and its text, read again
+    assert "body of" in texts[0] and row["title"] == "Public Title" and row["abstract"] == "public abstract"
+    assert _vector(pdfs["env"], v["id"]) is not None
 
 
 def test_a_paper_whose_rescore_keeps_failing_does_not_hold_up_the_queue(tmp_path, monkeypatch):
@@ -1045,19 +999,6 @@ def test_an_upload_openalex_cannot_answer_stores_nothing(pdfs, monkeypatch, fail
         r = _post(pdfs, b"matched later", A, slug)
         assert r.status_code == 503 and r.json()["openalex"]["available"] is False
         assert _state(pdfs["env"]) == before and _files(pdfs) == files
-
-
-def test_a_repair_openalex_cannot_answer_changes_nothing(pdfs, monkeypatch):
-    from rag_lib import openalex_status
-    from rag_lib.api.services import vault as vault_service
-
-    first = _upload(pdfs, b"matched original", A)
-    Path(_row(pdfs["env"], first["id"])["local_path"]).unlink()
-    before, files = _state(pdfs["env"]), _files(pdfs)
-    monkeypatch.setattr(vault_service, "_enrich_via_openalex", lambda *a, **k: (_ for _ in ()).throw(
-        openalex_status.OpenAlexUnavailable("down")))
-    assert _post(pdfs, b"matched original", A).status_code == 503
-    assert _state(pdfs["env"]) == before and _files(pdfs) == files
 
 
 def test_the_client_tells_not_answering_from_no_match(monkeypatch):
@@ -1189,19 +1130,19 @@ def test_files_of_one_paper_are_numbered_in_upload_order(env):
 
 
 def test_the_seeds_list_and_the_vault_show_version_numbers(pdfs):
-    # A fresh draft: the world's live interest has hand-made 64-d seed
-    # vectors, which do not mix with the uploads' model vectors.
-    r = _request(pdfs["app"], "POST", "/api/profiles/draft", json={"name": "Versions"}, headers=A)
-    live = r.json()["slug"]
-    v1 = _upload(pdfs, b"matched draft one", A, slug=live)
-    v2 = _upload(pdfs, b"matched draft two", A, slug=live)
+    # Fresh drafts: the world's live interest has hand-made 64-d seed
+    # vectors, which do not mix with the uploads' model vectors. Two files
+    # of one paper go into two interests (CR.10: one seed per paper).
+    one, two = _draft(pdfs, A, "Versions"), _draft(pdfs, A, "Versions two")
+    v1 = _upload(pdfs, b"matched draft one", A, slug=one)
+    v2 = _upload(pdfs, b"matched draft two", A, slug=two)
     assert (v1["version"], v2["version"]) == (None, 2)
-    detail = _request(pdfs["app"], "GET", f"/api/profiles/{live}/detail", headers=A).json()
-    seeds = {s["id"]: s for s in detail["seeds"]}
-    assert (seeds[v1["id"]]["version"], seeds[v2["id"]]["version"]) == (1, 2)
-    assert seeds[v2["id"]]["uploaded"]
-    docs = {d["id"]: d for d in _request(pdfs["app"], "GET", f"/api/vault/docs?tag={live}", headers=A).json()}
-    assert (docs[v1["id"]]["version"], docs[v2["id"]]["version"]) == (1, 2)
+    for slug, v, n in ((one, v1, 1), (two, v2, 2)):
+        detail = _request(pdfs["app"], "GET", f"/api/profiles/{slug}/detail", headers=A).json()
+        seeds = {s["id"]: s for s in detail["seeds"]}
+        assert seeds[v["id"]]["version"] == n and seeds[v["id"]]["uploaded"]
+        docs = {d["id"]: d for d in _request(pdfs["app"], "GET", f"/api/vault/docs?tag={slug}", headers=A).json()}
+        assert docs[v["id"]]["version"] == n
 
 
 def test_an_upload_must_name_an_interest(pdfs):

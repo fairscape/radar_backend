@@ -135,14 +135,10 @@ def test_a_scan_refits_seeds_added_while_it_ran(monkeypatch, db_path, settings, 
 # --- adopted topics survive the next rebuild ---------------------------------------------
 
 
-def test_an_upload_under_a_running_scan_still_lands_and_the_warning_is_logged(tmp_path):
-    conn, uid = _db(tmp_path)
-    pid, slug = _live_interest(conn, uid, name="Scanning")
-    papers_repo.upsert(conn, {"openalex_id": "local:abc", "title": "Notes", "body_text": "words " * 20, "source": "user_pdf"})
-    gather_runs_repo.start(conn, profile_id=pid, user_id=uid, tier_used="manual")
-    vault_service._attach_to_profile(conn, uid, slug, "local:abc")
-    assert "local:abc" in profiles_repo.list_seed_openalex_ids(conn, pid)
-    conn.close()
+# test_an_upload_under_a_running_scan_still_lands_and_the_warning_is_logged went
+# with the 2026-11-02 review (FUNCTIONAL_SPEC CR.11 L3, E): an upload goes only
+# into a draft or an Edit copy, never a live interest, and one into an interest
+# whose scan runs is refused (tests/test_cr_upload.py::test_l3_...).
 
 
 def test_the_seeds_route_answers_409_under_a_running_scan(tmp_path, monkeypatch):

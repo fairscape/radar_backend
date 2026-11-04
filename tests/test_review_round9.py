@@ -44,12 +44,9 @@ def test_an_interest_name_from_a_profile_is_bounded():
     assert ResearcherInterestRequest(name="x" * 120).name
 
 
-def test_an_upload_into_a_draft_is_embedded_under_the_drafts_model(tmp_path):
-    conn, uid = _db(tmp_path)
-    d = wizard.create_draft(conn, user_id=uid, name="D", embedding_model="placeholder-v1")
-    papers_repo.upsert(conn, {"openalex_id": "local:abc", "title": "Notes", "body_text": "words " * 20, "source": "user_pdf"})
-    vault_service._attach_to_profile(conn, uid, d["slug"], "local:abc")
-    assert embeddings_repo.get(conn, "local:abc", "placeholder-v1") is not None
+# test_an_upload_into_a_draft_is_embedded_under_the_drafts_model moved to
+# tests/test_cr_upload.py (through the upload itself) with the 2026-11-02 review:
+# the helper it called is gone; the upload embeds before it writes (CR.3).
 
 
 def test_coherence_over_seeds_without_vectors_keeps_the_seed_count(tmp_path):

@@ -50,6 +50,7 @@ import structlog
 from ...db.repos import (
     draft_owned as draft_owned_repo,
     embeddings as embeddings_repo,
+    paper_rows as paper_rows_repo,
     papers as papers_repo,
     profiles as profiles_repo,
     researchers as researchers_repo,
@@ -70,6 +71,7 @@ from ...prosopia_client import (
     allowed_base_url,
     read_summary,
     looks_like_orcid,
+    normalize_rid,
 )
 from ...prosopia_seeds import RUNGS, Person, _normalize_openalex_id, _paper_id, current_works, normalize_doi, prefetch_works, resolve_seed
 from . import wizard as wizard_service
@@ -161,6 +163,17 @@ class ImportPlan:
     # import_orcid`` / ``import_key``) so a second request finds it.
     import_orcid: str | None = None
     import_key: str | None = None
+    # The Prosopia profile's interests for the draft (FUNCTIONAL_SPEC M.3),
+    # ``{"key", "name", "document"}``: written only once the import has
+    # stored its seeds (CR.7). Written while planning, a failed import left
+    # them on the draft or Edit copy, and saving the copy kept them.
+    prosopia_doc: dict | None = None
+    # The researcher an existing, still empty draft is to be marked as
+    # built from (``profiles.researcher_id``), written by ``_persist`` once
+    # the import succeeds (review B3-1, the user's choice B): marked while
+    # planning, a failed import left the mark -- the drafts list named the
+    # person and step 3 showed their profile topics over no papers of theirs.
+    link_researcher: int | None = None
 
 
 def normalize_ref(raw: str) -> str:
@@ -252,7 +265,25 @@ def _resolve_profile(ref: str, base_url: str | None, prosopia_client: Any | None
     # the client turns it into the slug of the profile they published.
     if looks_like_orcid(slug):
         slug = client.resolve_orcid(slug)
-    return slug, client.fetch_profile(slug)
+    profile = client.fetch_profile(slug)
+    # Every Prosopia profile RADAR reads comes through here: its rid is
+    # made one form once (CR.8), whatever client produced it.
+    try:
+        profile.rid = normalize_rid(getattr(profile, "rid", ""))
+    except AttributeError:      # a read-only profile object: its own entry normalized it
+        pass
+    return slug, profile
+
+
+def _seed_form(openalex_id: str | None) -> str | None:
+    """An OpenAlex work id as seeds store it, ``https://openalex.org/W…``
+    (L10): the pick list reads the same whether or not OpenAlex answered.
+    None for anything that is not a work id (a DOI, a ``openalex:`` form):
+    a made-up openalex.org link is worse than none (review B3-2)."""
+    import re
+
+    bare = _normalize_openalex_id(openalex_id)
+    return f"https://openalex.org/{bare}" if re.fullmatch(r"W\d+", bare) else None
 
 
 def _work_summary(record: Any, current: dict[str, dict] | None = None) -> dict[str, Any]:
@@ -266,7 +297,7 @@ def _work_summary(record: Any, current: dict[str, dict] | None = None) -> dict[s
         "year": record.year,
         "venue": record.journal or record.venue,
         "doi": normalize_doi(record.doi),
-        "openalex_id": (work or {}).get("id") or record.openalex_id or None,
+        "openalex_id": _seed_form((work or {}).get("id") or record.openalex_id),
         "cited_by_count": getattr(record, "cited_by_count", None),
         "authors": authors[:3],
         "n_authors": len(authors) or None,
@@ -309,7 +340,7 @@ def list_works(
     works.sort(key=lambda w: (-(w["year"] or 0), w["title"]))
     log.info("prosopia.list_works", slug=slug, n=len(works))
     out = {"slug": slug, "name": profile.name or None, "works": works}
-    rid = str(getattr(profile, "rid", "") or "").strip().upper()
+    rid = getattr(profile, "rid", "") or ""
     out["orcid"] = rid if looks_like_orcid(rid) else None
     if refresh:
         out["profile"] = profile
@@ -346,18 +377,12 @@ def open_draft(
 ) -> sqlite3.Row:
     """The draft an import's papers become seeds of: ``target``, or a new one.
 
-    A new draft is linked to the researcher. An existing one keeps its
-    name and, if it was built from someone already, stays theirs -- so a
-    second researcher's papers can join the first's (the wizard's "add
-    papers from an ORCID / Prosopia profile" once a draft exists). A draft
-    that already has seeds of its own (uploaded PDFs) is not linked
-    either: it was not built from this person, and the link made the
-    wizard, the drafts list and the interest page say it was ("4 papers
-    from the profile of X" over two PDFs and two of X's papers).
+    A new draft is linked to the researcher (it goes with the import if
+    that fails). An existing one is returned as it is: whether it is to be
+    linked is :func:`_link_for` 's, and the link is written only when the
+    import succeeds (B3-1).
     """
     if target is not None:
-        if target["researcher_id"] is None and researcher_id is not None and not _has_seeds(conn, int(target["id"])):
-            researchers_repo.set_profile_researcher(conn, int(target["id"]), researcher_id)
         return target
     draft = wizard_service.create_draft(
         conn,
@@ -376,9 +401,10 @@ def open_draft(
 def open_draft_for_import(
     conn: sqlite3.Connection, settings: Any, *, save_profile: bool, record_researcher, new_researcher: bool,
     **kwargs: Any,
-) -> tuple[sqlite3.Row, int | None]:
-    """The draft a wizard import fills, and the researcher it saved, if any
-    (FUNCTIONAL_SPEC M.2).
+) -> tuple[sqlite3.Row, int | None, int | None]:
+    """The draft a wizard import fills, the researcher it saved, if any
+    (FUNCTIONAL_SPEC M.2), and the researcher an existing draft is to be
+    marked as built from once the import succeeds (:func:`_link_for`).
 
     Not saving (the default): no researcher; the papers are the draft's
     seeds, and go with it. Saving: ``record_researcher()`` makes the
@@ -388,15 +414,33 @@ def open_draft_for_import(
     when the import fails.
     """
     if not save_profile:
-        return open_draft(conn, settings, researcher_id=None, **kwargs), None
+        return open_draft(conn, settings, researcher_id=None, **kwargs), None, None
     researcher_id = record_researcher()
     try:
-        return open_draft(conn, settings, researcher_id=researcher_id, **kwargs), researcher_id
+        link = _link_for(conn, kwargs.get("target"), researcher_id)
+        return open_draft(conn, settings, researcher_id=researcher_id, **kwargs), researcher_id, link
     except BaseException:
         conn.rollback()
         if new_researcher:
             researchers_repo.delete(conn, researcher_id)
         raise
+
+
+def _link_for(conn: sqlite3.Connection, target: sqlite3.Row | None, researcher_id: int | None) -> int | None:
+    """The researcher an existing draft is to be marked as built from, once
+    the import into it succeeds; None to leave it as it is.
+
+    One built from someone already stays theirs -- so a second
+    researcher's papers can join the first's (the wizard's "add papers
+    from an ORCID / Prosopia profile" once a draft exists). One that has
+    seeds of its own (uploaded PDFs) is not marked either: it was not built
+    from this person, and the mark made the wizard, the drafts list and the
+    interest page say it was ("4 papers from the profile of X" over two
+    PDFs and two of X's papers). Decided now, before the import adds seeds.
+    """
+    if target is None or researcher_id is None or target["researcher_id"] is not None:
+        return None
+    return None if _has_seeds(conn, int(target["id"])) else int(researcher_id)
 
 
 def _has_seeds(conn: sqlite3.Connection, profile_id: int) -> bool:
@@ -443,7 +487,7 @@ def prepare_import(
     # source, by ORCID) is that run, not a second draft and a second job.
     from . import orcid as orcid_service
     from ...db.repos import researchers as researchers_repo
-    rid = str(getattr(profile, "rid", "") or "").strip().upper()
+    rid = getattr(profile, "rid", "") or ""
     from . import researchers as researchers_service
     known = researchers_service.saved_person(
         conn, user_id=user_id, source="prosopia", key=slug, orcid=rid if looks_like_orcid(rid) else None,
@@ -459,7 +503,7 @@ def prepare_import(
 
     model = (target["embedding_model"] if target is not None else None) \
         or embedding_model or settings.RADAR_DEFAULT_EMBEDDING_MODEL
-    draft_row, researcher_id = open_draft_for_import(
+    draft_row, researcher_id, link_researcher = open_draft_for_import(
         conn, settings, save_profile=save_profile, new_researcher=new_researcher,
         record_researcher=lambda: int(known["id"]) if known is not None else researchers_service.record_prosopia_researcher(
             conn, user_id=user_id, slug=slug, profile=profile,
@@ -469,13 +513,13 @@ def prepare_import(
         name=(name or profile.name or slug).strip()[:MAX_NAME], embedding_model=model,
     )
     # The profile's interest / not interest go with the draft, saved
-    # profile or not (FUNCTIONAL_SPEC M.3).
-    from ... import prosopia_interests
-    prosopia_interests.keep_doc(conn, int(draft_row["id"]), key=slug,
-                            name=(str(getattr(profile, "name", "") or "") or slug),
-                            document=researchers_service.profile_document(profile))
+    # profile or not (FUNCTIONAL_SPEC M.3) -- once the import succeeds (CR.7).
+    prosopia_doc = {"key": slug, "name": (str(getattr(profile, "name", "") or "") or slug),
+                    "document": researchers_service.profile_document(profile)}
 
     return ImportPlan(
+        prosopia_doc=prosopia_doc,
+        link_researcher=link_researcher,
         slug=slug,
         draft_slug=draft_row["slug"],
         draft_name=draft_row["name"],
@@ -797,6 +841,21 @@ def _persist(conn: sqlite3.Connection, plan: ImportPlan, resolved: list, vectors
             )
             conn.commit()
             researchers_repo.mark_imported(conn, plan.researcher_id, run_id=run_id)
+        if plan.link_researcher is not None and plan.profile_id is not None:
+            # Marked now the import succeeded (B3-1); not over a mark
+            # another import made meanwhile.
+            cur = conn.execute(
+                "UPDATE profiles SET researcher_id = ?, updated_at = datetime('now') "
+                "WHERE id = ? AND researcher_id IS NULL",
+                (int(plan.link_researcher), int(plan.profile_id)),
+            )
+            conn.commit()
+            if cur.rowcount:
+                done.append(("marked", int(plan.link_researcher)))
+        if plan.prosopia_doc is not None and plan.profile_id is not None:
+            # Last: everything else is stored (CR.7).
+            from ... import prosopia_interests
+            prosopia_interests.keep_doc(conn, int(plan.profile_id), **plan.prosopia_doc)
     except BaseException:
         conn.rollback()
         _take_back(conn, plan, done)
@@ -814,6 +873,9 @@ def _take_back(conn: sqlite3.Connection, plan: ImportPlan, done: list[tuple]) ->
         elif kind == "link":
             conn.execute("DELETE FROM researcher_papers WHERE researcher_id = ? AND openalex_id = ?",
                          (plan.researcher_id, oa_id))
+        elif kind == "marked":
+            conn.execute("UPDATE profiles SET researcher_id = NULL WHERE id = ? AND researcher_id = ?",
+                         (plan.profile_id, oa_id))
         elif kind == "vector":
             conn.execute("DELETE FROM paper_embeddings WHERE openalex_id = ? AND embedding_model = ?",
                          (oa_id, plan.embedding_model))
@@ -821,8 +883,7 @@ def _take_back(conn: sqlite3.Connection, plan: ImportPlan, done: list[tuple]) ->
             if plan.profile_id is not None:
                 conn.execute("DELETE FROM draft_owned WHERE profile_id = ? AND kind = 'paper' AND item = ?",
                              (plan.profile_id, oa_id))
-            if not draft_owned_repo._paper_in_use(conn, oa_id):
-                conn.execute("DELETE FROM papers WHERE openalex_id = ?", (oa_id,))
+            paper_rows_repo.delete_if_unused(conn, oa_id)
     conn.commit()
     if done:
         log.info("prosopia.import.taken_back", n=len(done), profile_id=plan.profile_id,
@@ -863,7 +924,8 @@ def undo_import(conn: sqlite3.Connection, plan: ImportPlan, *, run_id: int | Non
     if rid is None or researchers_repo.get(conn, int(rid)) is None:
         return
     if plan.profile_id is not None:
-        # The draft added to was linked to the new researcher by open_draft.
+        # The draft added to was marked as built from the new researcher by
+        # _persist (B3-1) -- this runs only when the job fails after it.
         conn.execute("UPDATE profiles SET researcher_id = NULL WHERE id = ? AND researcher_id = ?",
                      (int(plan.profile_id), int(rid)))
     draft_owned_repo.disown(conn, "researcher", rid)

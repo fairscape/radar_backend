@@ -99,7 +99,8 @@ def test_m36_the_listing_shows_prosopias_ids_while_openalex_is_unavailable(env):
     app = _app(_prosopia(), Down())
     r = _request(app, "GET", "/api/import/prosopia/works", params={"ref": "sheffield-nathan"})
     assert r.status_code == 200, r.text
-    assert {w["id"]: w["openalex_id"] for w in r.json()["works"]}["leroy2025atacformer"] == OLD
+    # Prosopia's id, in the seed form (L10).
+    assert {w["id"]: w["openalex_id"] for w in r.json()["works"]}["leroy2025atacformer"] == "https://openalex.org/" + OLD
 
 
 def test_m36_a_test_without_an_openalex_stub_never_reaches_openalex(env):
@@ -108,7 +109,8 @@ def test_m36_a_test_without_an_openalex_stub_never_reaches_openalex(env):
     app = _app(_prosopia())
     r = _request(app, "GET", "/api/import/prosopia/works", params={"ref": "sheffield-nathan"})
     assert r.status_code == 200, r.text
-    assert {w["id"]: w["openalex_id"] for w in r.json()["works"]}["leroy2025atacformer"] == OLD
+    # Prosopia's id, in the seed form (L10).
+    assert {w["id"]: w["openalex_id"] for w in r.json()["works"]}["leroy2025atacformer"] == "https://openalex.org/" + OLD
 
 
 # --- M-35: the import ------------------------------------------------------------------------

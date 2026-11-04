@@ -20,6 +20,8 @@ def upsert(
     openalex_id: str,
     model: str,
     vector: Iterable[float] | np.ndarray,
+    *,
+    commit: bool = True,
 ) -> None:
     blob = encode_vector(vector)
     conn.execute(
@@ -32,7 +34,8 @@ def upsert(
         """,
         (openalex_id, model, blob),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get(

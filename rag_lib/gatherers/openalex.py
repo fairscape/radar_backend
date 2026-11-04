@@ -30,7 +30,7 @@ import time
 
 import structlog
 
-from ..openalex_client import OpenAlexClient
+from ..openalex_client import WIDE_OR_SECONDS, WIDE_OR_TERMS, OpenAlexClient  # noqa: F401 -- re-exported
 from ..openalex_tiers import (
     DEFAULT_MUST_HAVE_PREVALENCE,
     DEFAULT_TOP_SUBFIELDS_N,
@@ -43,10 +43,8 @@ from ..openalex_tiers import (
 from ..paper import Paper, title_key
 from ..profile import Profile
 
-# OpenAlex: an OR-list of more than 10 topics.id values is limited to one
-# request a second per client.
-WIDE_OR_TERMS = 10
-WIDE_OR_SECONDS = 1.0
+# OpenAlex limits a wide topic OR-list to one request a second: paced for
+# the whole process in OpenAlexClient._get (WIDE_OR_TERMS, CR.11 L8).
 
 
 log = structlog.get_logger("rag_lib.gatherers.openalex")
@@ -256,47 +254,36 @@ class OpenAlexGatherer:
         by_bare = {bare_id(t): t for t in topic_ids}
         chosen: list[Paper] = []
         seen = _Deduper()
-        # OpenAlex allows a query that ORs more than WIDE_OR_TERMS topics
-        # once a second (each topic matches a large share of the index).
-        # The years go out back to back, so the second year's query was
-        # refused (429) unless the first happened to take over a second.
-        # The client sleeps after every request; make that a second here.
-        wide = max((len(vals) for _, vals, op in parts if op == "or"), default=0) > WIDE_OR_TERMS
-        usual_sleep = getattr(client, "rate_limit_sleep", None)
-        if wide and usual_sleep is not None:
-            client.rate_limit_sleep = max(float(usual_sleep), WIDE_OR_SECONDS)
-        try:
-            if parts:
-                per_page = max(1, min(200, per_year))
-                for year in range(int(year_from), int(year_to) + 1):
-                    filter_str = build_filter_string(
-                        parts, f"{year}-01-01", until=f"{year}-12-31", extras=self.extras,
-                    )
-                    if self.last_filter_str is None:
-                        self.last_filter_str = filter_str
-                    works = client.paginate_filter(
-                        filter_str, limit=per_year, per_page=per_page, sort=MOST_CITED,
-                    )
-                    n_new = 0
-                    for w in works:
-                        p = client.paper_from_work(w, source="openalex_gatherer")
-                        if p.openalex_id and seen.take(p):
-                            chosen.append(p)
-                            n_new += 1
-                            # Credit the first enabled topic the work carries
-                            # (OpenAlex lists its topics best match first):
-                            # left unattributed, a backfilled interest's
-                            # topics all read "found 0".
-                            for t in w.get("topics") or []:
-                                tid = by_bare.get(bare_id(str((t or {}).get("id") or "")))
-                                if tid:
-                                    self.last_source_topics[p.openalex_id] = tid
-                                    break
-                    log.info("openalex_gatherer.year_fetch", profile=profile.name,
-                             year=year, n=len(works), new=n_new)
-        finally:
-            if wide and usual_sleep is not None:
-                client.rate_limit_sleep = usual_sleep
+        # The years go out back to back; a wide topic OR-list is held to one
+        # request a second by the client, for every caller (CR.11 L8).
+        if parts:
+            per_page = max(1, min(200, per_year))
+            for year in range(int(year_from), int(year_to) + 1):
+                filter_str = build_filter_string(
+                    parts, f"{year}-01-01", until=f"{year}-12-31", extras=self.extras,
+                )
+                if self.last_filter_str is None:
+                    self.last_filter_str = filter_str
+                works = client.paginate_filter(
+                    filter_str, limit=per_year, per_page=per_page, sort=MOST_CITED,
+                )
+                n_new = 0
+                for w in works:
+                    p = client.paper_from_work(w, source="openalex_gatherer")
+                    if p.openalex_id and seen.take(p):
+                        chosen.append(p)
+                        n_new += 1
+                        # Credit the first enabled topic the work carries
+                        # (OpenAlex lists its topics best match first):
+                        # left unattributed, a backfilled interest's
+                        # topics all read "found 0".
+                        for t in w.get("topics") or []:
+                            tid = by_bare.get(bare_id(str((t or {}).get("id") or "")))
+                            if tid:
+                                self.last_source_topics[p.openalex_id] = tid
+                                break
+                log.info("openalex_gatherer.year_fetch", profile=profile.name,
+                         year=year, n=len(works), new=n_new)
         self._last_cost = {
             "wall_seconds": time.time() - t0,
             "api_calls": int(client.api_calls - calls_before),

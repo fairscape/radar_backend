@@ -165,13 +165,27 @@ def test_an_upload_names_an_interest(app, tmp_path):
     assert _request(app, "GET", "/api/vault/docs").json() == []
 
 
-def test_upload_is_idempotent_for_same_bytes(app):
-    a = _upload(app, b"identical-bytes", filename="x.pdf").json()
-    b = _upload(app, b"identical-bytes", filename="x-renamed.pdf").json()
-    assert a["id"] == b["id"]
+def test_the_same_bytes_twice_in_one_interest_are_refused(app):
+    """Same file into the same interest: refused, says where it came from;
+    nothing new stored (FUNCTIONAL_SPEC CR.10)."""
+    a = _upload(app, b"identical-bytes", filename="x.pdf")
+    assert a.status_code == 200, a.text
+    b = _upload(app, b"identical-bytes", filename="x-renamed.pdf")
+    assert b.status_code == 409, b.text
+    assert "already a seed of this interest (from an uploaded PDF)" in b.json()["detail"]
 
     docs = _request(app, "GET", "/api/vault/docs").json()
-    assert sum(1 for d in docs if d["id"] == a["id"]) == 1
+    assert [d["id"] for d in docs] == [a.json()["id"]]
+
+
+def test_the_same_bytes_in_another_interest_are_a_copy_of_their_own(app):
+    """Different interests: every upload stored on its own (CR.10)."""
+    a = _upload(app, b"identical-bytes").json()
+    r = _request(app, "POST", "/api/profiles/draft", json={"name": "Other"})
+    assert r.status_code == 200, r.text
+    b = _upload(app, b"identical-bytes", profile_slug=r.json()["slug"])
+    assert b.status_code == 200, b.text
+    assert b.json()["id"] != a["id"]
 
 
 def _upload_saved(app, content: bytes, slug: str) -> dict:
@@ -330,13 +344,6 @@ def test_upload_size_limit(app, monkeypatch):
     assert resp.status_code == 413, resp.text
 
 
-def test_reupload_says_duplicate(app):
-    a = _upload(app, b"dup-bytes").json()
-    b = _upload(app, b"dup-bytes").json()
-    assert not a.get("duplicate")
-    assert b["duplicate"] is True
-
-
 def test_two_users_uploading_one_paper_both_keep_it(app, monkeypatch):
     # Both PDFs resolve to the same OpenAlex work.
     work = {"id": "https://openalex.org/W42", "title": "Shared paper"}
@@ -454,9 +461,10 @@ def test_a_doi_from_the_references_is_not_the_paper():
     assert vault_service._verified_doi_match(_rec("Some cited method", "x"), cited)
 
 
-def test_a_retry_embeds_an_upload_that_failed_at_embedding(app, tmp_path, monkeypatch):
-    """The rows are written before the embedder runs; with it down the upload
-    500'd, and every retry was a 'duplicate' that never embedded the paper."""
+def test_an_upload_whose_embedding_fails_writes_nothing_and_a_retry_works(app, tmp_path, monkeypatch):
+    """Vectors are computed before any write (CR.3): with the embedder down
+    the upload fails and leaves no row, file or seed; a retry is a fresh
+    upload, embedded once."""
     from rag_lib.db import connect as _connect
 
     real = vault_service.get_embedder
@@ -465,13 +473,23 @@ def test_a_retry_embeds_an_upload_that_failed_at_embedding(app, tmp_path, monkey
         raise ConnectionError("ollama down")
     monkeypatch.setattr(vault_service, "get_embedder", down)
     try:
-        _upload(app, b"retry-bytes")
-    except Exception:  # noqa: BLE001 -- the ASGI transport re-raises the 500
-        pass
+        r = _upload(app, b"retry-bytes")
+    except ConnectionError:  # the ASGI transport re-raises the 500
+        r = None
+    assert r is None or r.status_code >= 500
+    conn = _connect(tmp_path / "radar.db")
+    left = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in ("paper_uploads", "paper_versions", "paper_embeddings", "profile_seeds", "draft_owned")}
+    conn.close()
+    assert left == dict.fromkeys(left, 0), left
+    assert not [p for p in (tmp_path / "vault").rglob("*") if p.is_file()]
+
     monkeypatch.setattr(vault_service, "get_embedder", real)
     resp = _upload(app, b"retry-bytes")
-    assert resp.status_code == 200 and resp.json()["duplicate"] is True
+    assert resp.status_code == 200, resp.text
     conn = _connect(tmp_path / "radar.db")
     n = conn.execute("SELECT COUNT(*) FROM paper_embeddings WHERE openalex_id = ?", (resp.json()["id"],)).fetchone()[0]
     conn.close()
     assert n == 1
+
+

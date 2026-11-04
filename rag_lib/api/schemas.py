@@ -161,7 +161,8 @@ class Seed(_Model):
     title: str
     year: int
     coh: float
-    # As VaultDoc.version, with the time that file was uploaded.
+    # As VaultDoc.version. ``uploaded``: when this file was uploaded, for
+    # every uploaded seed, numbered or not (CR.4).
     version: int | None = None
     uploaded: str | None = None
     # Where the seed came from (profiles_repo.SEED_SOURCES; None before this
@@ -180,6 +181,8 @@ class DeletedSeed(_Model):
 
     id: str
     title: str | None = None
+    # When that file was uploaded (CR.4); None for a mark from before 0041.
+    uploaded: str | None = None
     deletedAt: str
 
 
@@ -1303,6 +1306,31 @@ class User(_Model):
     email: str
     mailto: str | None = None
     created_at: str | None = None
+
+
+class MyProsopiaProfile(_Model):
+    """The signed-in person's self profile on Prosopia (public record)."""
+
+    slug: str
+    name: str
+    affiliation: str | None = None
+    paper_count: int | None = None
+    url: str
+
+
+class MyProsopia(_Model):
+    """``GET /api/users/me/prosopia``: the signed-in person's own profile.
+
+    Every field is optional and all-null is the common answer: header
+    mode, no self profile on the Prosopia account, no public copy of it,
+    or Prosopia unreachable. The UI shows the one-click card only when
+    ``profile`` is set.
+    """
+
+    profile: MyProsopiaProfile | None = None
+    # This user's stored researcher for that profile, once imported.
+    researcher_id: int | None = None
+    imported_at: str | None = None
 
 
 class UserUpdateRequest(_Model):

@@ -29,24 +29,33 @@ http://:8080 {
 	encode gzip
 
 	handle /api/* {
+		# L4: a body over 55 MB (Caddy's MB is 10^6 bytes) is refused here
+		# with 413 before any of it reaches the backend, which would spool
+		# it to disk first. The vault takes PDFs up to RADAR_UPLOAD_MAX_MB
+		# (50 MiB = 52,428,800 bytes); the margin is the multipart envelope.
+		# Raise both together.
+		# By the declared length: `request_body max_size` alone only cuts
+		# the stream off, and the first 55 MB still went to the backend
+		# (measured). It stays for a body sent without a length.
+		@too_big expression `{http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 55000000`
+		respond @too_big "This request is larger than the server accepts." 413 {
+			close
+		}
+		request_body {
+			max_size 55MB
+		}
 		reverse_proxy 127.0.0.1:8000 {
-			# The backend treats X-User-Email as the identity, with no
-			# signature behind it, so the client must never get to choose
-			# it. This overwrites whatever the browser sent with the
-			# address Cloudflare Access verified; with Access absent it
-			# resolves empty and the backend 401s (RADAR_REQUIRE_AUTH).
-			# Don't add a `header_up -X-User-Email` alongside this: Caddy
-			# applies deletes after sets, so it would undo the line below.
-			# This is the whole identity mechanism: the backend trusts
-			# X-User-Email with nothing behind it, so the value has to
-			# come from the tunnel and nowhere else. The loopback bind
-			# above is what makes that true -- a client that can reach
-			# this port can simply send the Cf-Access header and be
-			# whoever it likes. Stripping the client's copy here does
-			# not help: Caddy runs request_header before reverse_proxy
-			# reads the placeholder, so the delete would erase the real
-			# identity too (measured: every request 401s).
-			header_up X-User-Email {http.request.header.Cf-Access-Authenticated-User-Email}
+			# Identity is the session cookie the /auth sign-in sets; the
+			# backend ignores X-User-Email whenever a sign-in provider is
+			# on, and refuses to start without one (RADAR_TRUST_EMAIL_HEADER
+			# off). Until 2026-11 this line copied Cloudflare Access's
+			# Cf-Access-Authenticated-User-Email into X-User-Email; with
+			# Access gone nothing vouches for that header, so a client could
+			# send it and be anyone. The identity headers are dropped here so
+			# none reaches the backend even if it were misconfigured.
+			header_up -X-User-Email
+			header_up -Cf-Access-Authenticated-User-Email
+			header_up -Cf-Access-Jwt-Assertion
 
 			# Every /api response is private to one identity, and the
 			# backend sets no cache headers at all. Without this the
@@ -65,6 +74,17 @@ http://:8080 {
 		}
 	}
 
+	# Sign-in buttons: /auth/login/<provider>, its
+	# callback and logout run in the backend and set its session cookie.
+	handle /auth/* {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up -X-User-Email
+			header_up -Cf-Access-Authenticated-User-Email
+			header_up -Cf-Access-Jwt-Assertion
+			header_down Cache-Control "no-store"
+		}
+	}
+
 	handle {
 		root * /p/realai/lei/radar_deployment/radar_frontend/dist
 		# The SPA shell must be revalidated on every load: asset names are
@@ -80,5 +100,19 @@ http://:8080 {
 
 	log {
 		output file /bigtemp/nkw3mr/radar_deployment/logs/caddy.log
+		# L13: the access log records request and response headers. These
+		# are credentials: the sign-in session cookie (Cookie on requests,
+		# Set-Cookie on the /auth answers), any Authorization, and
+		# Cloudflare Access's signed assertion from before 2026-11. Anyone
+		# who can read this file could replay them until they expire.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Cf-Access-Jwt-Assertion delete
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				resp_headers>Set-Cookie delete
+			}
+		}
 	}
 }

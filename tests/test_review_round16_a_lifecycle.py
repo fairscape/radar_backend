@@ -184,20 +184,23 @@ def test_upload_seed_then_interest_deleted_before_refit_is_not_a_500(app, env, m
 
     Spec E: the drop goes into the interest's Edit-interest copy (an upload
     into the saved slug is 409); deleting the interest cascades the copy."""
-    from rag_lib.api.services import wizard as wizard_service
+    from rag_lib.api.services import vault as vault_service
 
     slug, _ = _go_live(app, env, name="Late Delete", seeds_from_researcher=False)
     pid = _one(env, "SELECT id FROM profiles WHERE slug = ?", slug)["id"]
     assert _upload(app, b"late-delete-body", "late.pdf", slug).status_code == 409
     copy = _ok(_request(app, "POST", f"/api/profiles/{slug}/edit"))["slug"]
-    real = wizard_service.embed_missing
+    # Deleted while the PDF is read: since CR.3 the upload computes its
+    # vectors before writing anything and re-checks the target under the
+    # write lock (CR.2), so this is where the delete can land now.
+    real = vault_service._enrich_via_openalex
 
-    def _embed_then_deleted(conn, model, ids):
-        out = real(conn, model, ids)
+    def _enrich_then_deleted(record, **kw):
+        out = real(record, **kw)
         _delete_now(env, pid)
         return out
 
-    monkeypatch.setattr(wizard_service, "embed_missing", _embed_then_deleted)
+    monkeypatch.setattr(vault_service, "_enrich_via_openalex", _enrich_then_deleted)
     try:
         res = _upload(app, b"late-delete-body", "late.pdf", copy)
         code = res.status_code

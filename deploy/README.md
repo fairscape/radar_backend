@@ -62,10 +62,47 @@ download the same versions (`<binary> --version`) into that directory.
 
 ## The one thing a reader should know before changing Caddyfile
 
-The backend trusts the `X-User-Email` request header as identity with
-nothing signed behind it. Caddy overwriting that header with
-`Cf-Access-Authenticated-User-Email` is the *entire* authentication
-mechanism, and `bind 127.0.0.1` is what makes it trustworthy: a client that
-can reach the port can send the Cf-Access header itself. It was bound to
-every interface until 2026-09-28, and anyone on the campus network could be
-anybody. `radar.sh status` now asserts the bind address for that reason.
+Identity is the session cookie the backend's `/auth` sign-in (Google,
+Prosopia) sets; `X-User-Email` is ignored. Until 2026-11 it was the other
+way round: Caddy copied Cloudflare Access's
+`Cf-Access-Authenticated-User-Email` into `X-User-Email` and the backend
+trusted it. With Access removed nothing vouches for that header, so the
+copy line is gone and Caddy now *drops* both headers. Never put it back:
+a client can send the Cf-Access header itself.
+
+Two checks hold this up:
+- the backend refuses to start with `RADAR_REQUIRE_AUTH=true` and no
+  sign-in provider unless `RADAR_TRUST_EMAIL_HEADER=true` (the live `.env`
+  must not set it), so a missing client secret stops the site instead of
+  reopening the header;
+- `radar.sh status` sends a forged header through :8080 and expects 401.
+
+`bind 127.0.0.1` still matters: the backend's own port and Caddy's admin
+socket stay off the network.
+
+## When the data shrinks: pinned copies
+
+`backup.sh` does not try to tell an accident from a deliberate cleanup.
+When the data shrinks sharply it keeps backing up as usual and keeps the
+last copy from before the shrink for good:
+
+- **Database** (L14): a snapshot with fewer than a tenth of the previous
+  one's papers+profiles rows, or none at all after a non-empty one. The
+  previous snapshot is copied to `backups/pinned/` (and `pinned/` on R2),
+  which the rolling windows (48 hourly, 60 daily) never prune.
+- **Vault** (CR.9): fewer than half the files R2 holds. The sync runs; what
+  it removes goes to `vault-pinned/<day>/` on R2, never pruned. (A normal
+  sync moves removed or replaced files to `vault-deleted/<day>/`, kept 60
+  days.)
+
+Each pin is a line in `backups/pinned.log` and a `WARN` in `backup.log`;
+`radar.sh watchdog` reports each new one once, and `radar.sh status` shows
+the latest. Nothing needs to be done to keep backups running.
+
+When you see one: if the shrink was an accident, restore from the pinned
+copy (`backup.sh restore backups/pinned/<file>`). If it was deliberate,
+delete the pinned copy when you no longer want it, here and on R2.
+
+The first vault sync after the 2026-11-02 switch to an empty database will
+pin: R2's `vault/` still holds the files of the vault from before it. They
+end up in `vault-pinned/`.

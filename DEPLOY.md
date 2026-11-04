@@ -204,16 +204,29 @@ serves on <http://localhost:5173> and forwards `/api` to
 
 ## Users
 
-The backend takes the user's identity from the `X-User-Email` request
-header and checks nothing behind it.
+Two ways to know who is asking:
+
+- **Sign-in buttons** (the live site since 2026-11): Google and/or
+  Prosopia. Set `BIOXPLORER_GOOGLE_CLIENT_ID` and `_SECRET` (and/or
+  `BIOXPLORER_PROSOPIA_CLIENT_SECRET`), `BIOXPLORER_OIDC_REDIRECT_URI`
+  (`https://<host>/auth/login/callback`, registered with each provider),
+  `BIOXPLORER_SESSION_SECRET` (32+ random characters, e.g.
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"`) and,
+  behind https, `BIOXPLORER_COOKIE_SECURE=true`. Route `/auth/*` to the
+  backend as `deploy/Caddyfile` does. The backend then reads a signed
+  session cookie and ignores `X-User-Email` entirely. Anyone with a
+  verified email at a provider can sign in; the account is that address.
+- **The `X-User-Email` header**, with nothing checked behind it:
 
 - **One user** (the default here): `RADAR_REQUIRE_AUTH=false` and a proxy
   that removes any `X-User-Email` a client sends. Every request is the
   built-in default user.
 - **Several users**: put a proxy that signs people in (OAuth2 Proxy,
-  your SSO, Cloudflare Access as the live site does) in front, have it
+  your SSO, Cloudflare Access as the live site did until 2026-11) in front, have it
   set `X-User-Email` to the signed-in address, set
-  `RADAR_REQUIRE_AUTH=true`, and make sure nothing but that proxy can
+  `RADAR_REQUIRE_AUTH=true` and `RADAR_TRUST_EMAIL_HEADER=true` (without
+  it the backend refuses to start: a sign-in setup whose client secret
+  went missing must not quietly trust the header), and make sure nothing but that proxy can
   reach port 8000 or 8080. Anyone who can reach them directly can claim
   any address -- including other accounts on a shared machine, since
   loopback is open to every local user.

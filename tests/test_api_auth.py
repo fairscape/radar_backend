@@ -59,6 +59,9 @@ def app_auth_required(tmp_path, monkeypatch):
     monkeypatch.setenv("RADAR_LOG_JSON", "false")
     monkeypatch.setenv("RADAR_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("RADAR_REQUIRE_AUTH", "true")
+    # The header model with auth on has to be asked for (sign-in tests:
+    # test_signin_identity.py).
+    monkeypatch.setenv("RADAR_TRUST_EMAIL_HEADER", "true")
     settings_module.get_settings.cache_clear()
     _seed_db(db)
 

@@ -68,6 +68,8 @@ EXPECTED_VERSIONS = [
     "0037_import_person",
     "0038_vault_and_unsave",
     "0039_vault_kept",
+    "0040_cr_vault_kept_and_versions",
+    "0041_deleted_seed_uploaded_at",
 ]
 
 

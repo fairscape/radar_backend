@@ -140,7 +140,7 @@ def _storage_with(entries):
     class S(pc.PagedApiStorage):
         def _request(self, method, path, params=None, **kw):  # noqa: ARG002
             if path.endswith("papers"):
-                return {"items": entries, "has_more": False}
+                return {"results": entries, "pagination": {"page_size": 100, "next_page_token": None}}
             return {"fields": {"name": "Someone"}}
 
     return S

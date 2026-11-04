@@ -919,21 +919,30 @@ def test_a_refresh_asked_for_while_one_runs_makes_the_running_one_go_round_again
 def test_a_scan_that_overlapped_a_seed_change_rescores_against_the_new_seeds(
     monkeypatch, db_path, settings, profile_id,
 ):
-    """The batch was scored against the centroid read at the start; the
-    refit's rescore ran before these rows went in."""
+    """The batch was scored against the fit read once OpenAlex answered
+    (CR.5); a seed edit's refit while it scored rescored the pool before
+    these rows went in."""
     from rag_lib.scoring import rescore
 
     calls = []
+    real_attach = scheduler_jobs.embeddings_repo.attach_stored
+    done = []
 
-    class RefitMidway(_StubGatherer):
-        def fetch(self, profile, *, since, limit):
-            c = connect(db_path)          # a seed edit's refit, mid-scan
+    def refit_midway(conn, candidates, model):
+        if not done:                      # a seed edit's refit, while the batch is scored
+            done.append(1)
+            c = connect(db_path)
             try:
                 c.execute("UPDATE profiles SET selector_config_json = json_set(selector_config_json, '$.refit', 1) WHERE id = ?", (profile_id,))
                 c.commit()
             finally:
                 c.close()
-            return super().fetch(profile, since=since, limit=limit)
+        return real_attach(conn, candidates, model)
+
+    monkeypatch.setattr(scheduler_jobs.embeddings_repo, "attach_stored", refit_midway)
+
+    class RefitMidway(_StubGatherer):
+        pass
 
     conn = connect(db_path)   # the fit records its seeds (round 12); W1 alone here
     conn.execute("UPDATE profiles SET selector_config_json = json_set(selector_config_json, '$.fit_seed_ids', json('[\"W1\"]')) WHERE id = ?", (profile_id,))
@@ -944,6 +953,7 @@ def test_a_scan_that_overlapped_a_seed_change_rescores_against_the_new_seeds(
     assert calls == [profile_id]
 
     calls.clear()      # an ordinary scan does not
+    monkeypatch.setattr(scheduler_jobs.embeddings_repo, "attach_stored", real_attach)
     _patch_dependencies(monkeypatch, [_candidate_paper("W801")])
     scheduler_jobs.gather_for_profile(user_id=1, profile_id=profile_id, settings=settings, days=7)
     assert calls == []

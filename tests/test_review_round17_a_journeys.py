@@ -376,7 +376,7 @@ def test_delete_interest_sharing_a_paper(app, env):
     assert a not in tags
     # Feedback of b intact, a's routes 404
     assert _code(app, "GET", f"/api/profiles/{a}/feedback") == 404
-    assert _ok(_request(app, "GET", f"/api/profiles/{a}")) is None
+    assert _code(app, "GET", f"/api/profiles/{a}") == 404
 
 
 def test_forget_researcher_with_live_and_draft_interests(app, env):
