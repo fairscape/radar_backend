@@ -343,6 +343,9 @@ def test_user_b_cannot_read_or_touch_user_a(world):
         hit("DELETE", f"/api/profiles/draft/{s}/seeds/{world['seed']}")
         hit("POST", f"/api/profiles/draft/{s}/seeds", json={"openalex_ids": [world["seed"]]})
         hit("POST", "/api/profiles", json={"slug": s, "threshold": 0.7, "selected_topic_ids": []})
+        # One tab at a time on a draft (W.L): B neither takes nor frees A's.
+        hit("POST", f"/api/profiles/draft/{s}/hold")
+        hit("POST", f"/api/profiles/draft/{s}/release")
         # Edit interest's copy routes
         hit("POST", f"/api/profiles/draft/{s}/edit-alive", json={"tab": "t"})
         hit("GET", f"/api/profiles/draft/{s}/edit-state")

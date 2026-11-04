@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from ...openalex_status import OpenAlexUnavailable
 from ...redact import public_error
 
+from .. import draft_lock
 from ..deps import get_current_user, get_db, get_settings
 from ..schemas import (
     GatherRun,
@@ -155,6 +156,8 @@ def import_prosopia(
             )
         except prosopia_service.DraftNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except draft_lock.DraftOpenElsewhere:
+            raise                              # a 409 (app handler), not "could not read"
         except orcid_service.ImportAlreadyRunning as exc:
             # As the ORCID route: the run already filling this draft, or a 409.
             if exc.slug is None:
@@ -402,6 +405,8 @@ def import_orcid(
             )
         except prosopia_service.DraftNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except draft_lock.DraftOpenElsewhere:
+            raise                              # a 409 (app handler), not "could not read"
         except orcid_service.ImportAlreadyRunning as exc:
             if exc.slug is None:
                 # The run is a researcher import (no draft to hand back): the

@@ -17,14 +17,14 @@ from urllib.parse import urlsplit
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
 
-from . import oidc
+from . import draft_lock, oidc
 from .logging import configure_logging
 from .routers import auth, chat, health, profiles, prosopia, radar, researchers, users, vault
 from .settings import get_settings
@@ -159,6 +159,9 @@ def create_app() -> FastAPI:
         title="BioXplorer API",
         version=_service_version(),
         lifespan=lifespan,
+        # Which tab each request comes from: a draft open in one tab is
+        # changed from that tab only (draft_lock, FUNCTIONAL_SPEC W.L).
+        dependencies=[Depends(draft_lock.request_tab)],
     )
 
     # CORS: only the origins RADAR_CORS_ORIGINS lists (live: the vite dev
@@ -257,6 +260,13 @@ def create_app() -> FastAPI:
         # row; none was written (each would undo a change). Try again.
         return JSONResponse(status_code=409, content={
             "detail": "the interest's seeds changed while it was being fitted; try again"})
+
+    @app.exception_handler(draft_lock.DraftOpenElsewhere)
+    async def _draft_open_elsewhere(request: Request, exc: draft_lock.DraftOpenElsewhere):
+        # Refused wherever it was reached (the profiles router's guard, an
+        # upload, an import, a Vault or researcher delete). ``openElsewhere``
+        # lets the wizard show its "open in another tab" page.
+        return JSONResponse(status_code=409, content={"detail": str(exc), "openElsewhere": True})
 
     from .services.wizard import SavedInterest
 

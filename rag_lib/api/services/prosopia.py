@@ -362,6 +362,8 @@ def target_draft(conn: sqlite3.Connection, user_id: int, into: str | None) -> sq
     row = profiles_repo.get_by_slug(conn, user_id, into)
     if row is None or not row["is_draft"]:
         raise DraftNotFound(f"no draft '{into}' to add these papers to")
+    from .. import draft_lock
+    draft_lock.check(conn, row)        # open in another tab: that tab adds to it (W.L)
     return row
 
 

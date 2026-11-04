@@ -611,6 +611,10 @@ def delete_researcher(
     # draft, still being built from them, loses their profile topics.
     drafts = [int(p["id"]) for p in researchers_repo.interests_for(conn, researcher_id)
               if wizard_service.is_new_draft(p)]
+    # Their profile topics leave these drafts: not one open in another tab (W.L).
+    from .. import draft_lock
+    for d in drafts:
+        draft_lock.check_id(conn, d)
     # Their papers stay in the vault: only the Vault's delete takes one out (B2.2).
     from rag_lib.db.repos import vault as vault_repo
 

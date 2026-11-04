@@ -195,6 +195,9 @@ def _check_target(conn: sqlite3.Connection, user_id: int, profile_id: int, slug:
         # A saved interest changes only through Edit interest, which
         # uploads into its copy (FUNCTIONAL_SPEC E.2-8, E.6 R12).
         raise UploadRejected(f"'{slug}' is a saved interest: add seeds to it in Edit interest.", status_code=409)
+    # A draft open in another tab takes uploads from that tab only (W.L).
+    from .. import draft_lock
+    draft_lock.check_id(conn, int(profile_id))
     if gather_runs_repo.running_scan(conn, int(profile_id)) is not None:
         raise UploadRejected(f"'{slug}' is being saved; add seeds to it once that finishes.", status_code=409)
     if gather_runs_repo.has_unfinished_import(conn, int(profile_id)):
@@ -1111,7 +1114,11 @@ def delete_upload(conn: sqlite3.Connection, settings: Any, *, user_id: int, doc_
             " JOIN profile_seeds s ON s.profile_id = p.id WHERE s.openalex_id = ? AND p.user_id = ?",
             (doc_id, int(user_id)),
         ).fetchall()
+        from .. import draft_lock
         for p in seeded:
+            # Taking a seed out of a draft open in another tab is a change
+            # to it: refused (W.L).
+            draft_lock.check_id(conn, int(p["id"]))
             if (gather_runs_repo.running_scan(conn, int(p["id"])) is not None
                     or gather_runs_repo.has_unfinished_import(conn, int(p["id"]))):
                 raise DeleteRefused(f"A scan or an import of '{p['name']}' is running. Delete the PDF once it has finished.")

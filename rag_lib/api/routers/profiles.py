@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from datetime import datetime, timezone
 
+from .. import draft_lock
 from ..deps import get_current_user, get_db, get_scheduler, get_settings
 from ..schemas import (
     FeedSeedChoice,
@@ -75,7 +76,21 @@ log = structlog.get_logger("rag_lib.api.routers.profiles")
 from ... import openalex_status
 from ...redact import public_error
 
-router = APIRouter()
+def _guard_draft_writes(
+    request: Request,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> None:
+    """Every route here that changes a draft named in its path, refused
+    from any tab but the one that has it open (draft_lock, W.L). Reads
+    pass. The save (``POST ""``, slug in the body) checks itself."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    key = request.path_params.get("slug") or request.path_params.get("key")
+    draft_lock.check_slug(db, int(user["id"]), key)
+
+
+router = APIRouter(dependencies=[Depends(_guard_draft_writes)])
 
 
 def get_wizard_gatherer():
@@ -226,6 +241,38 @@ def edit_alive(
         edit_copy_service.alive(db, user_id=int(user["id"]), slug=slug, tab=body.tab if body else "")
     except edit_copy_service.BeingEdited as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.post("/draft/{slug}/hold")
+def hold_draft(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    """The wizard opens draft ``slug`` in this tab, or says (every 30 s) it
+    is still there: the tab holds it (draft_lock, W.L). 409 with
+    ``openElsewhere`` while another tab holds it; 404 when it is no longer
+    a draft (saved as an interest, or deleted, elsewhere)."""
+    try:
+        draft_lock.hold(db, user_id=int(user["id"]), slug=slug)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.post("/draft/{slug}/release")
+def release_draft(
+    slug: str,
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    """The wizard leaves draft ``slug`` (another page, the tab closed): it
+    is free at once; the draft stays. 404 when it is no longer a draft."""
+    try:
+        draft_lock.release(db, user_id=int(user["id"]), slug=slug)
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return {"ok": True}
@@ -955,6 +1002,7 @@ def commit_draft(
         # and says it was saved in another tab); an Edit interest copy is
         # saved with save-edit (spec E).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"draft '{body.slug}' not found")
+    draft_lock.check(db, row)          # the slug is in the body: the router's guard does not see it
     profile_id = int(row["id"])
     lock = _save_lock(profile_id)
     if not lock.acquire(blocking=False):
