@@ -37,8 +37,9 @@ LIGATURES = str.maketrans({"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", 
 # put a footer anywhere in a page's reading order.
 HEADER_LINE, HEADER_LETTERS, HEADER_MIN_PAGES = 80, 4, 3
 
+# "Abstract | The twenty-first…" (Nature Reviews) has a bar for the colon.
 ABSTRACT_START = re.compile(
-    r"^\s*(?:a\s?b\s?s\s?t\s?r\s?a\s?c\s?t|summary)\b\s*[:.—–-]?\s*(.*)$", re.I)
+    r"^\s*(?:a\s?b\s?s\s?t\s?r\s?a\s?c\s?t|summary)\b\s*[:.—–|-]?\s*(.*)$", re.I)
 # What follows an abstract: a keyword list, the first section, a figure
 # caption, or the journal's small print. Not "Background": a structured
 # abstract has one.
@@ -182,6 +183,10 @@ def find_abstract(text: str) -> str | None:
         if not m:
             continue
         out = [m.group(1)] if m.group(1).strip() else []
+        # No end mark at all (Nature Reviews: the abstract, a blank line,
+        # the body): the paragraph break once there is an abstract's worth
+        # ends it. Only then -- an end mark further on still wins.
+        blank_at = None
         j = i + 1
         while j < len(lines):
             nxt = lines[j]
@@ -202,11 +207,17 @@ def find_abstract(text: str) -> str | None:
                 continue
             if nxt.strip():
                 out.append(nxt)
+            elif blank_at is None and sum(map(len, out)) >= ABSTRACT_MIN:
+                blank_at = len(out)
             j += 1
             if sum(map(len, out)) > ABSTRACT_MAX:
+                if blank_at is not None:
+                    out = out[:blank_at]
                 break
         else:
-            continue
+            if blank_at is None:
+                continue
+            out = out[:blank_at]
         while out and STRAY.match(out[-1]):                 # a footnote mark before the end
             out.pop()
         # a kept hyphen or a URL broken at the line end joins without a space

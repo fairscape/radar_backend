@@ -202,15 +202,17 @@ def test_abstract_from_its_heading_to_the_keywords():
     assert pdf_text.find_abstract(text) == ABSTRACT
 
 
-@pytest.mark.parametrize("heading", ["ABSTRACT", "A B S T R A C T", "Abstract—", "Abstract:", "Summary"])
+@pytest.mark.parametrize("heading", ["ABSTRACT", "A B S T R A C T", "Abstract—", "Abstract:", "Abstract |", "Summary"])
 def test_abstract_headings(heading):
     text = _page_text(heading, *SENT, "1. Introduction")
     assert pdf_text.find_abstract(text).startswith("Alzheimer's disease is the most")
 
 
-def test_abstract_text_on_the_heading_line():
-    text = _page_text("Abstract—" + SENT[0], *SENT[1:], "Index Terms—dementia")
-    assert pdf_text.find_abstract(text).startswith("Alzheimer's disease is the most")
+@pytest.mark.parametrize("heading", ["Abstract—", "Abstract | "])
+def test_abstract_text_on_the_heading_line(heading):
+    # "Abstract | The twenty-first century…": Nature Reviews (test_cases, 2026-11-04).
+    text = _page_text(heading + SENT[0], *SENT[1:], "Index Terms—dementia")
+    assert pdf_text.find_abstract(text) == ABSTRACT
 
 
 @pytest.mark.parametrize("end", [
@@ -360,3 +362,31 @@ def test_an_end_before_300_characters_is_not_found_rather_than_reading_on():
 def test_a_correspondence_line_inside_the_abstract_is_not_found():
     text = _page_text("Abstract", SENT[0], "*Correspondence: someone", *SENT[1:], "Keywords: x")
     assert pdf_text.find_abstract(text) is None
+
+
+def test_no_end_mark_the_paragraph_break_ends_it():
+    """Nature Reviews (test_cases, 2026-11-04): "Abstract | …", a blank
+    line, then the body, with no keyword list or Introduction between."""
+    body = [f"Body sentence number {k} goes on about outbreaks and the spread of disease in towns." for k in range(80)]
+    text = _page_text("Abstract | " + SENT[0], *SENT[1:], "", *body)
+    assert pdf_text.find_abstract(text) == ABSTRACT
+
+
+def test_an_end_mark_after_the_break_still_ends_it():
+    """A two-paragraph abstract that has its end mark is read whole, as before."""
+    second = "We close with the open questions that a clinician would ask first about these trials."
+    text = _page_text("Abstract", *SENT, "", second, "1. Introduction")
+    assert pdf_text.find_abstract(text) == ABSTRACT + " " + second
+
+
+def test_a_break_before_an_abstract_s_worth_does_not_end_it():
+    """A blank line right under the heading is not the end: the abstract follows it."""
+    body = [f"Body sentence number {k} goes on about outbreaks and the spread of disease in towns." for k in range(80)]
+    text = _page_text("Abstract |", "", *SENT, "", *body)
+    assert pdf_text.find_abstract(text) == ABSTRACT
+
+
+def test_no_end_mark_and_the_pages_end_soon_after():
+    """The break ends it also when the first pages run out before the limit."""
+    text = _page_text("Abstract | " + SENT[0], *SENT[1:], "", "In premodern times, colonization and war spread disease.")
+    assert pdf_text.find_abstract(text) == ABSTRACT
