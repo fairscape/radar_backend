@@ -1,16 +1,20 @@
-"""Topics for an uploaded PDF OpenAlex does not have, read from its text."""
+"""No topics are guessed from an uploaded PDF's text (user 11-04).
+
+An unpublished paper's topics come only from its UMLS concepts and from
+Claude's research topics. Rows written while they were guessed
+(``source: pdf_content``) stay in the database and are read as no topics,
+by every reader of ``papers.topics_json``.
+"""
 
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 from rag_lib import content_topics
-from rag_lib.api import settings as settings_module
-from rag_lib.api.services import wizard
+from rag_lib.api import mappers, settings as settings_module
+from rag_lib.api.services import suggestions, wizard
 from rag_lib.db import apply_migrations, connect
 from rag_lib.db.repos import papers as papers_repo, profiles as profiles_repo, users as users_repo
 
@@ -18,6 +22,15 @@ from rag_lib.db.repos import papers as papers_repo, profiles as profiles_repo, u
 def _t(n: int, name: str | None = None) -> dict:
     return {"id": f"https://openalex.org/T{n}", "display_name": name or f"Topic {n}",
             "subfield": None, "field": None, "domain": None, "score": 0.9}
+
+
+def _legacy(*ns: int) -> str:
+    """``topics_json`` as it was written when topics were read from a PDF's text."""
+    return json.dumps({"primary_topic": None, "topics": [_t(n) for n in ns], "source": content_topics.SOURCE})
+
+
+def _openalex(*ns: int) -> str:
+    return json.dumps({"primary_topic": _t(ns[0]), "topics": [_t(n) for n in ns]})
 
 
 @pytest.fixture()
@@ -42,101 +55,77 @@ def _interest_with(conn, seeds: dict[str, str | None]) -> int:
     return pid
 
 
-def _openalex(*ns: int) -> str:
-    return json.dumps({"primary_topic": _t(ns[0]), "topics": [_t(n) for n in ns]})
+def test_what_counts_as_read_from_a_pdf():
+    assert content_topics.is_from_content(_legacy(1))
+    assert content_topics.seed_topics_raw(_legacy(1)) is None
+    for raw in (None, "", "not json", "[]", _openalex(1), json.dumps({"source": "umls", "topics": []})):
+        assert not content_topics.is_from_content(raw)
+        assert content_topics.seed_topics_raw(raw) == raw
 
 
-# --- reading topics from text ------------------------------------------------
-
-
-class _Index:
-    def __init__(self, sims):
-        self.sims = sims
-
-    def check_compatible(self, *a, **k):
-        pass
-
-    def search(self, vec, *, top_k, min_similarity):
-        hits = [({"id": f"https://openalex.org/T{i}", "display_name": f"Topic {i}",
-                  "subfield": "Sub", "field": "Field", "domain": "Dom"}, s)
-                for i, s in enumerate(self.sims)]
-        return [h for h in hits if h[1] >= min_similarity][:top_k]
-
-
-def test_text_maps_to_the_nearest_topics_above_the_floor(monkeypatch):
-    seen = {}
-    monkeypatch.setattr("rag_lib.umls.cache.get_topic_index", lambda d: _Index([0.81, 0.7, 0.6, 0.5]))
-    monkeypatch.setattr("rag_lib.embedders.get_embedder",
-                        lambda m: (lambda text: seen.setdefault("text", text) and np.ones(4)))
-    settings = SimpleNamespace(RADAR_UMLS_EMBEDDING_MODEL="mxbai-embed-large", RADAR_UMLS_CACHE_DIR="x")
-    out = content_topics.topics_from_text("Buffer sizing", "These are lab notes. " * 400, settings=settings)
-    assert [t["display_name"] for t in out] == ["Topic 0", "Topic 1", "Topic 2"]   # 0.5 is below 0.55
-    assert out[0]["score"] == 0.81 and out[0]["subfield"] == {"id": None, "display_name": "Sub"}
-    assert seen["text"].startswith("Buffer sizing. These are lab notes.")
-    assert len(seen["text"]) <= len("Buffer sizing. ") + content_topics.BODY_CHARS
-
-
-def test_topics_that_share_a_name_count_once(monkeypatch):
-    class Dup(_Index):
-        def search(self, vec, *, top_k, min_similarity):
-            return [({"id": f"https://openalex.org/T{i}", "display_name": n}, s) for i, (n, s) in
-                    enumerate([("Marine ecosystems", 0.75), ("Marine Ecosystems", 0.75), ("Fisheries", 0.7), ("Corals", 0.69)])][:top_k]
-    monkeypatch.setattr("rag_lib.umls.cache.get_topic_index", lambda d: Dup([]))
-    monkeypatch.setattr("rag_lib.embedders.get_embedder", lambda m: (lambda text: np.ones(4)))
-    settings = SimpleNamespace(RADAR_UMLS_EMBEDDING_MODEL="m", RADAR_UMLS_CACHE_DIR="x")
-    out = content_topics.topics_from_text("Reef survey notes", "fish " * 50, settings=settings)
-    assert [t["display_name"] for t in out] == ["Marine ecosystems", "Fisheries", "Corals"]
-
-
-def test_too_little_text_reads_nothing():
-    assert content_topics.topics_from_text("", "  ", settings=None) == []
-
-
-def test_a_failing_embedder_leaves_it_for_later(monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("ollama down")
-    monkeypatch.setattr(content_topics, "topics_from_text", boom)
-    assert content_topics.try_topics_json("t", None, "b", settings=SimpleNamespace()) is None
-
-
-# --- into the interest's topics ---------------------------------------------
-
-
-def test_an_unmatched_seeds_topics_survive_the_top_eight_cut(conn):
-    """Matched seeds bring 10 topics; the PDF's one topic has a count of 1 and
-    used to be cut. It stays, marked as read from the PDF."""
+def test_a_legacy_pdf_topic_is_not_in_the_interest_s_topics(conn):
     pid = _interest_with(conn, {
-        "https://openalex.org/W1": _openalex(*range(1, 11)),
-        "https://openalex.org/W2": _openalex(*range(1, 11)),
-        "local:abc": content_topics.topics_json([_t(500, "Buffer Management")]),
+        "https://openalex.org/W1": _openalex(1, 2),
+        "local:abc": _legacy(500, 2),
     })
     topics = wizard._aggregate_topics(conn, pid, new_on=True)["topics"]
     by_id = {t["id"]: t for t in topics}
-    assert by_id["https://openalex.org/T500"]["source"] == content_topics.SOURCE
-    assert by_id["https://openalex.org/T500"]["on"] is True
-    assert "source" not in by_id["https://openalex.org/T1"]
+    assert "https://openalex.org/T500" not in by_id
+    assert all(t.get("source") != content_topics.SOURCE for t in topics)
+    # T2 is W1's alone: counted once, not twice
+    assert by_id["https://openalex.org/T2"]["count"] == 1
 
 
-def test_a_content_topic_a_matched_seed_also_has_is_not_marked(conn):
-    pid = _interest_with(conn, {
-        "https://openalex.org/W1": _openalex(7),
-        "local:abc": content_topics.topics_json([_t(7), _t(8)]),
-    })
-    by_id = {t["id"]: t for t in wizard._aggregate_topics(conn, pid, new_on=True)["topics"]}
-    assert "source" not in by_id["https://openalex.org/T7"]
-    assert by_id["https://openalex.org/T8"]["source"] == content_topics.SOURCE
-
-
-def test_an_older_unmatched_seed_is_read_when_topics_are_aggregated(conn, monkeypatch):
-    """Uploaded before this existed: no topics_json. Aggregation reads it once
-    and stores the result, empty or not, on the paper."""
-    calls = []
-    monkeypatch.setattr(content_topics, "topics_from_text",
-                        lambda title, body, settings: calls.append(title) or [_t(42, "Lab Notes")])
+def test_an_unmatched_seed_without_topics_is_left_without_them(conn):
+    """It used to be read on aggregation and its guess stored on the paper."""
     pid = _interest_with(conn, {"local:old": None})
-    topics = wizard._aggregate_topics(conn, pid, new_on=True)["topics"]
-    assert [t["display_name"] for t in topics] == ["Lab Notes"]
-    stored = conn.execute("SELECT topics_json FROM papers WHERE openalex_id = 'local:old'").fetchone()[0]
-    assert json.loads(stored)["source"] == content_topics.SOURCE
-    wizard._aggregate_topics(conn, pid, new_on=True)
-    assert len(calls) == 1
+    assert wizard._aggregate_topics(conn, pid, new_on=True)["topics"] == []
+    assert conn.execute("SELECT topics_json FROM papers WHERE openalex_id = 'local:old'").fetchone()[0] is None
+
+
+def test_a_legacy_pdf_topic_is_no_seed_s(conn):
+    pid = _interest_with(conn, {"https://openalex.org/W1": _openalex(1), "local:abc": _legacy(500)})
+    codes = wizard._seed_topic_codes(conn, pid)
+    assert any(c.endswith("T1") for c in codes) and not any(c.endswith("T500") for c in codes)
+
+
+def test_every_reader_of_a_paper_s_topics_reads_a_legacy_row_as_none(conn):
+    _interest_with(conn, {"local:abc": _legacy(500)})
+    row = papers_repo.get_by_openalex_id(conn, "local:abc")
+    assert papers_repo.decode_topics(row) == {"primary_topic": None, "topics": []}
+    assert mappers._decode_topics(row["topics_json"]) == {"primary_topic": None, "topics": []}
+    assert suggestions._topics_of(row) == (None, [])
+
+
+def test_the_overlap_fallback_leaves_a_legacy_pdf_topic_out(conn, monkeypatch):
+    """Review L2: when the rebuild fails the stored list stands in -- without
+    the topics no rebuild has now."""
+    pid = _interest_with(conn, {"https://openalex.org/W1": _openalex(1)})
+    conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE id = ?", (json.dumps({"topics": [
+        {"id": _t(1)["id"], "display_name": "Topic 1", "on": True},
+        {"id": _t(500)["id"], "display_name": "Old", "on": True, "source": content_topics.SOURCE},
+    ]}), pid))
+    conn.commit()
+
+    def boom(*a, **k):
+        raise RuntimeError("rebuild failed")
+    monkeypatch.setattr(wizard, "_aggregate_topics", boom)
+    ids = [t["id"] for t in wizard._overlap_basis(conn, pid)["topics"]]
+    assert ids == [_t(1)["id"]]
+
+
+def test_a_legacy_pdf_topic_left_on_does_not_decide_a_forgotten_researcher_s_topics():
+    """Review L3: the researcher is gone and the only other topic on is one
+    once guessed from a PDF -- not in the rebuilt list, so it cannot be what
+    stays on: the profile's topics are kept (adopted), not all switched off."""
+    from rag_lib import researcher_topics as rt
+
+    R, P = "https://openalex.org/T7", "https://openalex.org/T500"
+    stored = {"topics": [
+        {"id": R, "display_name": "From the profile", "on": True, "source": rt.SOURCE, rt.BEFORE: False},
+        {"id": P, "display_name": "Old", "on": True, "source": content_topics.SOURCE},
+    ]}
+    topic_filters = {"topics": []}
+    prior_on: dict = {}
+    wizard._restore_or_adopt(stored, topic_filters, prior_on)
+    assert [(t["id"], t["source"]) for t in topic_filters["topics"]] == [(R, rt.ADOPTED)]

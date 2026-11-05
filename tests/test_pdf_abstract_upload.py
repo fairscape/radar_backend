@@ -40,18 +40,8 @@ def uploads(pdfs, monkeypatch):
                           "doi": "10.1/w88", "openalex_doi": "10.1/w88", "source": "user_pdf"}
         return real_enrich(record, mailto=mailto, filename=filename, file_hash=file_hash)
 
-    from rag_lib import content_topics
-    from rag_lib.pdf_text import paper_text
-
-    read = pdfs["content_calls"]
-
-    def topics(title, abstract, body, *, settings):     # what the real one embeds
-        read.append(paper_text(abstract, body, content_topics.BODY_CHARS))
-        return None
-
     monkeypatch.setattr(vault_service, "ingest_pdf", ingest)
     monkeypatch.setattr(vault_service, "_enrich_via_openalex", enrich)
-    monkeypatch.setattr(vault_service.content_topics, "try_topics_json", topics)
     return pdfs
 
 
@@ -59,8 +49,8 @@ def test_unmatched_upload_keeps_the_pdf_abstract(uploads):
     u = _upload(uploads, b"nothing known abs", A)
     row = _row(uploads["env"], u["id"])
     assert row["abstract"] == PDF_ABSTRACT and row["abstract_source"] == "pdf"
-    # what its topics are read from: the abstract, not the body
-    assert uploads["content_calls"] == [PDF_ABSTRACT]
+    # no topics are guessed from its text (user 11-04)
+    assert row["topics_json"] is None
 
 
 def test_matched_without_an_openalex_abstract_keeps_it_on_the_version_only(uploads):
@@ -84,8 +74,6 @@ def test_no_abstract_anywhere_stores_none(uploads):
     u = _upload(uploads, b"nothing known", A)
     row = _row(uploads["env"], u["id"])
     assert not row["abstract"] and row["abstract_source"] is None
-    # topics then come from where the body's reading starts
-    assert uploads["content_calls"] == [f"body of %PDF-1.4\nnothing known"]
 
 
 def test_the_same_file_in_another_interest_reads_its_pdf_abstract_again(uploads):

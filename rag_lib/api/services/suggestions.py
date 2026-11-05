@@ -223,7 +223,10 @@ def choose_groups(
 
 
 def _topics_of(row: sqlite3.Row) -> tuple[dict | None, list[dict]]:
-    raw = row["topics_json"] if row["topics_json"] else None
+    from ... import content_topics
+
+    # Topics once guessed from a PDF's text count as none (rag_lib.content_topics).
+    raw = content_topics.seed_topics_raw(row["topics_json"]) or None
     if not raw:
         return None, []
     try:

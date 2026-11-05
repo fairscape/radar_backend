@@ -15,7 +15,6 @@ T1, T2, T3 = ("https://openalex.org/T10001", "https://openalex.org/T10002", "htt
 
 def _setup(tmp_path, monkeypatch, doc, *, draft):
     monkeypatch.setenv("RADAR_UMLS_ENABLED", "false")
-    monkeypatch.setenv("RADAR_CONTENT_TOPICS_ENABLED", "false")
     from rag_lib.api import settings as s
     s.get_settings.cache_clear()
     conn, uid = _db(tmp_path)

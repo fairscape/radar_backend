@@ -6,6 +6,9 @@ Three endpoints:
   PATCH /api/users/me            → ``User`` (after applying ``mailto`` change).
   GET   /api/users/me/prosopia   → ``MyProsopia``: the person's self
                                    profile on Prosopia, if public.
+  POST  /api/users/me/lease      → ``{editing}``: this tab takes or keeps
+                                   the account's right to change things.
+  POST  /api/users/me/lease/release → this tab lets go of it (W.A).
 
 The acting user is always resolved by ``get_current_user`` (the sign-in
 session cookie; the header only on a header-model setup); this router never accepts a user id in the
@@ -25,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from rag_lib.db.repos import researchers as researchers_repo
 
-from .. import oidc
+from .. import oidc, write_lease
 from ..deps import get_current_user, get_db
 from ..schemas import MyProsopia, MyProsopiaProfile, User, UserUpdateRequest
 from ..settings import Settings, get_settings
@@ -135,3 +138,30 @@ def get_my_prosopia(
         researcher_id=int(row["id"]) if row else None,
         imported_at=row["imported_at"] if row else None,
     )
+
+
+@router.post("/me/lease")
+def claim_lease(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> dict:
+    """This tab asks for the account's right to change things, or says it
+    still has it (every 30 s; a view-only tab asks every 15 s). ``editing``:
+    whether it holds it now (FUNCTIONAL_SPEC W.A). However long the tab is
+    left unused, it keeps the right (user 2026-11-05, second round); an
+    unused tab's requests only stop renewing the sign-in (app.py)."""
+    return {"editing": write_lease.claim(db, int(user["id"]))}
+
+
+@router.post("/me/lease/release")
+def release_lease(
+    user: Annotated[sqlite3.Row, Depends(get_current_user)],
+    db: Annotated[sqlite3.Connection, Depends(get_db)],
+    grace: bool = False,
+) -> dict:
+    """This tab lets go. Signing out: the right is free at once.
+    A page closing or reloading (``?grace=1``): free after a few seconds, so
+    the same tab reloaded keeps it (FC-1). A tab that does not hold it
+    changes nothing."""
+    write_lease.release(db, int(user["id"]), grace=grace)
+    return {"ok": True}

@@ -53,7 +53,7 @@ from ...db.repos import (
     gather_runs as gather_runs_repo,
     versions as versions_repo,
 )
-from ... import content_topics, openalex_status, seed_duplicates
+from ... import openalex_status, seed_duplicates
 from ...embed import build_embedding_input
 from ...embedders import get_embedder
 from ...openalex_client import OpenAlexClient
@@ -345,13 +345,9 @@ def upload(
         if not (paper_dict.get("abstract") or "").strip() and record.abstract:
             paper_dict["abstract"] = record.abstract
             from_pdf = True
-        if canonical is None:
-            # OpenAlex does not have it, so nothing says what it is about: read
-            # that from the PDF itself (rag_lib.content_topics).
-            found = content_topics.try_topics_json(
-                paper_dict.get("title"), paper_dict.get("abstract"), record.body_text, settings=settings)
-            if found is not None:
-                paper_dict["topics_json"] = found
+        # OpenAlex does not have it (``canonical`` None): it has no topics of
+        # its own -- its UMLS concepts and Claude's research topics speak for
+        # it (user 11-04; nothing is guessed from its text, rag_lib.content_topics).
 
         # Embedded before anything is written, from what will be stored, so the
         # writes below are one transaction (CR.3): under the default model and

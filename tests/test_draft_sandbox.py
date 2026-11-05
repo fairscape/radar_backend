@@ -50,7 +50,10 @@ def _save(world, slug, headers=A):
     try:
         (pid,) = conn.execute("SELECT p.id FROM profiles p JOIN users u ON u.id = p.user_id "
                               "WHERE p.slug = ? AND u.email = ?", (slug, headers["X-User-Email"])).fetchone()
-        conn.execute("UPDATE profiles SET is_draft = 0 WHERE id = ?", (pid,))
+        # Saved with a topic on, as the commit route requires (BT4).
+        conn.execute("UPDATE profiles SET is_draft = 0, topic_filters_json = ? WHERE id = ?",
+                     ('{"topics": [{"id": "https://openalex.org/T10001", "display_name": "Test topic",'
+                      ' "count": 1, "on": true}]}', pid))
         draft_owned.clear(conn, pid)
         conn.commit()
     finally:
@@ -227,8 +230,10 @@ def _found(n=3):
 
 
 def _commit(world, slug, headers=A):
+    from tests.topic_helpers import ensure_a_topic   # saved with a topic on (BT4)
     return _request(world["app"], "POST", "/api/profiles",
-                    json={"slug": slug, "threshold": 0.0, "selected_topic_ids": []}, headers=headers)
+                    json={"slug": slug, "threshold": 0.0, "selected_topic_ids": ensure_a_topic(slug)},
+                    headers=headers)
 
 
 def _is_draft(world, slug):

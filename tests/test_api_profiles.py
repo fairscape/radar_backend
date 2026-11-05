@@ -400,8 +400,9 @@ def test_committing_a_draft_registers_no_daily_scan(app, tmp_path, monkeypatch):
     slug = _request(app, "POST", "/api/profiles/draft",
                     json={"name": "to commit", "embedding_model": "placeholder-v1"}).json()["slug"]
     _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": ["W2000002", "W2000003"]})
+    from tests.topic_helpers import ensure_a_topic   # saved with a topic on (BT4)
     resp = _request(app, "POST", "/api/profiles",
-                    json={"slug": slug, "threshold": 0.5, "selected_topic_ids": []})
+                    json={"slug": slug, "threshold": 0.5, "selected_topic_ids": ensure_a_topic(slug)})
     assert resp.status_code == 200, resp.text
     conn = connect(tmp_path / "radar.db")
     pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]
@@ -425,8 +426,9 @@ def test_committing_a_draft_with_daily_scans_on_registers_its_job_at_once(app, t
     slug = _request(app, "POST", "/api/profiles/draft",
                     json={"name": "to commit", "embedding_model": "placeholder-v1"}).json()["slug"]
     _request(app, "POST", f"/api/profiles/{slug}/seeds", json={"openalex_ids": ["W2000002", "W2000003"]})
+    from tests.topic_helpers import ensure_a_topic   # saved with a topic on (BT4)
     resp = _request(app, "POST", "/api/profiles",
-                    json={"slug": slug, "threshold": 0.5, "selected_topic_ids": []})
+                    json={"slug": slug, "threshold": 0.5, "selected_topic_ids": ensure_a_topic(slug)})
     assert resp.status_code == 200, resp.text
     conn = connect(tmp_path / "radar.db")
     pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]

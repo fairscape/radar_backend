@@ -9,10 +9,21 @@ import io
 
 import pytest
 
-from rag_lib.api import draft_lock
+from rag_lib.api import draft_lock, write_lease
 from rag_lib.db import connect
 from tests.test_researchers import _request, env  # noqa: F401  (fixture)
 from tests.test_review_round12_isolation import A, world  # noqa: F401  (fixture)
+
+
+
+@pytest.fixture(autouse=True)
+def _draft_lock_alone(monkeypatch):
+    """The draft lock on its own. Since W.A one tab holds the whole account,
+    so another tab is refused before the draft lock is reached
+    (test_write_lease.py); the draft lock stays as the inner layer and is
+    tested here with the account lease out of the way."""
+    monkeypatch.setattr(write_lease, "check", lambda *a, **k: None)
+
 
 T1 = {**A, "X-Radar-Tab": "tab-one"}
 T2 = {**A, "X-Radar-Tab": "tab-two"}
@@ -168,30 +179,19 @@ def test_edit_interest_copies_and_saved_interests_are_not_this_lock(world):
 def test_every_route_that_changes_a_profile_by_path_is_guarded():
     """A route added later under /api/profiles that changes a draft named in
     its path is guarded with the rest (the router's dependency): fails on a
-    route the guard does not cover."""
-    from fastapi.routing import APIRoute
-
+    route the guard does not cover. Walks the routes as served (BL-1)."""
     from rag_lib.api.app import create_app
     from rag_lib.api.routers.profiles import _guard_draft_writes
-
-    def calls(dep) -> set:
-        out = {dep.call}
-        for d in dep.dependencies:
-            out |= calls(d)
-        return out
+    from tests.route_walk import served_routes
 
     app = create_app()
-    missing = []
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.path.startswith("/api/profiles"):
-            continue
-        if not (route.methods - {"GET", "HEAD", "OPTIONS"}):
-            continue
-        if "{slug}" not in route.path and "{key}" not in route.path and route.path != "/api/profiles":
-            continue
-        if _guard_draft_writes not in calls(route.dependant):
-            missing.append(f"{sorted(route.methods)} {route.path}")
+    checked = [r for r in served_routes(app)
+               if r.path.startswith("/api/profiles") and (r.methods - {"GET", "HEAD", "OPTIONS"})
+               and ("{slug}" in r.path or "{key}" in r.path or r.path == "/api/profiles")]
+    assert len(checked) >= 20, len(checked)
+    missing = [f"{sorted(r.methods)} {r.path}" for r in checked if _guard_draft_writes not in r.calls]
     assert not missing, missing
+    assert all(draft_lock.request_tab in r.calls for r in served_routes(app) if r.path.startswith("/api/"))
     assert draft_lock.request_tab in {d.dependency for d in app.router.dependencies}
 
 

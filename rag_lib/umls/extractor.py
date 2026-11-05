@@ -361,7 +361,9 @@ def _main() -> int:
                   f"<- {m.source_name[:26]}")
 
         per_paper.append(mapped)
-        topics = json.loads(row["topics_json"] or "{}")
+        from .. import content_topics
+
+        topics = json.loads(content_topics.seed_topics_raw(row["topics_json"]) or "{}")
         seed_papers.append(Paper.from_dict({
             "openalex_id": row["openalex_id"],
             "title": row["title"],
@@ -498,7 +500,9 @@ def _main_paper(argv: list[str]) -> int:
         title = title or (row["title"] or "")
         abstract = abstract or (row["abstract"] or "")
         body = row["body_text"] or ""
-        topics_json = row["topics_json"] or ""
+        from .. import content_topics
+
+        topics_json = content_topics.seed_topics_raw(row["topics_json"]) or ""
         print(f"source       : papers row {row['openalex_id']}")
         print(f"               columns read: title, abstract, body_text, "
               f"topics_json  (no umls_* columns, no profiles)")

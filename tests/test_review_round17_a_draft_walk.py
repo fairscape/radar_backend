@@ -13,6 +13,8 @@ from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
 from tests.test_review_round17_a_journeys import _give_topics, _set_paper_topics
 
 
+from tests.topic_helpers import ensure_a_topic  # noqa: E402  (saved with a topic on, BT4)
+
 @pytest.mark.parametrize("seed", list(range(1, 16)))
 def test_draft_walk(app, env, seed):
     rnd = random.Random(seed)
@@ -95,7 +97,7 @@ def test_draft_walk(app, env, seed):
         _ok(_upload(app, f"dw-{seed}-final".encode(), "final.pdf", slug))
         seeds = sorted(r[0] for r in _q(env, "SELECT ps.openalex_id FROM profile_seeds ps JOIN profiles p ON p.id=ps.profile_id WHERE p.slug=?", slug))
     ts = _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/topics"))
-    pick = rnd.sample([t["id"] for t in ts], rnd.randint(1, len(ts))) if ts else []
+    pick = rnd.sample([t["id"] for t in ts], rnd.randint(1, len(ts))) if ts else ensure_a_topic(slug)
     years = rnd.choice([None, {"year_from": 2019, "year_to": None}])
     prof = _ok(_request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.05, "selected_topic_ids": pick, "years": years}))
     det = _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))

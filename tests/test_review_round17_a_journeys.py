@@ -8,6 +8,8 @@ from tests.test_review_round12_journeys import (  # noqa: F401 -- fixtures
 )
 
 
+from tests.topic_helpers import ensure_a_topic  # noqa: E402  (saved with a topic on, BT4)
+
 def _edit(app, slug, **kw):
     """Edit interest: a saved interest changes only on a copy, saved in one
     go (FUNCTIONAL_SPEC E)."""
@@ -144,7 +146,7 @@ def test_restart_between_steps(app, env):
     assert [d["slug"] for d in drafts] == [slug] and drafts[0]["n_seeds"] == 2
     t2 = _ok(_request(app2, "GET", f"/api/profiles/draft/{slug}/topics"))
     assert [(t["id"], t["on"]) for t in t2] == [(t["id"], t["on"]) for t in topics]
-    on = [t["id"] for t in t2 if t["on"]]
+    on = [t["id"] for t in t2 if t["on"]] or ensure_a_topic(slug)
     _ok(_request(app2, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.0, "selected_topic_ids": on}))
     app3 = create_app()
     app3.dependency_overrides.update(app.dependency_overrides)

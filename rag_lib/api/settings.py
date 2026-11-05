@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # time when its key is missing, mapped to a 503 by the router with
     # an actionable hint.
     RADAR_ANTHROPIC_API_KEY: str | None = None
+    # OpenAlex API key (free, https://openalex.org/rest-api). Sent as
+    # ``api_key`` on every OpenAlex request when set: anonymous search is
+    # rate-limited whenever OpenAlex is under load (2026-11-05, user's own
+    # key). Never logged: rag_lib.openalex_client scrubs it from errors.
+    RADAR_OPENALEX_API_KEY: str | None = None
     RADAR_ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
     RADAR_OPENAI_API_KEY: str | None = None
     RADAR_OPENAI_MODEL: str = "gpt-4o-mini"
@@ -159,9 +164,6 @@ class Settings(BaseSettings):
     RADAR_LLM_TOPIC_MIN_SIMILARITY: float = 0.65
     RADAR_LLM_TOPIC_EXTRA_SIMILARITY: float = 0.80
     RADAR_LLM_MAX_TOPIC_ADDITIONS: int = 10
-    # Topics for an upload OpenAlex does not have, read from the PDF's own
-    # text against the same topic index (rag_lib.content_topics).
-    RADAR_CONTENT_TOPICS_ENABLED: bool = True
     RADAR_UMLS_CACHE_DIR: Path = Path("data/umls_cache")
 
     # MedCPT cross-encoder reranker. Disabled by default; enable after
@@ -184,7 +186,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     @field_validator(
-        "RADAR_ANTHROPIC_API_KEY", "RADAR_OPENAI_API_KEY", "RADAR_LOG_FILE",
+        "RADAR_ANTHROPIC_API_KEY", "RADAR_OPENAI_API_KEY", "RADAR_OPENALEX_API_KEY", "RADAR_LOG_FILE",
         "RADAR_GATHER_MAX_CANDIDATES", "BIOXPLORER_PROSOPIA_CLIENT_SECRET",
         "BIOXPLORER_GOOGLE_CLIENT_ID", "BIOXPLORER_GOOGLE_CLIENT_SECRET",
         "BIOXPLORER_OIDC_REDIRECT_URI", "BIOXPLORER_SESSION_SECRET", mode="before",

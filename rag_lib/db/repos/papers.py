@@ -231,7 +231,10 @@ def _encode_authors(paper: dict[str, Any]) -> str | None:
 
 
 def decode_topics(row: sqlite3.Row) -> dict:
-    raw = row["topics_json"] if row is not None else None
+    from ... import content_topics
+
+    # Topics once guessed from a PDF's text count as none (rag_lib.content_topics).
+    raw = content_topics.seed_topics_raw(row["topics_json"] if row is not None else None)
     if not raw:
         return {"primary_topic": None, "topics": []}
     return json.loads(raw)

@@ -334,7 +334,6 @@ def api(env, monkeypatch):
     """A saved interest 'live' of the demo user with two seeds and topics,
     and the app."""
     from rag_lib.db import connect
-    monkeypatch.setenv("RADAR_CONTENT_TOPICS_ENABLED", "false")
     conn = connect(env)
     uid = 1
     pid = profiles_repo.upsert(conn, user_id=uid, name="Live", embedding_model="placeholder-v1",
@@ -668,9 +667,15 @@ def test_lock_the_same_tab_reopens_a_reload(edit):
     assert edit_copy.discard_leftovers(conn, uid, "A") == [second["slug"]]
 
 
-def test_lock_a_copy_not_heard_from_for_2_minutes_is_left_behind(edit):
+def test_lock_a_copy_not_heard_from_for_2_minutes_is_kept_until_the_user_confirms(edit):
+    """User 2026-11-05 (second round): a copy left unheard is not deleted on
+    its own. Another tab opening Edit is told it drops that tab's unsaved
+    changes (UnsavedElsewhere) and goes ahead only once the user confirms;
+    the first tab, back, is told its changes were discarded."""
     conn, uid, pid, slug, *_ = edit
     a = edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="A")
+    conn.execute("UPDATE profiles SET threshold = 0.66 WHERE id = ?", (int(a["id"]),))
+    conn.commit()
     _age(conn, int(a["id"]), 110)                                    # still within 2 minutes
     with pytest.raises(edit_copy.BeingEdited):
         edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="B")
@@ -679,16 +684,30 @@ def test_lock_a_copy_not_heard_from_for_2_minutes_is_left_behind(edit):
     edit_copy.alive(conn, user_id=uid, slug=a["slug"], tab="A")     # heard from again
     assert not edit_copy.is_stale(conn, _row(conn, int(a["id"])))
     _age(conn, int(a["id"]), 130)
-    b = edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="B")
+    # Left unheard: not held (scans go ahead) but kept, with its changes.
+    assert edit_copy.open_copy_of(conn, pid) is None
+    assert _row(conn, int(a["id"]))["threshold"] == pytest.approx(0.66)
+    # The site opening in another tab leaves it alone.
+    assert edit_copy.discard_leftovers(conn, uid, "C") == []
+    assert _row(conn, int(a["id"])) is not None
+    # Tab B: asked first; nothing changes until it confirms.
+    with pytest.raises(edit_copy.UnsavedElsewhere):
+        edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="B")
+    assert _row(conn, int(a["id"])) is not None
+    # Tab A wakes up first: it carries on with its changes.
+    edit_copy.alive(conn, user_id=uid, slug=a["slug"], tab="A")
+    with pytest.raises(edit_copy.BeingEdited):
+        edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="B", discard_unsaved=True)
+    # A goes quiet again; B confirms: A's copy goes, B gets its own.
+    _age(conn, int(a["id"]), 130)
+    b = edit_copy.open_copy(conn, user_id=uid, slug=slug, tab="B", discard_unsaved=True)
     assert _row(conn, int(a["id"])) is None and b["edit_tab"] == "B"
-    with pytest.raises(LookupError):                                 # tab A, back: told it was closed
+    with pytest.raises(LookupError) as e:                            # tab A, back: told it was discarded
         edit_copy.alive(conn, user_id=uid, slug=a["slug"], tab="A")
+    assert str(e.value) == edit_copy.CLOSED and "discarded" in str(e.value)
     # Another tab's call on B's copy (a duplicated tab) is not B.
     with pytest.raises(edit_copy.BeingEdited):
         edit_copy.alive(conn, user_id=uid, slug=b["slug"], tab="A")
-    # And the site opening anywhere discards a left-behind copy.
-    _age(conn, int(b["id"]), 130)
-    assert edit_copy.discard_leftovers(conn, uid, "C") == [b["slug"]]
 
 
 def test_lock_a_copy_an_import_fills_is_never_left_behind(edit):
@@ -747,8 +766,9 @@ def test_x_lock_over_the_api(api):
     assert _request(app, "POST", f"/api/profiles/draft/{a}/discard-edit").status_code == 200
     assert _request(app, "POST", f"/api/profiles/draft/{a}/edit-alive", json={"tab": "A"}).status_code == 404
     b = _request(app, "POST", f"/api/profiles/{slug}/edit", json={"tab": "B"}).json()["slug"]
-    # Tab B is then gone without a word (a crash): after 2 minutes the
-    # interest scans again and the copy is discarded.
+    # Tab B is then gone without a word (a crash, or asleep): after 2
+    # minutes the interest scans again, and the copy is kept (user
+    # 2026-11-05, second round): tab B, back, carries on.
     conn = connect(env)
     try:
         conn.execute("UPDATE profiles SET edit_seen_at = datetime('now', '-130 seconds') WHERE slug = ?", (b,))
@@ -756,4 +776,28 @@ def test_x_lock_over_the_api(api):
     finally:
         conn.close()
     assert _request(app, "POST", f"/api/profiles/{slug}/gather-now").status_code == 200
-    assert _request(app, "POST", f"/api/profiles/draft/{b}/edit-alive", json={"tab": "B"}).status_code == 404
+    assert _request(app, "POST", f"/api/profiles/draft/{b}/edit-alive", json={"tab": "B"}).status_code == 200
+    assert _request(app, "POST", f"/api/profiles/{slug}/gather-now").status_code == 409   # held again
+
+
+def test_lock_over_the_api_another_tab_s_unsaved_copy_is_dropped_only_once_confirmed(api):
+    """POST /edit: 409 with unsavedElsewhere for another tab's copy left
+    unheard; with discard_unsaved the copy goes and this tab gets one."""
+    from rag_lib.db import connect
+    app, slug, env = api
+    r = _request(app, "POST", f"/api/profiles/{slug}/edit", json={"tab": "A"})
+    assert r.status_code == 200, r.text
+    first = r.json()["slug"]
+    conn = connect(env)
+    try:
+        conn.execute("UPDATE profiles SET edit_seen_at = datetime('now', '-130 seconds') WHERE slug = ?", (first,))
+        conn.commit()
+    finally:
+        conn.close()
+    r = _request(app, "POST", f"/api/profiles/{slug}/edit", json={"tab": "B"})
+    assert r.status_code == 409 and r.json().get("unsavedElsewhere") is True, r.text
+    assert "discards those changes" in r.json()["detail"]
+    r = _request(app, "POST", f"/api/profiles/{slug}/edit", json={"tab": "B", "discard_unsaved": True})
+    assert r.status_code == 200, r.text
+    r = _request(app, "POST", f"/api/profiles/draft/{first}/edit-alive", json={"tab": "A"})
+    assert r.status_code in (404, 409) and "discarded its unsaved changes" in r.text, r.text

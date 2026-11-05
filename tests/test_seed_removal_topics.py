@@ -38,7 +38,6 @@ def live(tmp_path, monkeypatch):
     """A saved interest: W1 brings One and Two, W2 brings Three; all three
     saved on, and a Claude-generated topic (source llm) on too."""
     monkeypatch.setenv("RADAR_UMLS_ENABLED", "false")
-    monkeypatch.setenv("RADAR_CONTENT_TOPICS_ENABLED", "false")
     from rag_lib.api import settings as s
     s.get_settings.cache_clear()
     conn, uid = _db(tmp_path)
@@ -265,9 +264,9 @@ def test_a_topic_the_profile_does_not_want_stays_off_when_its_seed_goes(tmp_path
 
 def test_a_topic_a_seed_still_brings_is_not_unmatched(live):
     """Review: "not in this rebuild" is not "no seed brings it". A UMLS
-    topic (UMLS switched off here) or a PDF-text topic (content topics off)
-    of a seed still there is not said to come from a removed seed; a UMLS
-    topic of the removed seed is."""
+    topic (UMLS switched off here) of a seed still there is not said to come
+    from a removed seed; a UMLS topic of the removed seed is. A topic once
+    read from a PDF's text is no seed's now (user 11-04): not kept at all."""
     conn, uid, pid, slug = live
     T5, T6, T7 = "https://openalex.org/T10005", "https://openalex.org/T10006", "https://openalex.org/T10007"
     conn.execute("UPDATE papers SET umls_mapped_topics_json = ? WHERE openalex_id = ?",
@@ -289,7 +288,7 @@ def test_a_topic_a_seed_still_brings_is_not_unmatched(live):
     _remove(conn, pid, W2)
     got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
     assert T5 not in got or not got[T5].get("unmatched")
-    assert got[T6]["on"] is True and not got[T6].get("unmatched")
+    assert T6 not in got
     assert got[T7]["on"] is False and got[T7].get("unmatched") is True
     assert got[T3].get("unmatched") is True
 

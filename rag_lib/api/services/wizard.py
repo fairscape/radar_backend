@@ -49,7 +49,7 @@ from ...db.repos import (
     users as users_repo,
     schedules as schedules_repo,
 )
-from ... import interest_terms, llm_topics, prosopia_interests, researcher_topics
+from ... import content_topics, interest_terms, llm_topics, prosopia_interests, researcher_topics
 from ...gatherers.openalex import OpenAlexGatherer
 from ...openalex_tiers import enabled_topic_ids
 from ...paper import Paper, Topic
@@ -459,8 +459,7 @@ def _aggregate_topics(
     """The seeds' aggregated topics, carrying forward prior on/off states.
 
     Writes nothing to the profile. ``new_on`` is the state of a topic not
-    seen before. (A seed OpenAlex does not have may get its content topics
-    stored on its paper row here; see ``_content_topics``.)
+    seen before.
 
     ``profile_topics`` says whether the researcher's profile topics are folded
     in: None reads the stored flag, True/False overrides it (the apply and
@@ -471,10 +470,8 @@ def _aggregate_topics(
     """
     prior_on = _prior_topic_states(conn, profile_id)
     stored = _stored_topic_filters(conn, profile_id)
-    from_content = _content_topics(conn, profile_id)
     papers = _load_seed_papers(conn, profile_id)
     topic_filters = Profile.aggregate_topic_filters(papers)
-    _keep_content_topics(topic_filters, from_content)
     _keep_adopted_topics(stored, topic_filters)
     llm_topics.keep_stored(stored, topic_filters)
 
@@ -559,10 +556,11 @@ def _prosopia_interests(conn: sqlite3.Connection, profile_id: int) -> list[dict]
 
 # A saved topic no seed brings any more (FUNCTIONAL_SPEC T.2-2).
 UNMATCHED = "unmatched"
-# The topics a seed brings: OpenAlex's own (no source), read from an
-# unmatched PDF's text, mapped from its UMLS concepts. A researcher's
-# profile or Claude-generated topics are not the seeds'.
-_SEED_SOURCES = (None, "pdf_content", "umls")
+# The topics a seed brings: OpenAlex's own (no source), mapped from its UMLS
+# concepts. A researcher's profile or Claude-generated topics are not the
+# seeds'. Not ``pdf_content``: topics once guessed from a PDF's text are
+# no seed's now (rag_lib.content_topics), so a saved one is not kept.
+_SEED_SOURCES = (None, "umls")
 
 
 def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, stored: dict,
@@ -576,7 +574,7 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
     searches are separate choices. A topic no current seed brings stays as
     saved, on or off, marked ``unmatched``, with no seed counted; the user
     switches it off. One a seed still brings that this rebuild left out
-    (OpenAlex's beyond the list's length, PDF-text topics switched off)
+    (OpenAlex's beyond the list's length)
     stays too, unmarked -- except a UMLS one, which the merge's own rules
     (its cap, a surer concept) settle. A new interest's draft still follows
     its seeds: nothing searches by it yet. A copy being edited is the saved
@@ -619,7 +617,7 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
 
 def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int) -> set[str]:
     """Every topic a current seed brings, as ``researcher_topics.code``: its
-    OpenAlex or PDF-text topics (``topics_json``) and the ones its UMLS
+    OpenAlex topics (``topics_json``) and the ones its UMLS
     concepts map to (``umls_mapped_topics_json``) -- read from the seeds,
     not from what a rebuild kept."""
     out: set[str] = set()
@@ -628,7 +626,7 @@ def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int) -> set[str]:
                            (oa_id,)).fetchone()
         if row is None:
             continue
-        for raw, read in ((row[0], lambda d: (d.get("topics") or []) + [d.get("primary_topic")]),
+        for raw, read in ((content_topics.seed_topics_raw(row[0]), lambda d: (d.get("topics") or []) + [d.get("primary_topic")]),
                           (row[1], lambda d: d)):
             try:
                 got = read(json.loads(raw)) if raw else []
@@ -725,7 +723,9 @@ def _restore_or_adopt(stored: dict, topic_filters: dict, prior_on: dict[str, boo
     topics are kept as ordinary ones (as ``drop_profile_topics`` does)."""
     stored_topics = [t for t in stored.get("topics") or [] if t.get("id")]
     restored = {t["id"]: bool(t[researcher_topics.BEFORE]) for t in stored_topics if researcher_topics.BEFORE in t}
-    own = [t for t in stored_topics if t.get("source") != researcher_topics.SOURCE]
+    # A topic once guessed from a PDF's text is not in the rebuilt list
+    # (rag_lib.content_topics): it does not count as one left on.
+    own = [t for t in stored_topics if t.get("source") not in (researcher_topics.SOURCE, content_topics.SOURCE)]
     if (any(restored.get(t["id"], bool(t.get("on"))) for t in own)
             or not any(t.get("on") for t in stored_topics)):
         prior_on.update(restored)
@@ -837,6 +837,13 @@ class SavedInterest(RuntimeError):
         self.slug = slug
 
 
+# An interest with no topic at all (only unpublished seeds, nothing UMLS
+# mapped): what the save says (BT4, R6). Claude's research topics are the
+# one way to add some, and they need an Anthropic key.
+NO_TOPIC = ("no topic to search by: generate research topics with an Anthropic API key and map them to "
+            "OpenAlex topics, then switch one on, or add seeds that are on OpenAlex")
+
+
 class NoTopicOn(ValueError):
     """Applying the profile's topics would leave none switched on."""
 
@@ -941,7 +948,7 @@ def _overlap_basis(conn: sqlite3.Connection, profile_id: int) -> dict:
     """The list rebuilt from the seeds without the profile: what a
     not-wanted topic's default is counted against, as every rebuild
     counts it -- so the default shown is the one recorded. (A read-only
-    copy of the rebuild would have to repeat its UMLS, PDF-text, Claude
+    copy of the rebuild would have to repeat its UMLS, Claude
     and adopted rules and drift from them.) Should the rebuild fail, the
     stored list's topics stand in rather than the view failing."""
     # The UMLS merge records how it went for step 3's notice; this read is
@@ -951,8 +958,10 @@ def _overlap_basis(conn: sqlite3.Connection, profile_id: int) -> dict:
         return _aggregate_topics(conn, profile_id, new_on=False, profile_topics=False)
     except Exception as exc:  # noqa: BLE001 -- a view, not a write
         log.warning("wizard.overlap_basis_from_stored", profile_id=profile_id, reason=type(exc).__name__)
+        # Not the profile's, and not one once guessed from a PDF's text: no
+        # rebuild has those now (rag_lib.content_topics).
         return {"topics": [t for t in _stored_topic_filters(conn, profile_id).get("topics") or []
-                           if t.get("source") != researcher_topics.SOURCE]}
+                           if t.get("source") not in (researcher_topics.SOURCE, content_topics.SOURCE)]}
     finally:
         if had:
             _UMLS_MERGE_STATE[profile_id] = kept
@@ -1054,13 +1063,16 @@ def _set_researcher_topics_once(
         full = _researcher_topics_on_stored(conn, profile_id, stored, enabled=enabled)
     if enabled:
         topics = full.get("topics") or []
-        if topics and not any(t.get("on", True) for t in topics):
+        # A saved interest keeps at least one topic on, even when the list
+        # comes back empty (user 2026-11-05, review BT4): with none, every
+        # scan searches nothing.
+        if (topics or not row["is_draft"]) and not any(t.get("on", True) for t in topics):
             raise NoTopicOn("the profile would switch every topic off: a scan searches by them")
     else:
         kept = full.get("topics") or []
         # On a saved interest the list is what the next scan searches by; a
         # draft's is settled on step 3, which says so when nothing is ticked.
-        if not is_new_draft(row) and kept and not any(t.get("on", True) for t in kept):
+        if not is_new_draft(row) and (kept or not row["is_draft"]) and not any(t.get("on", True) for t in kept):
             raise NoTopicOn("removing the profile's topics would leave none on: switch one on first")
     cur = conn.execute(
         "UPDATE profiles SET topic_filters_json = ?, updated_at = datetime('now')"
@@ -1193,47 +1205,6 @@ def _with_one_topic_from(stored: dict, new: dict | None, only: str, choices: dic
     return out
 
 
-def _content_topics(conn: sqlite3.Connection, profile_id: int) -> dict[str, dict]:
-    """Topics read from the text of the seeds OpenAlex does not have.
-
-    Returns ``{topic_id: topic}`` for the topics no OpenAlex-matched seed
-    has. A ``local:`` seed with no topics yet (uploaded before this
-    existed, or while the embedder was down) is read now and stored on its
-    paper row; there are only ever a few, so this stays cheap.
-    """
-    from ... import content_topics
-    from ...db.repos import versions as versions_repo
-    from ..settings import get_settings
-
-    rows = []
-    for oa_id in profiles_repo.list_seed_openalex_ids(conn, profile_id):
-        prow = papers_repo.get_by_openalex_id(conn, oa_id)
-        if prow is None:
-            continue
-        raw = prow["topics_json"]
-        if versions_repo.is_unmatched(conn, oa_id) and not raw:
-            raw = content_topics.try_topics_json(prow["title"], prow["abstract"], prow["body_text"],
-                                                 settings=get_settings())
-            if raw is not None:
-                conn.execute("UPDATE papers SET topics_json = ? WHERE openalex_id = ?", (raw, oa_id))
-                conn.commit()
-        rows.append(raw)
-    matched: set[str] = set()
-    found: dict[str, dict] = {}
-    for raw in rows:
-        ids = content_topics.ids_from_content(raw)
-        if ids:
-            for t in json.loads(raw).get("topics") or []:
-                if t.get("id") in ids:
-                    found.setdefault(t["id"], t)
-            continue
-        d = json.loads(raw) if raw else {}
-        for t in (d.get("topics") or []) + [d.get("primary_topic")]:
-            if isinstance(t, dict) and t.get("id"):
-                matched.add(t["id"])
-    return {tid: t for tid, t in found.items() if tid not in matched}
-
-
 def _keep_adopted_topics(stored: dict, topic_filters: dict) -> None:
     """Carry over the topics kept from a forgotten researcher's profile
     (``source: adopted``): no seed brings them back, and a rebuild from the
@@ -1248,26 +1219,6 @@ def _keep_adopted_topics(stored: dict, topic_filters: dict) -> None:
             # topics" override the user's later on/off choice.
             topics.append({k: v for k, v in t.items() if k not in ("profile", researcher_topics.BEFORE)})
             have.add(researcher_topics.code(t["id"]))
-
-
-def _keep_content_topics(topic_filters: dict, from_content: dict[str, dict]) -> None:
-    """Mark the content topics, and add back any the top-8 cut dropped.
-
-    ``aggregate_topic_filters`` keeps the 8 most common topics; one read
-    from a single PDF has a count of 1 and lost to the matched seeds' --
-    the same squeeze that kept that paper out of the search before.
-    """
-    from ... import content_topics
-
-    topics = topic_filters.setdefault("topics", [])
-    have = {t.get("id") for t in topics}
-    for t in topics:
-        if t.get("id") in from_content:
-            t["source"] = content_topics.SOURCE
-    for tid, t in from_content.items():
-        if tid not in have:
-            topics.append({"id": tid, "display_name": t.get("display_name") or "", "count": 1, "papers": 1,
-                           "source": content_topics.SOURCE})
 
 
 def preview_topics(conn: sqlite3.Connection, *, user_id: int, slug: str) -> tuple[dict, set[str]]:
@@ -1309,8 +1260,11 @@ def save_topics(
         full = _aggregate_topics(conn, profile_id, new_on=False)
         ids = {t["id"] for t in full.get("topics") or [] if t.get("id")}
         selected = set(selected_topic_ids) & ids
-        if ids and not selected:
-            raise ValueError("switch on at least one topic: a scan searches by them")
+        # A draft's step 3 may sit with no topic yet; its commit refuses.
+        # A saved interest always keeps one on (BT4).
+        if not selected and (ids or not row["is_draft"]):
+            raise ValueError("switch on at least one topic: a scan searches by them" if ids else
+                             NO_TOPIC)
         return _prune_topic_filters(full, selected)
 
     pruned = _write_rebuilt_topics(conn, profile_id, build)
@@ -1696,8 +1650,11 @@ def commit_draft(
             selected = _ticks_over(first, full_topics, set(selected_topic_ids))
         # As save_topics: with every topic off, each scan gathers nothing.
         ids = {t["id"] for t in (full_topics or {}).get("topics") or [] if t.get("id")}
-        if ids and not (selected & ids):
-            raise ValueError("switch on at least one topic: a scan searches by them")
+        # Even with no topic at all (only unpublished seeds, nothing UMLS
+        # mapped): an interest with no topic on searches nothing (BT4).
+        if not (selected & ids):
+            raise ValueError("switch on at least one topic: a scan searches by them" if ids else
+                             NO_TOPIC)
         pruned = _prune_topic_filters(full_topics, selected)
 
         def write(profile, sel_cfg, diag, centroid_blob, band, pruned=pruned, raw=raw):

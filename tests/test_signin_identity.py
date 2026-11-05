@@ -430,6 +430,21 @@ def test_session_is_renewed_on_use_past_half_its_life(app, monkeypatch, age_days
     assert "HttpOnly" in line and "Secure" in line and "Path=/" in line and "Max-Age=1209600" in line
 
 
+def test_an_idle_tab_does_not_renew_the_session(app, monkeypatch):
+    """A tab unused for 10 minutes says so (X-Radar-Idle: 1): its polls and
+    lease heartbeats must not keep the sign-in alive for ever (BL-3)."""
+    old = _aged_cookie(monkeypatch, "alice@example.org", 10)
+
+    async def steps(c):
+        c.cookies.set(_name(), old)
+        idle = await c.get("/api/users/me", headers={"X-Radar-Idle": "1"})
+        used = await c.get("/api/users/me")
+        return idle, used
+    idle, used = _run(app, steps)
+    assert idle.status_code == 200 and _set_cookie_token(idle) is None
+    assert used.status_code == 200 and _set_cookie_token(used) is not None
+
+
 def test_expired_session_is_not_renewed(app, monkeypatch):
     old = _aged_cookie(monkeypatch, "alice@example.org", 15)
 

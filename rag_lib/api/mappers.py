@@ -135,6 +135,10 @@ def profile_row_to_profile(
 
 
 def _decode_topics(topics_json: str | None) -> dict[str, Any]:
+    from .. import content_topics
+
+    # Topics once guessed from a PDF's text count as none (rag_lib.content_topics).
+    topics_json = content_topics.seed_topics_raw(topics_json)
     if not topics_json:
         return {"primary_topic": None, "topics": []}
     try:

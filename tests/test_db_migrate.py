@@ -70,6 +70,7 @@ EXPECTED_VERSIONS = [
     "0039_vault_kept",
     "0040_cr_vault_kept_and_versions",
     "0041_deleted_seed_uploaded_at",
+    "0042_write_lease",
 ]
 
 

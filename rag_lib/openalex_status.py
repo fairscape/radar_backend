@@ -7,10 +7,12 @@ error that says so, raised by ``OpenAlexClient._get`` for
 
   quota    429 with no requests left: the day's are used up
   busy     429 with requests left: too many at once (CR.11 L9); a minute
-  auth     401/403: OpenAlex wants an API key
+  auth     401/403 with no API key configured: OpenAlex wants one
+  key      401/403 with an API key configured: it is wrong, revoked or
+           expired (review BT2: was told as "without an API key")
   down     a 5xx, a timeout, no connection
 
-``quota``, ``busy`` and ``auth`` pause OpenAlex for this process until the time
+``quota``, ``busy``, ``auth`` and ``key`` pause OpenAlex for this process until the time
 OpenAlex gave (the next UTC midnight when it gave none): every request in
 between would be refused the same way and spend nothing but time. While
 paused, ``_get`` refuses without calling, and the frontend shows a banner
@@ -37,6 +39,7 @@ _MESSAGES = {
     "quota": "OpenAlex's daily request limit has been reached.",
     "busy": "OpenAlex is busy (too many requests at once).",
     "auth": "OpenAlex is refusing requests without an API key.",
+    "key": "OpenAlex rejected the configured API key (wrong, revoked or expired).",
     "down": "OpenAlex could not be reached.",
 }
 

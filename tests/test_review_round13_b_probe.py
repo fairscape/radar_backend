@@ -38,7 +38,7 @@ def env(tmp_path, monkeypatch):
         "RADAR_DB_PATH": str(db), "RADAR_VAULT_DIR": str(tmp_path / "vault"),
         "RADAR_CHROMA_DIR": str(tmp_path / "chroma"), "RADAR_LOG_JSON": "false",
         "RADAR_SCHEDULER_ENABLED": "false", "RADAR_DEFAULT_EMBEDDING_MODEL": "placeholder-v1",
-        "RADAR_UMLS_ENABLED": "false", "RADAR_CONTENT_TOPICS_ENABLED": "false",
+        "RADAR_UMLS_ENABLED": "false",
         "RADAR_RERANKER_ENABLED": "false",
     }.items():
         monkeypatch.setenv(k, v)

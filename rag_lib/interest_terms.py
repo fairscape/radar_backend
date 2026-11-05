@@ -179,7 +179,8 @@ def build_lite_profile(root: Path, profile_row: sqlite3.Row, seeds: list[sqlite3
 
     Rebuilt from scratch when the seed set changed (the hash file), reused
     otherwise: the index is the slow part (~15 s with model load for 80
-    seeds). Returns ``(profile, {paper_id: openalex_id})``.
+    seeds). ``generate`` removes ``root`` once it is done (BT3), so in
+    use each generation builds it afresh. Returns ``(profile, {paper_id: openalex_id})``.
     """
     from researcher_profiles import PaperRecord, ProfileDocument, ResearcherProfile
 
@@ -218,6 +219,23 @@ def build_lite_profile(root: Path, profile_row: sqlite3.Row, seeds: list[sqlite3
     prof.index.build(backend=backend if backend is not None else BACKEND_SPEC)
     hash_file.write_text(want)
     return prof, ids
+
+
+def _sweep_left_behind(base: Path, older_than_s: float = 3600.0) -> None:
+    """Remove lite profiles left by a generation that died before tidying up,
+    and the ones kept by builds before 2026-11-05 (BT3). Only those not
+    touched for an hour, so a generation running now keeps its own."""
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    now = time.time()
+    for d in entries:
+        try:
+            if d.is_dir() and now - d.stat().st_mtime > older_than_s:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def _chunk_sources(root: Path) -> dict[int, str]:
@@ -337,18 +355,40 @@ def generate(conn: sqlite3.Connection, settings: Any, profile_row: sqlite3.Row, 
     from researcher_profiles.embeddings.backends import get_backend
 
     be = backend if backend is not None else get_backend(BACKEND_SPEC)
-    root = Path(settings.RADAR_VAULT_DIR).parent / "rp_profiles" / str(pid)
-    t0 = time.monotonic()
-    prof, ids = build_lite_profile(root, profile_row, seeds, backend=be)
-    sources = _chunk_sources(root)
+    base = Path(settings.RADAR_VAULT_DIR).parent / "rp_profiles"
+    _sweep_left_behind(base)
+    # A folder of its own per run: two runs for one interest (two tabs, or
+    # Back then Regenerate) removed each other's (review R3).
+    import secrets
 
-    if api_key:
-        topics, usage = _llm_topics(prof, N_TOPICS, api_key, be)
-        record.update(source="rp-sdk-llm", model=usage.pop("model", None), usage=usage)
-    else:
-        sdk_topics = prof.topics.get(n=N_TOPICS, method="cluster")
-        topics = [{"label": t.label, "weight": t.weight, "chunk_ids": list(t.chunk_ids or [])} for t in sdk_topics]
-        record.update(source="rp-sdk-cluster", model=None)
+    root = base / f"{pid}-{secrets.token_hex(4)}"
+    t0 = time.monotonic()
+    # The lite profile holds the seeds' text (an unpublished manuscript's
+    # opening) and its vectors. It is only scratch for this one generation:
+    # removed as soon as the topics are out, so no delete of a draft, an
+    # interest, an edit copy or a vault PDF has to remember it (review BT3;
+    # the class: files that outlive their rows). A regenerate rebuilds it.
+    prof = sdk_topics = None
+    try:
+        prof, ids = build_lite_profile(root, profile_row, seeds, backend=be)
+        sources = _chunk_sources(root)
+
+        if api_key:
+            topics, usage = _llm_topics(prof, N_TOPICS, api_key, be)
+            record.update(source="rp-sdk-llm", model=usage.pop("model", None), usage=usage)
+        else:
+            sdk_topics = prof.topics.get(n=N_TOPICS, method="cluster")
+            topics = [{"label": t.label, "weight": t.weight, "chunk_ids": list(t.chunk_ids or [])}
+                      for t in sdk_topics]
+            record.update(source="rp-sdk-cluster", model=None)
+    finally:
+        # The SDK's objects recreate their .cache folder as they are freed:
+        # free them first, then remove it all.
+        prof = sdk_topics = None
+        import gc
+
+        gc.collect()
+        shutil.rmtree(root, ignore_errors=True)
     record["terms"] = [
         {"label": t["label"], "weight": round(float(t["weight"] or 0.0), 4),
          "paper_ids": _papers_for(t["chunk_ids"], sources, ids)}

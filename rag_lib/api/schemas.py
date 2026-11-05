@@ -268,6 +268,9 @@ class EditTab(_Model):
     opened it (FUNCTIONAL_SPEC E.7 R5)."""
 
     tab: str = Field(default="", max_length=64)
+    # Confirmed after ``unsavedElsewhere``: drop another tab's left-behind
+    # copy of the interest, with its unsaved changes (user 2026-11-05).
+    discard_unsaved: bool = False
 
 
 class EditCopyState(_Model):
@@ -897,7 +900,7 @@ class NotInterestTopic(_Model):
     weight: float | None = None
     similarity: float | None = None
     # Other sources listing the same topic: ``openalex`` (a seed), ``umls``,
-    # ``pdf_content``, ``llm``, ``adopted``, ``profile_interest``.
+    # ``llm``, ``adopted``, ``profile_interest``.
     overlap: list[str] = Field(default_factory=list)
     # ``filter`` it out, ``keep`` it as the other sources have it, or ``add``
     # it as a topic; recorded once the profile is applied, the default before.

@@ -54,7 +54,10 @@ def app(tmp_path, monkeypatch):
     apply_migrations(conn)
     uid = int(users_repo.upsert(conn, "demo@example.com")["id"])
     pid = profiles_repo.upsert(conn, user_id=uid, name="Chromatin", embedding_model="placeholder-v1",
-                               n_seed=6, topic_filters={"topics": []}, threshold=0.8)
+                               n_seed=6, threshold=0.8,
+                               # A saved interest keeps a topic on (BT4): saving the edit refuses otherwise.
+                               topic_filters={"topics": [{"id": "https://openalex.org/T10001",
+                                                          "display_name": "Chromatin", "on": True}]})
     for i in range(6):
         oa = f"https://openalex.org/W90{i}"
         papers_repo.upsert(conn, {"openalex_id": oa, "title": f"Seed {i}: chromatin accessibility study {i}",
@@ -142,8 +145,9 @@ def test_without_a_key_the_sdk_cluster_method_runs_and_topics_name_their_papers(
         # Kept on the copy; the interest gets them when the copy is saved.
         assert _stored(tmp_path) is None
     assert _stored(tmp_path)["source"] == "rp-sdk-cluster" and _stored(tmp_path)["edited"] is False
+    # The lite profile it was built from is scratch, gone once the topics are out (BT3).
     root = tmp_path / "rp_profiles"
-    assert any(root.rglob("profile.jsonld")) and any(root.rglob("papers.jsonld"))
+    assert not root.exists() or not any(root.iterdir())
 
 
 def test_the_llm_method_uses_the_key_typed_in_and_stores_it_nowhere(app, tmp_path, monkeypatch, caplog, capsys):
@@ -272,3 +276,84 @@ def test_struck_out_topics_are_kept_apart_and_never_used_as_queries(app, tmp_pat
                         json={"terms": [first, *rest], "removed": [first]}).json()
         assert body["removed"] == [] and first["label"] in [t["label"] for t in body["terms"]]
     assert _stored(tmp_path)["removed"] == [] and first["label"] in [t["label"] for t in _stored(tmp_path)["terms"]]
+
+
+def test_a_new_interests_draft_keeps_claudes_topics_and_maps_them_rt(app, tmp_path, monkeypatch):
+    """FUNCTIONAL_SPEC RT: step 3 of a new interest generates research
+    topics on the draft (no Edit interest copy), keeps them there, maps
+    Claude's to OpenAlex topics switched off, and the draft's topic list
+    keeps those through a rebuild. Saving the interest keeps them all."""
+    import researcher_profiles.generative.llm as llm
+    from rag_lib import llm_topics
+    from rag_lib.llm_topics import LabelMatch
+
+    FakeLLM.seen_keys = []
+    monkeypatch.setattr(llm, "LLMClient", FakeLLM)
+    mapped = []
+
+    def fake_map(labels, **kw):
+        mapped.append(list(labels))
+        return [LabelMatch(topic_id="https://openalex.org/T9001", display_name="Chromatin Accessibility Research",
+                           similarity=0.82, label=labels[0])]
+    monkeypatch.setattr(llm_topics, "map_labels", fake_map)
+
+    slug = _request(app, "POST", "/api/profiles/draft", json={"name": "New chromatin"}).json()["slug"]
+    conn = connect(tmp_path / "radar.db")
+    pid = conn.execute("SELECT id FROM profiles WHERE slug = ?", (slug,)).fetchone()[0]
+    from rag_lib.db.repos import embeddings as embeddings_repo
+    from rag_lib.embedders import placeholder_embed
+    model = settings_module.get_settings().RADAR_DEFAULT_EMBEDDING_MODEL
+    for i in range(6):
+        oa = f"https://openalex.org/W90{i}"
+        profiles_repo.attach_seed(conn, pid, oa)
+        embeddings_repo.upsert(conn, oa, model, placeholder_embed(oa))   # saving needs seed vectors
+    conn.commit()
+    conn.close()
+
+    # Without a key: the cluster method, kept on the draft; it cannot be mapped.
+    prev = _request(app, "POST", f"/api/profiles/{slug}/terms/generate", json={})
+    assert prev.status_code == 200, prev.text
+    assert prev.json()["source"] == "rp-sdk-cluster" and _stored(tmp_path, slug) is None
+    kept = _request(app, "PUT", f"/api/profiles/{slug}/terms", json={**prev.json(), "edited": False})
+    assert kept.status_code == 200, kept.text
+    assert _stored(tmp_path, slug)["source"] == "rp-sdk-cluster"
+    assert _request(app, "POST", f"/api/profiles/{slug}/llm-topics").status_code == 409
+    assert mapped == []
+
+    # With a key: Claude's topics, kept on the draft as generated.
+    prev = _request(app, "POST", f"/api/profiles/{slug}/terms/generate", json={"api_key": KEY})
+    assert prev.status_code == 200 and prev.json()["source"] == "rp-sdk-llm", prev.text
+    assert FakeLLM.seen_keys == [KEY]
+    kept = _request(app, "PUT", f"/api/profiles/{slug}/terms", json={**prev.json(), "edited": False})
+    assert kept.status_code == 200 and kept.json()["saved"] is True
+    assert KEY not in kept.text
+
+    # Mapped: joins the draft's topic list as an LLM topic, switched off.
+    res = _request(app, "POST", f"/api/profiles/{slug}/llm-topics")
+    assert res.status_code == 200, res.text
+    assert mapped == [["chromatin accessibility profiling", "ATAC-seq cohort analysis"]]
+    topics = _request(app, "GET", f"/api/profiles/draft/{slug}/topics").json()
+    llm_rows = [t for t in topics if t.get("source") == "llm"]
+    assert [(t["id"], t["on"]) for t in llm_rows] == [("https://openalex.org/T9001", False)]
+
+    # A seed removed rebuilds the draft's topic list: the LLM topic stays, still off.
+    r = _request(app, "DELETE", f"/api/profiles/draft/{slug}/seeds/https%3A%2F%2Fopenalex.org%2FW905")
+    assert r.status_code == 200, r.text
+    topics = _request(app, "GET", f"/api/profiles/draft/{slug}/topics").json()
+    assert [(t["id"], t["on"]) for t in topics if t.get("source") == "llm"] == [("https://openalex.org/T9001", False)]
+
+    # Saved with it switched on: the interest keeps the topics and searches by it.
+    r = _request(app, "POST", "/api/profiles", json={
+        "slug": slug, "threshold": 0.5, "selected_topic_ids": ["https://openalex.org/T9001"],
+        "cron": "0 4 * * *", "tz": "UTC", "years": None})
+    assert r.status_code == 200, r.text
+    stored = _stored(tmp_path, slug)
+    assert stored["source"] == "rp-sdk-llm"
+    assert [t["label"] for t in stored["terms"]] == ["chromatin accessibility profiling", "ATAC-seq cohort analysis"]
+    conn = connect(tmp_path / "radar.db")
+    row = conn.execute("SELECT is_draft, topic_filters_json FROM profiles WHERE slug = ?", (slug,)).fetchone()
+    conn.close()
+    assert row[0] == 0
+    from rag_lib.openalex_tiers import enabled_topic_ids
+    assert "https://openalex.org/T9001" in enabled_topic_ids(json.loads(row[1]))
+    _assert_key_nowhere(tmp_path)

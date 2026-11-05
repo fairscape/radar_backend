@@ -341,18 +341,6 @@ def test_embedding_without_an_abstract_starts_at_the_first_paragraph():
     assert "This is the first paragraph" in text and "University of Somewhere" not in text
 
 
-def test_content_topics_read_the_abstract_first(monkeypatch):
-    from types import SimpleNamespace
-
-    from rag_lib import content_topics
-
-    seen = []
-    monkeypatch.setattr(content_topics, "topics_from_text", lambda t, b, settings: seen.append(b) or [])
-    content_topics.try_topics_json("T", "An abstract.", _stored_with_front_matter(), settings=SimpleNamespace())
-    content_topics.try_topics_json("T", None, _stored_with_front_matter(), settings=SimpleNamespace())
-    assert seen[0] == "An abstract." and seen[1].startswith("This is the first paragraph")
-
-
 def test_an_end_before_300_characters_is_not_found_rather_than_reading_on():
     intro = textwrap.wrap("We study things in detail here, " * 20, 70)
     text = _page_text("Abstract", *SENT[:2], "1. Introduction", *intro, "2. Methods")

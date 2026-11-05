@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from rag_lib.db import apply_migrations, connect
 from rag_lib.scheduler import build_scheduler, start as start_scheduler, stop as stop_scheduler
 
-from . import draft_lock, oidc
+from . import draft_lock, oidc, write_lease
 from .logging import configure_logging
 from .routers import auth, chat, health, profiles, prosopia, radar, researchers, users, vault
 from .settings import get_settings
@@ -58,6 +58,13 @@ async def lifespan(app: FastAPI):
         # Only a process that runs the jobs owns the open runs: one started
         # with the scheduler off (tests, a second API worker) leaves them.
         if settings.RADAR_SCHEDULER_ENABLED:
+            # Research-topic scratch left by older builds or a generation a
+            # restart cut off (seed text and vectors, review BT3 / R7):
+            # nothing generates during boot, so all of it goes.
+            from pathlib import Path
+
+            from ..interest_terms import _sweep_left_behind
+            _sweep_left_behind(Path(settings.RADAR_VAULT_DIR).parent / "rp_profiles", older_than_s=0)
             from ..db.repos.gather_runs import close_interrupted, open_scan_profiles
 
             # Before closing: the scans a restart cut off had committed part
@@ -261,6 +268,11 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={
             "detail": "the interest's seeds changed while it was being fitted; try again"})
 
+    @app.exception_handler(write_lease.EditingElsewhere)
+    async def _editing_elsewhere(request: Request, exc: write_lease.EditingElsewhere):
+        # ``editingElsewhere`` turns the page view-only (W.A R2).
+        return JSONResponse(status_code=409, content={"detail": str(exc), "editingElsewhere": True})
+
     @app.exception_handler(draft_lock.DraftOpenElsewhere)
     async def _draft_open_elsewhere(request: Request, exc: draft_lock.DraftOpenElsewhere):
         # Refused wherever it was reached (the profiles router's guard, an
@@ -351,10 +363,14 @@ def create_app() -> FastAPI:
     # Not on errors, and not where the route set a cookie itself: that is
     # what keeps /auth/logout's clearing (and sign-in's own cookie) from
     # being overwritten by a renewal.
+    # Not for a tab nobody has used for 10 minutes (``X-Radar-Idle: 1``,
+    # review BL-3): its polls and lease heartbeats would otherwise keep a
+    # forgotten tab signed in for ever.
     @app.middleware("http")
     async def renew_session(request: Request, call_next):
         response = await call_next(request)
         if (oidc.providers(settings)
+                and request.headers.get("X-Radar-Idle") != "1"
                 and response.status_code < 400
                 and "set-cookie" not in response.headers):
             session = oidc.request_session(settings, request)
@@ -396,13 +412,16 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(health.router, prefix="/api", tags=["health"])
-    app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
-    app.include_router(radar.router, prefix="/api/radar", tags=["radar"])
-    app.include_router(vault.router, prefix="/api/vault", tags=["vault"])
-    app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
-    app.include_router(users.router, prefix="/api/users", tags=["users"])
-    app.include_router(prosopia.router, prefix="/api/import", tags=["import"])
-    app.include_router(researchers.router, prefix="/api/researchers", tags=["researchers"])
+    # One tab at a time changes an account (write_lease, FUNCTIONAL_SPEC
+    # W.A): every router that can change something goes through one guard.
+    wl = [Depends(write_lease.guard)]
+    app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"], dependencies=wl)
+    app.include_router(radar.router, prefix="/api/radar", tags=["radar"], dependencies=wl)
+    app.include_router(vault.router, prefix="/api/vault", tags=["vault"], dependencies=wl)
+    app.include_router(chat.router, prefix="/api/chat", tags=["chat"], dependencies=wl)
+    app.include_router(users.router, prefix="/api/users", tags=["users"], dependencies=wl)
+    app.include_router(prosopia.router, prefix="/api/import", tags=["import"], dependencies=wl)
+    app.include_router(researchers.router, prefix="/api/researchers", tags=["researchers"], dependencies=wl)
     app.include_router(auth.router, prefix="/auth", tags=["auth"])
 
     # Top-level liveness for load-balancer / docker healthcheck use.

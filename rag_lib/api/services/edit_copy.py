@@ -16,9 +16,12 @@ match until the user scans (E.4 Q5); the scan refits on the new seeds
 One tab at a time, first come first served (E.7 R5): the copy belongs to
 the tab that opened it (``edit_tab``), which says every 30 s it is still
 there (``alive``). Edit interest in another tab is refused (``BeingEdited``)
-while the copy is heard from; a copy not heard from for ``STALE_AFTER_S``
-(the tab closed without leaving, the computer slept) is left behind and
-is discarded the next time anything looks for it.
+while the copy is heard from. A copy not heard from for ``STALE_AFTER_S``
+(the tab closed without leaving, the computer slept) is left behind: it no
+longer holds the interest, but it is not discarded on its own -- the tab
+may wake up and carry on (user 2026-11-05). It goes only when its own tab
+leaves it, or when another tab opens Edit interest on the interest and,
+told that this drops the unsaved changes (``UnsavedElsewhere``), confirms.
 
 The copy is a draft, so everything that keys on drafts treats it as one:
 not listed, scanned or scored; an upload into it is the draft's. Only
@@ -61,8 +64,19 @@ _SAVED = ("threshold", "topic_filters_json", "interest_terms_json", "researcher_
 # A copy not heard from for this long is left behind (E.7 R5, user's Q1).
 STALE_AFTER_S = 120
 
-CLOSED = ("this edit is no longer open (this page went unheard for over 2 minutes, or the interest was "
-          "deleted elsewhere); its changes were discarded. Open Edit interest again")
+CLOSED = ("this edit is no longer open: another tab discarded its unsaved changes to edit this interest "
+          "there, or the interest was deleted elsewhere. Open Edit interest again")
+
+
+class UnsavedElsewhere(RuntimeError):
+    """Edit interest refused until confirmed: another tab left a copy of the
+    interest with unsaved changes (not heard from for 2 minutes: closed
+    without leaving, or asleep). Opening here discards them."""
+
+    def __init__(self, slug: str):
+        super().__init__(f"Another tab or window has unsaved changes to '{slug}' in Edit interest (it has not "
+                         "been heard from for over 2 minutes). Editing here discards those changes.")
+        self.slug = slug
 
 
 class BeingEdited(RuntimeError):
@@ -71,7 +85,7 @@ class BeingEdited(RuntimeError):
 
     def __init__(self, slug: str):
         super().__init__(f"'{slug}' is being edited in another tab or window. Save or leave the edit there "
-                         "first; a tab closed without leaving frees it within 2 minutes.")
+                         "first. If that tab was closed without leaving, after 2 minutes you can discard its changes and edit here.")
         self.slug = slug
 
 
@@ -94,14 +108,12 @@ def is_stale(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
 
 
 def open_copy_of(conn: sqlite3.Connection, profile_id: int) -> sqlite3.Row | None:
-    """The copy of interest ``profile_id`` someone is editing: one left
-    behind goes first, so it does not hold the interest (its scans, its
-    backfill) after the tab that had it is gone."""
+    """The copy of interest ``profile_id`` someone is editing now. One left
+    behind does not hold the interest (its scans, its backfill) after the
+    tab that had it went quiet; it is kept, not discarded (see the module)."""
     row = copy_of(conn, profile_id)
     if row is not None and is_stale(conn, row):
-        draft_owned_repo.discard(conn, int(row["id"]))
-        log.info("edit_copy.stale_discarded", copy_id=int(row["id"]), profile_id=int(profile_id))
-        return copy_of(conn, profile_id)
+        return None
     return row
 
 
@@ -138,18 +150,18 @@ def alive(conn: sqlite3.Connection, *, user_id: int, slug: str, tab: str) -> Non
 
 
 def discard_leftovers(conn: sqlite3.Connection, user_id: int, tab: str = "") -> list[str]:
-    """Discard the user's copies left behind: not heard from for 2 minutes,
-    or this tab's own (it is not on an edit page now: closed or reloaded
-    without leaving). Called when the site opens and when Edit interest
-    opens. Another tab's copy still heard from stays (E.7 R5), as does one
-    an import is still filling. Returns the slugs discarded."""
+    """Discard this tab's own copies (it is not on an edit page now: closed
+    or reloaded without leaving). Called when the site opens and when Edit
+    interest opens. Another tab's copy stays, heard from or not: that tab
+    may wake up and carry on (user 2026-11-05); one an import is still
+    filling stays too. Returns the slugs discarded."""
     gone: list[str] = []
     for row in conn.execute("SELECT * FROM profiles WHERE user_id = ? AND edit_of IS NOT NULL ORDER BY id",
                             (int(user_id),)).fetchall():
         if gather_runs_repo.has_unfinished_import(conn, int(row["id"])):
             log.info("edit_copy.leftover_importing", profile_id=int(row["id"]))
             continue
-        if (row["edit_tab"] or "") != (tab or "") and not is_stale(conn, row):
+        if (row["edit_tab"] or "") != (tab or ""):
             continue
         draft_owned_repo.discard(conn, int(row["id"]))
         gone.append(row["slug"])
@@ -158,14 +170,16 @@ def discard_leftovers(conn: sqlite3.Connection, user_id: int, tab: str = "") -> 
     return gone
 
 
-def open_copy(conn: sqlite3.Connection, *, user_id: int, slug: str, tab: str = "") -> sqlite3.Row:
+def open_copy(conn: sqlite3.Connection, *, user_id: int, slug: str, tab: str = "",
+              discard_unsaved: bool = False) -> sqlite3.Row:
     """Copy saved interest ``slug`` for Edit interest in tab ``tab``;
     returns the copy's row.
 
-    The copies left behind go first (unsaved changes are not kept, E.4
-    Q3), this tab's own among them (a reload). ``BeingEdited`` while
-    another tab has the interest open and is heard from (first come first
-    served, E.7 R5); ``LookupError`` for no such saved interest;
+    This tab's own copies go first (a reload: unsaved changes are not
+    kept, E.4 Q3). ``BeingEdited`` while another tab has the interest open
+    and is heard from (first come first served, E.7 R5);
+    ``UnsavedElsewhere`` when another tab left a copy of it not heard from
+    for 2 minutes, unless ``discard_unsaved`` (the user confirmed); ``LookupError`` for no such saved interest;
     ``wizard.ImportInProgress`` when a copy of it is still being filled
     by an import.
     """
@@ -193,8 +207,11 @@ def open_copy(conn: sqlite3.Connection, *, user_id: int, slug: str, tab: str = "
             if left is not None:
                 conn.rollback()
                 # Another tab's first: said as that, import or not.
-                if (left["edit_tab"] or "") != (tab or "") and not is_stale(conn, left):
-                    raise BeingEdited(slug)
+                if (left["edit_tab"] or "") != (tab or ""):
+                    if not is_stale(conn, left):
+                        raise BeingEdited(slug)
+                    if not discard_unsaved:
+                        raise UnsavedElsewhere(slug)
                 if gather_runs_repo.has_unfinished_import(conn, int(left["id"])):
                     raise wizard_service.ImportInProgress(left["slug"])
                 draft_owned_repo.discard(conn, int(left["id"]))     # its own transaction; then again
@@ -266,8 +283,10 @@ def save_copy(conn: sqlite3.Connection, *, user_id: int, slug: str) -> str:
     if not any(embeddings_repo.has(conn, s, copy["embedding_model"]) for s in seeds):
         raise ValueError("none of the seeds can be placed (no vector); add one that can before saving")
     topics = (profiles_repo.topic_filters(conn, copy_id) or {}).get("topics") or []
-    if topics and not enabled_topic_ids({"topics": topics}):
-        raise wizard_service.NoTopicOn("switch on at least one topic: a scan searches by them")
+    # Even with an empty list (BT4): an interest with no topic on searches nothing.
+    if not enabled_topic_ids({"topics": topics}):
+        raise wizard_service.NoTopicOn("switch on at least one topic: a scan searches by them" if topics else
+                                       wizard_service.NO_TOPIC)
 
     seeds_before = sorted(profiles_repo.list_seed_openalex_ids(conn, profile_id))
     if conn.in_transaction:

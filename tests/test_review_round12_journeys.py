@@ -40,6 +40,8 @@ B = {"X-User-Email": "b@example.com"}       # a second user; no header = demo us
 # ---------------------------------------------------------------------------
 
 
+from tests.topic_helpers import ensure_a_topic  # noqa: E402  (saved with a topic on, BT4)
+
 class InlineScheduler:
     """Runs what it is handed, right away, in the request."""
 
@@ -79,7 +81,7 @@ def env(tmp_path, monkeypatch):
         "RADAR_DB_PATH": str(db), "RADAR_VAULT_DIR": str(tmp_path / "vault"),
         "RADAR_CHROMA_DIR": str(tmp_path / "chroma"), "RADAR_LOG_JSON": "false",
         "RADAR_SCHEDULER_ENABLED": "false", "RADAR_DEFAULT_EMBEDDING_MODEL": "placeholder-v1",
-        "RADAR_UMLS_ENABLED": "false", "RADAR_CONTENT_TOPICS_ENABLED": "false",
+        "RADAR_UMLS_ENABLED": "false",
         "RADAR_RERANKER_ENABLED": "false",
     }.items():
         monkeypatch.setenv(k, v)
@@ -192,12 +194,19 @@ def _go_live(app, env, name="Live", *, seeds_from_researcher=True, headers=None,
         _ok(_upload(app, b"seed-two-" + name.encode(), "two.pdf", slug, headers=h))
     topics = _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/topics", headers=h))
     on = [t["id"] for t in topics if t["on"]]
+    if not on:      # PDF seeds bring no topic; a draft is saved with one on (BT4)
+        from tests.topic_helpers import ensure_a_topic
+        on = ensure_a_topic(slug)
     run = _ok(_request(app, "POST", f"/api/profiles/draft/{slug}/dry-run",
                        json={"days": 30, "selected_topic_ids": on}, headers=h))
     st = _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/dry-run/{run['run_id']}", headers=h))
     scores = st["result"]["scores"] if st["result"] else []
     if threshold is None:
         threshold = max(0.0, min(scores)) if scores else 0.0
+    if not [t for t in topics if t["on"]]:
+        # The trial re-reads the seeds' topics (none): add the test one again.
+        from tests.topic_helpers import ensure_a_topic
+        on = ensure_a_topic(slug)
     _ok(_request(app, "POST", "/api/profiles", json={
         "slug": slug, "threshold": round(threshold, 3), "selected_topic_ids": on,
         "cron": "0 4 * * *", "tz": "UTC", "years": None}, headers=h))
@@ -960,7 +969,7 @@ def test_j5_names_slugs_and_odd_payloads(app, env):
     _ok(_request(app, "GET", f"/api/profiles/{slug}/researcher-topics"))
     kicked = _ok(_request(app, "POST", f"/api/profiles/draft/{slug}/dry-run", json={"days": 7}))
     _ok(_request(app, "GET", f"/api/profiles/draft/{slug}/dry-run/{kicked['run_id']}"))
-    live = _ok(_request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.0, "selected_topic_ids": []}))
+    live = _ok(_request(app, "POST", "/api/profiles", json={"slug": slug, "threshold": 0.0, "selected_topic_ids": ensure_a_topic(slug)}))
     assert live["key"] == slug
     _ok(_request(app, "GET", f"/api/profiles/{slug}/detail"))
     _scan(app, slug)
@@ -1187,7 +1196,7 @@ def test_j4_one_user_two_interests_share_a_paper(app, env):
     _ok(_upload(app, b"b-seed", "b.pdf", b))
     kicked = _ok(_request(app, "POST", f"/api/profiles/draft/{b}/dry-run", json={"days": 7}))
     _ok(_request(app, "GET", f"/api/profiles/draft/{b}/dry-run/{kicked['run_id']}"))
-    _ok(_request(app, "POST", "/api/profiles", json={"slug": b, "threshold": 0.0, "selected_topic_ids": []}))
+    _ok(_request(app, "POST", "/api/profiles", json={"slug": b, "threshold": 0.0, "selected_topic_ids": ensure_a_topic(b)}))
     _scan(app, a)
     _scan(app, b)
     feed = _feed(app)
@@ -1309,7 +1318,7 @@ def test_j5_tiny_drafts_zero_and_one_seed(app, env):
     kicked = _ok(_request(app, "POST", f"/api/profiles/draft/{d1}/dry-run", json={"days": 7}))
     st = _ok(_request(app, "GET", f"/api/profiles/draft/{d1}/dry-run/{kicked['run_id']}"))
     assert st["run"]["error"] is None and st["result"]["scores"]
-    live = _ok(_request(app, "POST", "/api/profiles", json={"slug": d1, "threshold": 0.0, "selected_topic_ids": []}))
+    live = _ok(_request(app, "POST", "/api/profiles", json={"slug": d1, "threshold": 0.0, "selected_topic_ids": ensure_a_topic(d1)}))
     assert live["seeds"] == 1 and live["seedSimMin"] is None
     _scan(app, d1)
     assert _feed(app, d1)["cards"]

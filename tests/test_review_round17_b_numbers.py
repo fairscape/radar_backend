@@ -13,6 +13,8 @@ from tests.test_review_round12_journeys import (  # noqa: F401
 )
 
 
+from tests.topic_helpers import ensure_a_topic  # noqa: E402  (saved with a topic on, BT4)
+
 def _edit(app, slug):
     """Edit interest: a saved interest changes only on a copy, saved in one
     go (FUNCTIONAL_SPEC E)."""
@@ -100,7 +102,7 @@ def test_below_the_bar_across_interests_is_not_closest_to_the_bar_first(app, env
     _ok(_upload(app, b"low-seed", "low.pdf", b))
     kicked = _ok(_request(app, "POST", f"/api/profiles/draft/{b}/dry-run", json={"days": 7}))
     _ok(_request(app, "GET", f"/api/profiles/draft/{b}/dry-run/{kicked['run_id']}"))
-    _ok(_request(app, "POST", "/api/profiles", json={"slug": b, "threshold": 0.0, "selected_topic_ids": []}))
+    _ok(_request(app, "POST", "/api/profiles", json={"slug": b, "threshold": 0.0, "selected_topic_ids": ensure_a_topic(b)}))
     _scan(app, a)
     _scan(app, b)
     _set_threshold(app, a, 0.9)

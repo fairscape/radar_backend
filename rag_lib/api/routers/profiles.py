@@ -219,10 +219,10 @@ def discard_left_edits(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
     body: EditTab | None = None,
 ) -> dict:
-    """Discard the user's Edit interest copies left behind unsaved: this
-    tab's own (closed or reloaded without leaving) and any not heard from
-    for 2 minutes. The site calls this when it opens anywhere but an edit
-    page; another tab's edit still going stays (FUNCTIONAL_SPEC E.7 R5)."""
+    """Discard this tab's own Edit interest copies left unsaved (closed or
+    reloaded without leaving). The site calls this when it opens anywhere
+    but an edit page. Another tab's copy stays, heard from or not: that tab
+    may come back and carry on (FUNCTIONAL_SPEC E.7 R5, user 2026-11-05)."""
     tab = body.tab if body else ""
     return {"discarded": len(edit_copy_service.discard_leftovers(db, int(user["id"]), tab))}
 
@@ -838,12 +838,21 @@ def open_edit(
 ) -> EditCopy:
     """Open Edit interest on saved interest ``key`` in tab ``body.tab``: a
     copy every step changes, saved with ``POST /draft/{slug}/save-edit``
-    or discarded with ``DELETE /draft/{slug}`` (FUNCTIONAL_SPEC E). Copies
-    left behind go first. 404 for no saved interest ``key``; 409 while
-    another tab edits it (first come first served, E.7 R5) or an import
-    still fills a copy of it."""
+    or discarded with ``DELETE /draft/{slug}`` (FUNCTIONAL_SPEC E). This
+    tab's own copies go first. 404 for no saved interest ``key``; 409 while
+    another tab edits it (first come first served, E.7 R5), or an import
+    still fills a copy of it; 409 with ``unsavedElsewhere`` when another
+    tab left a copy unheard for 2 minutes, until the page sends
+    ``discard_unsaved`` (the user confirmed dropping its changes)."""
     try:
-        copy = edit_copy_service.open_copy(db, user_id=int(user["id"]), slug=key, tab=body.tab if body else "")
+        copy = edit_copy_service.open_copy(db, user_id=int(user["id"]), slug=key, tab=body.tab if body else "",
+                                           discard_unsaved=bool(body and body.discard_unsaved))
+    except edit_copy_service.UnsavedElsewhere as exc:
+        # The page asks before discarding them, and sends discard_unsaved.
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT,
+                            content={"detail": str(exc), "unsavedElsewhere": True})
     except edit_copy_service.BeingEdited as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:       # the copy kept being taken meanwhile: a moment later works

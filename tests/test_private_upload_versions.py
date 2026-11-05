@@ -60,16 +60,8 @@ def pdfs(world, monkeypatch):
         d["openalex_id"] = f"local:{file_hash}"
         return d["openalex_id"], d
 
-    content_calls = []
-
-    def content(title, abstract, body, *, settings):
-        content_calls.append(body)
-        return json.dumps({"source": "pdf_content", "topics": [{"id": "T-content", "display_name": "From text"}]})
-
     monkeypatch.setattr(vault_service, "ingest_pdf", ingest)
     monkeypatch.setattr(vault_service, "_enrich_via_openalex", enrich)
-    monkeypatch.setattr(vault_service.content_topics, "try_topics_json", content)
-    world["content_calls"] = content_calls
     return world
 
 
@@ -153,11 +145,10 @@ def test_a_matched_upload_keeps_openalex_title_and_topics(pdfs):
     assert row["title"] == "Public Title"
     topics = json.loads(row["topics_json"])
     assert topics.get("source") != "pdf_content" and topics["primary_topic"]["id"] == TOPIC["id"]
-    assert pdfs["content_calls"] == []
+    # One OpenAlex does not have gets no topics from its text (user 11-04).
     u = _upload(pdfs, b"nothing known", A)
     assert u["canonicalId"] is None
-    assert json.loads(_row(pdfs["env"], u["id"])["topics_json"])["source"] == "pdf_content"
-    assert len(pdfs["content_calls"]) == 1
+    assert _row(pdfs["env"], u["id"])["topics_json"] is None
 
 
 def test_a_revised_file_is_a_new_version_and_the_old_one_stays_a_seed(pdfs):

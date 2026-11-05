@@ -50,7 +50,9 @@ def _seed_db(db_path) -> dict:
         name="neonatal_vitals",
         embedding_model="placeholder-v1",
         n_seed=0,
-        topic_filters={},
+        # A saved interest keeps a topic on (BT4): saving an edit refuses otherwise.
+        topic_filters={"topics": [{"id": "https://openalex.org/T10001", "display_name": "Test topic",
+                                   "count": 1, "on": True}]},
     )
     # An unrelated paper coming in via the gather path — must NOT show up
     # in the vault listing for this user (uploaded_by_user_id is NULL).
@@ -310,31 +312,36 @@ def test_a_pdf_without_a_title_is_named_after_the_uploaded_file(app, monkeypatch
     assert resp.json()["title"] == "Lab scan 2024"
 
 
-def test_an_unmatched_upload_gets_topics_from_its_own_text(app, tmp_path, monkeypatch):
-    """OpenAlex has no record of it (the stub client finds nothing), so the
-    PDF's text is read for topics; an embedder failure still uploads."""
-    from rag_lib import content_topics
+def test_an_unmatched_upload_gets_no_topics_from_its_own_text(app, tmp_path, monkeypatch):
+    """OpenAlex has no record of it (the stub client finds nothing): it has
+    no topics of its own -- none are guessed from its text (user 11-04).
+
+    A topic index and embedder that would answer are in place, so a guess
+    made anywhere on the way would be stored (the code before 11-04 stored
+    one here; without them it failed quietly and stored nothing)."""
+    import rag_lib.embedders as embedders
+    import rag_lib.umls.cache as umls_cache
     from rag_lib.db import connect as _connect
 
-    read = []
-    monkeypatch.setattr(content_topics, "topics_from_text", lambda title, body, settings: read.append(body) or [
-        {"id": "https://openalex.org/T9", "display_name": "Lab Notes", "subfield": None,
-         "field": None, "domain": None, "score": 0.7}])
+    class _Index:
+        def check_compatible(self, *a, **k):
+            pass
+
+        def search(self, vec, *, top_k, min_similarity):
+            return [({"id": "https://openalex.org/T9", "display_name": "Lab Notes"}, 0.9)]
+
+    monkeypatch.setattr(umls_cache, "get_topic_index", lambda *a, **k: _Index())
+    # Only what imports it late sees this (vault's own embedding is bound at import).
+    monkeypatch.setattr(embedders, "get_embedder", lambda model: (lambda text: [0.1] * 8))
+
     resp = _upload(app, b"unmatched-bytes", filename="notes.pdf")
     assert resp.status_code == 200, resp.text
     oa = resp.json()["id"]
-    assert oa.startswith("local:") and read == ["hello world from a fake pdf"]
+    assert oa.startswith("local:")
     conn = _connect(tmp_path / "radar.db")
-    stored = json.loads(conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa,)).fetchone()[0])
+    stored = conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa,)).fetchone()[0]
     conn.close()
-    assert stored["source"] == content_topics.SOURCE
-    assert [t["display_name"] for t in stored["topics"]] == ["Lab Notes"]
-
-    def down(*a, **k):
-        raise RuntimeError("ollama down")
-    monkeypatch.setattr(content_topics, "topics_from_text", down)
-    resp = _upload(app, b"other-unmatched-bytes", filename="more.pdf")
-    assert resp.status_code == 200, resp.text
+    assert stored is None
 
 
 def test_upload_size_limit(app, monkeypatch):

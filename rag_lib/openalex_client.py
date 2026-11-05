@@ -16,11 +16,16 @@ into a reusable class. Used by two callers with different intents:
     integration surface present while the body is written.
 
 All requests carry ``mailto`` for the OpenAlex polite pool. mailto is
-required at construction — no baked-in default.
+required at construction — no baked-in default. They also carry
+``api_key`` when ``RADAR_OPENALEX_API_KEY`` is set (or one is passed): the
+key never leaves this module in an error -- every error text made here has
+it replaced by ``<api_key>`` (``_scrub``), and an HTTP error is re-raised
+without the original, whose message is the full request URL.
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -68,6 +73,20 @@ def _wait_for_wide_slot() -> None:
         _wide_next = time.monotonic() + WIDE_OR_SECONDS
 
 
+def _configured_api_key() -> str | None:
+    """``RADAR_OPENALEX_API_KEY`` from the backend's settings, None without one."""
+    try:
+        from .api.settings import get_settings
+
+        return get_settings().RADAR_OPENALEX_API_KEY
+    except Exception:  # noqa: BLE001 -- a script without the settings: no key
+        return None
+
+
+# An ``api_key=`` query value, in any URL an error message quotes (BT1).
+_API_KEY_PARAM = re.compile(r"(api_key=)[^&\s'\"]+")
+
+
 class OpenAlexClient:
     def __init__(
         self,
@@ -77,6 +96,7 @@ class OpenAlexClient:
         user_agent: str | None = None,
         rate_limit_sleep: float = 0.15,
         session: requests.Session | None = None,
+        api_key: str | None = None,
     ):
         if not mailto:
             raise ValueError("OpenAlexClient requires mailto for the polite pool.")
@@ -87,6 +107,22 @@ class OpenAlexClient:
         self.session = session or requests.Session()
         self.session.headers.setdefault("User-Agent", self.user_agent)
         self._api_calls = 0
+        self.api_key = (api_key if api_key is not None else _configured_api_key()) or None
+
+    def _scrub(self, text: str) -> str:
+        """``text`` without the API key (an error's URL carries it).
+
+        Every way it can be written (review BT1, classes 13/17): as is, and
+        URL-encoded the way requests puts it in a query (``+ / =`` and spaces
+        become ``%2B %2F %3D +``), and any ``api_key=`` value in a URL."""
+        if not self.api_key:
+            return text
+        from urllib.parse import quote, quote_plus
+
+        for form in sorted({self.api_key, quote(self.api_key, safe=""), quote_plus(self.api_key)},
+                           key=len, reverse=True):
+            text = text.replace(form, "<api_key>")
+        return _API_KEY_PARAM.sub(r"\1<api_key>", text)
 
     # ------------------------------------------------------------------
     # Low-level HTTP
@@ -101,11 +137,14 @@ class OpenAlexClient:
         self._api_calls += 1
         p = dict(params or {})
         p["mailto"] = self.mailto
+        if self.api_key:
+            p["api_key"] = self.api_key
         url = f"{self.base_url}{path}"
         try:
             r = self.session.get(url, params=p, timeout=30)
         except requests.RequestException as exc:
-            raise OpenAlexUnavailable("down", detail=f"{type(exc).__name__}: {exc}"[:300]) from exc
+            # Not chained: the original's text is the URL, key included.
+            raise OpenAlexUnavailable("down", detail=self._scrub(f"{type(exc).__name__}: {exc}")[:300]) from None
         code = getattr(r, "status_code", 200)
         # Single attempt. Auto-retry on 429 wastes quota and extends the
         # cooldown when many simultaneous requests share an IP. Surface
@@ -117,7 +156,8 @@ class OpenAlexClient:
             reset = headers.get("X-RateLimit-Reset", "?")
             body = ""
             try:
-                body = r.text[:200]
+                # Scrubbed before it is cut: a key across the cut kept its first half.
+                body = self._scrub(r.text)[:200]
             except Exception:
                 pass
             if str(remaining).strip() == "0":
@@ -139,18 +179,29 @@ class OpenAlexClient:
                         f"Body: {body!r}"),
             )
         if code in (401, 403):
-            until = openalex_status.pause("auth")
-            raise OpenAlexUnavailable("auth", until=until, response=r, detail=f"OpenAlex {code}")
+            # With a key configured, it is the key OpenAlex refuses (BT2).
+            kind = "key" if self.api_key else "auth"
+            until = openalex_status.pause(kind)
+            body = ""
+            try:
+                body = self._scrub(r.text)[:200]
+            except Exception:
+                pass
+            raise OpenAlexUnavailable(kind, until=until, response=r, detail=f"OpenAlex {code}: {body!r}")
         if isinstance(code, int) and code >= 500:
             raise OpenAlexUnavailable("down", response=r, detail=f"OpenAlex {code}")
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as exc:
+            # Its message is "... for url: <the request URL>": key included.
+            raise requests.HTTPError(self._scrub(str(exc)), response=r) from None
         if self.rate_limit_sleep:
             time.sleep(self.rate_limit_sleep)
         try:
             return r.json()
         except ValueError as exc:
             # A 200 that is not JSON (a proxy's error page): no answer either.
-            raise OpenAlexUnavailable("down", response=r, detail=f"not JSON: {exc}"[:300]) from exc
+            raise OpenAlexUnavailable("down", response=r, detail=self._scrub(f"not JSON: {exc}")[:300]) from None
 
     @property
     def api_calls(self) -> int:

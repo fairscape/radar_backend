@@ -2,7 +2,8 @@
 
 A version is a ``papers`` row under ``local:upload:<user_id>:<sha256>:<token>``
 (one per upload, CR.10; ``local:upload:<user_id>:<sha256>`` before, migration 0029). It holds what was read from that user's file -- body
-text, embeddings, UMLS concepts, content topics -- and a copy of the
+text, embeddings, UMLS concepts (topics guessed from the text, until
+2026-11-04: rag_lib.content_topics) -- and a copy of the
 public record's metadata when OpenAlex matched it. The public row
 (``https://openalex.org/W...``) is bibliographic only: the same work
 uploaded by two users, or twice by one user with different bytes, never
@@ -317,7 +318,9 @@ def parse_pending(conn: sqlite3.Connection, *, limit: int = 20) -> int:
         cur = conn.execute("UPDATE paper_versions SET parsed = 1 WHERE version_id = ? AND parsed = 0", (vid,))
         if cur.rowcount:
             # The title stays: it is OpenAlex's (or the upload's), and
-            # ingest_pdf falls back to the file name, here the hash.
+            # ingest_pdf falls back to the file name, here the hash. Topics
+            # once guessed from the old file's text go (none are guessed
+            # now: rag_lib.content_topics).
             conn.execute(
                 """UPDATE papers SET body_text = ?, n_pages = COALESCE(?, n_pages),
                    umls_concepts_json = NULL, umls_mapped_topics_json = NULL,

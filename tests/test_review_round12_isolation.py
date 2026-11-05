@@ -54,6 +54,8 @@ NO_USER_DATA = {
     # Needs a sign-in session (self_rid), which this header-model world
     # has none of; B-cannot-see-A's-import is test_api_my_prosopia.py::
     # test_another_users_import_is_not_mine.
+    ("POST", "/api/users/me/lease"): "the caller's own lease (test_write_lease.py::test_accounts_are_separate)",
+    ("POST", "/api/users/me/lease/release"): "the caller's own lease (test_write_lease.py::test_accounts_are_separate)",
     ("GET", "/api/users/me/prosopia"): "the caller's own Prosopia profile (tested for isolation in test_api_my_prosopia.py)",
 }
 
