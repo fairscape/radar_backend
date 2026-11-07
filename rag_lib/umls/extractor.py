@@ -256,6 +256,7 @@ def _main() -> int:
     print(f"min conf     : {settings.RADAR_UMLS_MIN_CONFIDENCE}")
     print(f"max concepts : {settings.RADAR_UMLS_MAX_CONCEPTS}")
     print(f"embed model  : {settings.RADAR_UMLS_EMBEDDING_MODEL}")
+    print(f"topic sim    : {settings.RADAR_UMLS_TOPIC_MIN_SIMILARITY}")
     print(f"topic conf   : {settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE}  "
           f"per seed {settings.RADAR_UMLS_TOPICS_PER_PAPER}")
     print(f"max additions: {settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS}")
@@ -391,6 +392,7 @@ def _main() -> int:
         base,
         per_paper,
         min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
+        min_similarity=settings.RADAR_UMLS_TOPIC_MIN_SIMILARITY,
         per_paper=settings.RADAR_UMLS_TOPICS_PER_PAPER,
         max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
         cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
@@ -536,7 +538,7 @@ def _main_paper(argv: list[str]) -> int:
               "         --pdf FILE | --text FILE | --title T --abstract A\n"
               "       optional: --min-confidence F  --max-concepts N  "
               "--max-additions N\n"
-              "                 --topic-confidence F  --per-paper N  --spacy-model M  "
+              "                 --topic-confidence F  --topic-similarity F  --per-paper N  --spacy-model M  "
               "--cache-dir D")
         return 2
     else:
@@ -705,18 +707,20 @@ def _main_paper(argv: list[str]) -> int:
     # -----------------------------------------------------------------
     #
     # Each concept's name is embedded and its one nearest topic in the
-    # precomputed index taken, however near: the topics are chosen on the
-    # concepts' confidence in stage 3, not on this similarity.
+    # precomputed index taken, however near; stage 3 chooses on the
+    # concepts' confidence and leaves out a topic under the similarity bar.
     from .topic_mapper import map_concepts_to_topics, merge_umls_topics
 
     try:
         emb = _flag("--embedding-model") or s.RADAR_UMLS_EMBEDDING_MODEL
         min_conf_t = float(_flag("--topic-confidence") or s.RADAR_UMLS_TOPIC_MIN_CONFIDENCE)
+        min_sim_t = float(_flag("--topic-similarity") or s.RADAR_UMLS_TOPIC_MIN_SIMILARITY)
         per_seed = int(_flag("--per-paper") or s.RADAR_UMLS_TOPICS_PER_PAPER)
         max_add = int(_flag("--max-additions") or s.RADAR_UMLS_MAX_TOPIC_ADDITIONS)
     except NameError:  # settings never loaded
         emb = _flag("--embedding-model") or "mxbai-embed-large"
         min_conf_t = float(_flag("--topic-confidence") or 0.9)
+        min_sim_t = float(_flag("--topic-similarity") or 0.80)
         per_seed = int(_flag("--per-paper") or 5)
         max_add = int(_flag("--max-additions") or 20)
 
@@ -757,7 +761,7 @@ def _main_paper(argv: list[str]) -> int:
                 for t in base.get("topics", []) if t.get("id")]
 
     print("\n" + "=" * 96)
-    print(f"stage 3 — choosing the topics (confidence >= {min_conf_t}, {per_seed} a seed, "
+    print(f"stage 3 — choosing the topics (confidence >= {min_conf_t}, similarity >= {min_sim_t}, {per_seed} a seed, "
           f"at most {max_add}; added switched off)")
     print("=" * 96)
     if not topics_json:
@@ -769,7 +773,7 @@ def _main_paper(argv: list[str]) -> int:
         print(f"    {name[:66]}")
 
     merged = merge_umls_topics(
-        base, [mapped], min_confidence=min_conf_t, per_paper=per_seed,
+        base, [mapped], min_confidence=min_conf_t, min_similarity=min_sim_t, per_paper=per_seed,
         max_additions=max_add, cache_dir=cache,
     )
     offered = [t for t in (merged.get("topics") or []) if t.get("source") == "umls"]
@@ -777,7 +781,7 @@ def _main_paper(argv: list[str]) -> int:
     # Narrate the same decisions, then check the narration against the real
     # merge — same contract as the stage-1 walkthrough above.
     from .cache import get_topic_index
-    from .topic_mapper import _embedding_similarity, _is_near_duplicate
+    from .topic_mapper import _embedding_similarity, _is_near_duplicate, _reaches
 
     try:
         index = get_topic_index(cache)
@@ -791,14 +795,17 @@ def _main_paper(argv: list[str]) -> int:
     seen_names = {n.lower() for _, n in existing if n}
     for m in sorted(mapped, key=lambda x: (-(x.confidence or 0), x.display_name.lower(), x.topic_id)):
         dup = None
-        if (m.confidence or 0) >= min_conf_t and m.topic_id not in seen_ids \
+        if _reaches(m.confidence, min_conf_t) and _reaches(m.similarity, min_sim_t) \
+                and m.topic_id not in seen_ids \
                 and m.display_name.lower() not in seen_names:
             dup = next(((en, _embedding_similarity(index, m.topic_id, eid))
                         for eid, en in existing
                         if _is_near_duplicate(index, m.topic_id, m.display_name, eid, en)),
                        None)
-        if (m.confidence or 0) < min_conf_t:
+        if not _reaches(m.confidence, min_conf_t):
             why = f"skip  confidence under {min_conf_t}"
+        elif not _reaches(m.similarity, min_sim_t):
+            why = f"skip  similarity {m.similarity} under {min_sim_t}"
         elif m.topic_id in seen_ids or m.display_name.lower() in seen_names:
             why = "skip  the paper's own topic"
         elif dup:

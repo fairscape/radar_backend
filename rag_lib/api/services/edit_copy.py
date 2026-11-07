@@ -89,6 +89,21 @@ class BeingEdited(RuntimeError):
         self.slug = slug
 
 
+
+def _topics_on(raw: str | None) -> frozenset[str] | None:
+    """The topics switched on in a stored topic list (None: no list)."""
+    from ...openalex_tiers import is_enabled
+
+    try:
+        tf = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    topics = tf.get("topics") if isinstance(tf, dict) else None
+    if not isinstance(topics, list):
+        return None
+    return frozenset(str(t["id"]).replace("https://openalex.org/", "")
+                     for t in topics if isinstance(t, dict) and t.get("id") and is_enabled(t))
+
 def copy_of(conn: sqlite3.Connection, profile_id: int) -> sqlite3.Row | None:
     """The copy of interest ``profile_id`` open in Edit interest, if any,
     heard from or not."""
@@ -329,8 +344,11 @@ def save_copy(conn: sqlite3.Connection, *, user_id: int, slug: str) -> str:
     except BaseException:
         conn.rollback()
         raise
+    # The threshold, the years and the topics switched on (rule B,
+    # candidates.TOPIC_ON) decide which stored papers are in the feed.
     if (copy["threshold"] != original["threshold"] or copy["year_from"] != original["year_from"]
-            or copy["year_to"] != original["year_to"]):
+            or copy["year_to"] != original["year_to"]
+            or _topics_on(copy["topic_filters_json"]) != _topics_on(original["topic_filters_json"])):
         from ...scheduler.jobs import rescore_pool
 
         # Saved by now: a failure here must not answer "not saved" (a retry

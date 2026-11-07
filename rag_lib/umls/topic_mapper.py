@@ -35,7 +35,7 @@ class MappedTopic:
 
     topic_id: str  # e.g. "https://openalex.org/T12345"
     display_name: str
-    similarity: float  # concept name to topic name; shown, not used to choose
+    similarity: float  # concept name to topic name; under SIMILARITY it is not chosen
     source_cui: str  # which UMLS concept triggered this match
     source_name: str  # UMLS concept name for traceability
     # The concept's confidence (how surely the text's words are this
@@ -50,8 +50,12 @@ class MappedTopic:
 # How the UMLS topics of an interest are chosen (FUNCTIONAL_SPEC U.2):
 # from each seed, its concepts of CONFIDENCE or more, each with its one
 # nearest topic, PER_PAPER of them by confidence; at most MAX_TOPICS for
-# the interest, by confidence. They are added switched off.
+# the interest, by confidence. They are added switched off. A concept
+# whose nearest topic is under SIMILARITY to it is not used (UT-1): the
+# mapping is a stretch ("BaseLine dental cement" -> "Dental materials and
+# restorations", 0.665).
 CONFIDENCE = 0.9
+SIMILARITY = 0.80
 PER_PAPER = 5
 MAX_TOPICS = 20
 
@@ -70,8 +74,9 @@ def map_concepts_to_topics(
     """Each concept's nearest OpenAlex topic, by embedding its name.
 
     One entry per concept, in the order given, however near or far the
-    topic is: which of them an interest gets is decided on the concepts'
-    confidence (merge_umls_topics), not on this similarity.
+    topic is: all are stored, and which of them an interest gets is
+    decided when its topics are chosen (merge_umls_topics: the concept's
+    confidence, and this similarity of SIMILARITY or more).
     """
     if not concepts or not cache_dir:
         return []
@@ -98,6 +103,13 @@ def map_concepts_to_topics(
                 confidence=round(float(concept.confidence), 4),
             ))
     return out
+
+
+def _reaches(value: float | None, bar: float) -> bool:
+    """Whether a confidence or similarity is ``bar`` or more. None and NaN
+    (a zero-vector embedding) do not: ``NaN < bar`` is False, so a plain
+    "under the bar" test let NaN through (review 2026-11-06 L3)."""
+    return value is not None and value >= bar
 
 
 def stale_mapping(entries: list[dict]) -> bool:
@@ -162,6 +174,7 @@ def merge_umls_topics(
     umls_topics_per_paper: list[list[MappedTopic]],
     *,
     min_confidence: float = CONFIDENCE,
+    min_similarity: float = SIMILARITY,
     per_paper: int = PER_PAPER,
     max_additions: int = MAX_TOPICS,
     cache_dir: str | None = None,
@@ -170,8 +183,9 @@ def merge_umls_topics(
     """``base_filters`` with the UMLS topics of its seeds appended, switched
     off (FUNCTIONAL_SPEC U.2).
 
-    Chosen on the concepts' confidence alone. In each seed, the concepts
-    of ``min_confidence`` or more, by confidence: one whose topic the
+    Chosen on the concepts' confidence. In each seed, the concepts of
+    ``min_confidence`` or more whose topic is ``min_similarity`` or more
+    similar to them (UT-1), by confidence: one whose topic the
     interest already has (same id or name, or an embedding cosine of
     _DEDUP_COSINE_THRESHOLD or more to one of ``base_filters``' topics)
     is skipped, and so is one whose topic a concept of the same seed
@@ -249,7 +263,7 @@ def merge_umls_topics(
         for mt in sorted(paper_topics, key=by_confidence):
             if len(chosen) >= per_paper:
                 break
-            if mt.confidence is None or mt.confidence < min_confidence:
+            if not _reaches(mt.confidence, min_confidence) or not _reaches(mt.similarity, min_similarity):
                 continue
             name = mt.display_name.lower()
             if name in chosen or has_already(mt):

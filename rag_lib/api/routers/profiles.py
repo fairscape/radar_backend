@@ -1306,6 +1306,17 @@ def update_terms(
     row = profiles_repo.get_by_slug(db, int(user["id"]), key)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"profile '{key}' not found")
+    # Text that looks like an API key is not kept (rag_lib/secret_text.py):
+    # refused when new, let through when the record already holds it, so the
+    # one stored before the rule can still be deleted for good (RD).
+    from rag_lib.secret_text import MESSAGE as SECRET_MESSAGE, looks_like_secret
+
+    stored = interest_terms.load(row) or {}
+    had = {t.get("label") for k in ("terms", "removed") for t in (stored.get(k) or []) if isinstance(t, dict)}
+    had |= set(stored.get("not_interests") or [])
+    sent = [*(t.label for t in body.terms), *(t.label for t in body.removed), *body.not_interests]
+    if any(looks_like_secret(x) and x not in had for x in sent):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=SECRET_MESSAGE)
     if body.source:   # a preview being kept: its provenance comes with it
         if body.source not in ("prosopia", "rp-sdk-llm", "rp-sdk-cluster"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"unknown source '{body.source}'")
@@ -1367,7 +1378,9 @@ def save_topics(
     db: Annotated[sqlite3.Connection, Depends(get_db)],
 ) -> list[Topic]:
     """Switch the interest's topics: exactly ``selected_topic_ids`` on. 409
-    when that would leave none on. Takes effect from the next scan."""
+    when that would leave none on. A topic switched off takes the papers it
+    brought out of the feed (rule B, candidates.TOPIC_ON); one switched on
+    is searched from the next scan."""
     _editable(db, int(user["id"]), key)
     try:
         topic_filters = wizard_service.save_topics(
@@ -1997,7 +2010,7 @@ def reranker_comparison(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {candidates_repo.PASSES} AND {candidates_repo.IN_YEARS}
+          AND {candidates_repo.PASSES} AND {candidates_repo.IN_YEARS} AND {candidates_repo.TOPIC_ON}
           AND {candidates_repo.NOT_SEED}
           -- Every row the feed ranks: the pool rescore blends a row with
           -- no reranker logit at the pool median (scoring/pool.py), and
@@ -2112,7 +2125,8 @@ def topic_yield(
 
     # Topics that sourced candidates but have since been dropped from
     # topic_filters (re-aggregation after the seed set changed). Their
-    # papers are still in the radar, so the yield stays visible.
+    # papers stay stored, and in the feed while one of their own topics is
+    # on (rule B), so the yield stays visible.
     for tid, row in tallies.items():
         out.append(TopicYield(
             topic_id=tid,

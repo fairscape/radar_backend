@@ -3,8 +3,10 @@
 The merge decides which UMLS-derived topics get appended to a profile's
 ``topic_filters``; switched on, they feed the OpenAlex gatherer's query,
 and a bad pick pulls off-topic papers into the candidate pool. They are
-chosen on the concepts' confidence alone: from each seed its concepts of
-0.9 or more, five of them, at most twenty for the interest; added off.
+chosen on the concepts' confidence: from each seed its concepts of 0.9 or
+more whose nearest topic is 0.80 or more similar to them (UT-1), five of
+them, at most twenty for the interest; added off. The fixtures' mappings
+are near (0.85) unless a test is about the similarity bar.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from rag_lib.umls import topic_mapper
 from rag_lib.umls.topic_mapper import MappedTopic, merge_umls_topics
 
 
-def _mt(tid: str, name: str, conf: float, concept: str = "concept", sim: float = 0.5) -> MappedTopic:
+def _mt(tid: str, name: str, conf: float, concept: str = "concept", sim: float = 0.85) -> MappedTopic:
     return MappedTopic(
         topic_id=tid if tid.startswith("https://") else f"https://openalex.org/{tid}",
         display_name=name,
@@ -144,12 +146,39 @@ def test_a_mapping_without_confidence_adds_nothing():
     assert _umls_ids(merge_umls_topics(_base("Base"), [[old]])) == []
 
 
-def test_similarity_does_not_choose():
-    """A concept mapped to a topic far from its name still counts on its
-    confidence; the similarity is not a threshold or a rank."""
+def test_similarity_is_a_bar_not_a_rank():
+    """UT-1 / UT-a: a concept whose nearest topic is under 0.80 to it is
+    not used and the next concept takes its place; at or above the bar the
+    confidence alone ranks (a nearer topic does not win)."""
+    assert topic_mapper.SIMILARITY == 0.80
     near = _mt("T900", "Near", 0.91, sim=0.95)
-    far = _mt("T901", "Far", 0.99, sim=0.10)
-    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1)) == ["Far"]
+    at_bar = _mt("T902", "At bar", 0.95, sim=0.80)
+    far = _mt("T901", "Far", 0.99, sim=0.79)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1)) == ["Near"]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, at_bar, far]], per_paper=1)) == ["At bar"]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1,
+                                       min_similarity=0.5)) == ["Far"]
+
+
+def test_scope_noise_is_no_longer_offered():
+    """UT-b: SCoPe's two concepts as stored on the live paper (11-06)."""
+    cement = _mt("T10113", "Dental materials and restorations", 0.9843,
+                 concept="BaseLine dental cement", sim=0.6654)
+    algebra = _mt("T11727", "Advanced Algebra and Logic", 0.9687,
+                  concept="Expression procedure", sim=0.6238)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[cement, algebra]])) == []
+
+
+def test_a_mapping_without_similarity_is_not_used():
+    bare = MappedTopic(topic_id="https://openalex.org/T900", display_name="Bare",
+                       similarity=None, source_cui="C1", source_name="x", confidence=0.99)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[bare]])) == []
+
+
+def test_the_setting_reaches_the_merge():
+    from rag_lib.api.settings import Settings
+
+    assert Settings.model_fields["RADAR_UMLS_TOPIC_MIN_SIMILARITY"].default == 0.80
 
 
 def test_stale_mapping_is_recognised():
@@ -391,3 +420,66 @@ def test_a_topic_the_profile_wants_is_already_the_interests():
     paper = [_mt("T900", "Wanted", 0.99)] + [_mt(f"T9{i}{i}", f"Topic {i}", 0.98 - i / 100) for i in range(1, 6)]
     out = merge_umls_topics(_base("Base"), [paper], also_have=wanted)
     assert _umls_ids(out) == [f"Topic {i}" for i in range(1, 6)]
+
+
+def test_every_merge_passes_the_similarity_setting():
+    """Class check (UT-d): each merge_umls_topics call in rag_lib passes
+    min_similarity, so the setting is not silently the library default."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    missing = []
+    for path in root.joinpath("rag_lib").rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if rel in ("rag_lib/umls/__init__.py", "rag_lib/umls/topic_mapper.py"):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and (getattr(node.func, "id", None)
+                                               or getattr(node.func, "attr", None)) == "merge_umls_topics":
+                if not any(k.arg == "min_similarity" for k in node.keywords):
+                    missing.append(f"{rel}:{node.lineno}")
+    assert missing == []
+
+
+@pytest.mark.parametrize("field", ["confidence", "similarity"])
+def test_nan_does_not_pass_a_bar(field):
+    """Review L3: ``NaN < bar`` is False, so NaN used to pass."""
+    import dataclasses
+
+    nan = dataclasses.replace(_mt("T900", "Nan", 0.99), **{field: float("nan")})
+    good = _mt("T901", "Good", 0.95)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[nan, good]], per_paper=1)) == ["Good"]
+
+
+SCORE_BARS = ["RADAR_UMLS_MIN_CONFIDENCE", "RADAR_UMLS_TOPIC_MIN_CONFIDENCE", "RADAR_UMLS_TOPIC_MIN_SIMILARITY",
+              "RADAR_RERANKER_MIN_UMLS_CONFIDENCE", "RADAR_LLM_TOPIC_MIN_SIMILARITY",
+              "RADAR_LLM_TOPIC_EXTRA_SIMILARITY"]
+
+
+@pytest.mark.parametrize("field", SCORE_BARS)
+@pytest.mark.parametrize("value,ok", [("80", False), ("-0.1", False), ("1.01", False),
+                                      ("0", True), ("1", True), ("0.8", True)])
+def test_a_score_bar_outside_0_to_1_stops_the_start(monkeypatch, field, value, ok):
+    """Review L4: 80 for 0.80 quietly dropped everything."""
+    from pydantic import ValidationError
+
+    from rag_lib.api.settings import Settings
+
+    monkeypatch.setenv("RADAR_REQUIRE_AUTH", "false")
+    monkeypatch.setenv(field, value)
+    if ok:
+        assert getattr(Settings(_env_file=None), field) == float(value)
+    else:
+        with pytest.raises(ValidationError, match="between 0 and 1"):
+            Settings(_env_file=None)
+
+
+def test_every_score_bar_setting_is_checked():
+    """Class check: a float setting named like a bar (CONFIDENCE / SIMILARITY)
+    is in the 0-1 check."""
+    from rag_lib.api.settings import Settings
+
+    bars = sorted(n for n, f in Settings.model_fields.items()
+                  if f.annotation is float and ("CONFIDENCE" in n or "SIMILARITY" in n))
+    assert bars == sorted(SCORE_BARS)

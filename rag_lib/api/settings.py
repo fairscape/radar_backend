@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     # added switched off: words matched literally (a misread "Baseline" is
     # dental cement at 1.0), so the user picks.
     RADAR_UMLS_TOPIC_MIN_CONFIDENCE: float = 0.9
+    # ...and only a concept whose nearest topic is this close to its name
+    # (UT-1): "BaseLine dental cement" -> "Dental materials and
+    # restorations" is 0.665.
+    RADAR_UMLS_TOPIC_MIN_SIMILARITY: float = 0.80
     RADAR_UMLS_TOPICS_PER_PAPER: int = 5
     RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 20
     RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"
@@ -197,6 +201,18 @@ class Settings(BaseSettings):
         # field would otherwise refuse "" and stop the backend starting.
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator(
+        "RADAR_UMLS_MIN_CONFIDENCE", "RADAR_UMLS_TOPIC_MIN_CONFIDENCE", "RADAR_UMLS_TOPIC_MIN_SIMILARITY",
+        "RADAR_RERANKER_MIN_UMLS_CONFIDENCE", "RADAR_LLM_TOPIC_MIN_SIMILARITY", "RADAR_LLM_TOPIC_EXTRA_SIMILARITY",
+    )
+    @classmethod
+    def _a_score_bar(cls, value: float, info) -> float:
+        # A confidence or similarity bar: 80 for 0.80 would quietly drop
+        # every concept or topic (review 2026-11-06 L4), so it stops the start.
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{info.field_name} must be between 0 and 1, got {value!r}")
         return value
 
     @field_validator("RADAR_LLM_PROVIDER", mode="before")

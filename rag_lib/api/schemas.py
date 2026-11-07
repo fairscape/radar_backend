@@ -13,7 +13,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
+
+from rag_lib.secret_text import refuse_secret
+
+# Typed text the server keeps: refused when it looks like an API key (rag_lib/secret_text.py).
+NoSecret = AfterValidator(refuse_secret)
 
 
 # Rank-percentile fallback cut-points for ``bucket`` when a candidate row
@@ -523,9 +528,10 @@ class InterestTermsUpdate(_Model):
                 raise ValueError(f"a research topic is at most {MAX_TERM_LABEL} characters")
         return self
     source: str | None = None
-    model: str | None = None
-    generated_at: str | None = None
-    seed_hash: str | None = None
+    # Labels are checked in the route: one already stored passes (to be deleted).
+    model: Annotated[str | None, NoSecret] = None
+    generated_at: Annotated[str | None, NoSecret] = None
+    seed_hash: Annotated[str | None, NoSecret] = None
     usage: dict[str, Any] | None = None
     edited: bool | None = None
 
@@ -667,7 +673,7 @@ class DraftSummary(_Model):
 class DraftCreateRequest(_Model):
     # A 100,000-character name made a draft whose URL no page could open
     # and no delete could reach.
-    name: str = Field(min_length=1, max_length=MAX_NAME)
+    name: Annotated[str, Field(min_length=1, max_length=MAX_NAME), NoSecret]
     # Plugin keys. Both default to ``None`` so the router can fall back
     # to the configured ``RADAR_DEFAULT_EMBEDDING_MODEL`` and the
     # built-in ``"centroid"`` selector. Any registered key from
@@ -690,9 +696,9 @@ class ProsopiaImportRequest(_Model):
     create-draft route.
     """
 
-    ref: str
-    base_url: str | None = None
-    name: str | None = Field(default=None, max_length=MAX_NAME)
+    ref: Annotated[str, NoSecret]
+    base_url: Annotated[str | None, NoSecret] = None
+    name: Annotated[str | None, Field(max_length=MAX_NAME), NoSecret] = None
     embedding_model: str | None = None
     # The ``id`` values from GET /api/import/prosopia/works to keep;
     # omitted = every paper on the profile.
@@ -795,9 +801,9 @@ class OrcidImportRequest(_Model):
     draft is named after the author unless ``name`` says otherwise.
     """
 
-    orcid: str
+    orcid: Annotated[str, NoSecret]
     openalex_ids: list[str]
-    name: str | None = Field(default=None, max_length=MAX_NAME)
+    name: Annotated[str | None, Field(max_length=MAX_NAME), NoSecret] = None
     embedding_model: str | None = None
     # A draft to add these works to, instead of opening a new one: the
     # wizard's "add papers from another ORCID" once a draft exists.
@@ -1097,8 +1103,8 @@ class ResearcherImportRequest(_Model):
     """
 
     source: str
-    ref: str
-    base_url: str | None = None
+    ref: Annotated[str, NoSecret]
+    base_url: Annotated[str | None, NoSecret] = None
     paper_ids: list[str] | None = None
     embedding_model: str | None = None
     # "Check for new papers" on this stored profile. Without it a person
@@ -1121,7 +1127,7 @@ class ResearcherInterestRequest(_Model):
     """Body of ``POST /api/researchers/{id}/interests``: a draft named
     ``name`` seeded with ``openalex_ids`` (omitted = every paper)."""
 
-    name: str = Field(min_length=1, max_length=MAX_NAME)
+    name: Annotated[str, Field(min_length=1, max_length=MAX_NAME), NoSecret]
     openalex_ids: list[str] | None = None
     embedding_model: str | None = None
 
@@ -1339,7 +1345,7 @@ class MyProsopia(_Model):
 class UserUpdateRequest(_Model):
     """Body of ``PATCH /api/users/me``."""
 
-    mailto: str | None = Field(default=None, max_length=MAX_EMAIL)
+    mailto: Annotated[str | None, Field(max_length=MAX_EMAIL), NoSecret] = None
 
 
 # ---------------------------------------------------------------------------

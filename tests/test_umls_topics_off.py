@@ -48,8 +48,8 @@ def _seed(conn, pid, oid, mapped):
     conn.commit()
 
 
-def _mt(tid, name, conf, concept):
-    return MappedTopic(topic_id=f"https://openalex.org/{tid}", display_name=name, similarity=0.6,
+def _mt(tid, name, conf, concept, sim=0.85):
+    return MappedTopic(topic_id=f"https://openalex.org/{tid}", display_name=name, similarity=sim,
                        source_cui="C1", source_name=concept, confidence=conf).to_dict()
 
 
@@ -143,3 +143,26 @@ def test_concepts_with_no_mapping_at_all_were_mapped_by_the_earlier_rules(db):
     got = dict(conn.execute("SELECT openalex_id, umls_concepts_json FROM papers").fetchall())
     assert got["W1"] is None          # sent back
     assert got["W2"] == "[]"          # nothing found is a result
+
+
+def test_ut_a_through_the_wizard_a_concept_under_the_bar_is_not_offered(db):
+    """Review M1 (FUNCTIONAL_SPEC UT-1): through the real aggregation, a sure
+    concept whose topic is under 0.80 to it is left out and the next one
+    takes its place."""
+    conn, pid = db
+    _seed(conn, pid, "W1", [_mt("T9", "Dental materials and restorations", 0.99, "BaseLine dental cement", sim=0.79),
+                            _mt("T7", "Immune Response and Inflammation", 0.95, "Immune response", sim=0.80)])
+    ids = {t["id"] for t in wizard_service._aggregate_topics(conn, pid, new_on=True)["topics"]}
+    assert "https://openalex.org/T9" not in ids
+    assert "https://openalex.org/T7" in ids
+
+
+def test_ut_a_the_wizard_follows_the_setting(db, monkeypatch):
+    from rag_lib.api import settings as settings_mod
+
+    conn, pid = db
+    _seed(conn, pid, "W1", [_mt("T9", "Dental materials and restorations", 0.99, "BaseLine dental cement", sim=0.79)])
+    monkeypatch.setenv("RADAR_UMLS_TOPIC_MIN_SIMILARITY", "0.5")
+    settings_mod.get_settings.cache_clear()
+    ids = {t["id"] for t in wizard_service._aggregate_topics(conn, pid, new_on=True)["topics"]}
+    assert "https://openalex.org/T9" in ids

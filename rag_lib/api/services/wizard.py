@@ -1251,7 +1251,8 @@ def save_topics(
     Re-aggregates first, so a topic the seeds gained since the last
     aggregation can be switched on. Raises ``ValueError`` when topics exist
     but none would be on -- a scan needs at least one. Papers already found
-    through a topic switched off stay; it only narrows the next scans.
+    through a topic switched off stay stored but leave the feed until one of
+    their topics is on again (rule B, ``candidates.TOPIC_ON``).
     """
     row = _require_profile(conn, user_id, slug)
     profile_id = int(row["id"])
@@ -1277,9 +1278,9 @@ def save_topics(
 
 
 def scan_outdated(conn: sqlite3.Connection, *, user_id: int, slug: str) -> dict:
-    """Whether the recommendations no longer match the interest: the topics
-    switched on, or the seeds, are not the ones its last successful scan
-    searched and scored with (FUNCTIONAL_SPEC T.2-4, E.2-5). For a copy
+    """Whether the recommendations no longer match the interest: a topic
+    switched on that its last successful scan did not search, or seeds other
+    than the ones it scored with (FUNCTIONAL_SPEC T.2-4, E.2-5). For a copy
     being edited, its topics and seeds against the saved interest's last
     scan, or against the saved interest itself when that scan recorded no
     seeds or topics (E.9). ``{"topics": bool, "seeds": bool}``; for a saved
@@ -1306,7 +1307,10 @@ def outdated(conn: sqlite3.Connection, profile_id: int) -> dict:
             seeds = profiles_repo.list_seed_openalex_ids(conn, scanned)
     now_topics = set(enabled_topic_ids(_stored_topic_filters(conn, profile_id)))
     now_seeds = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
-    return {"topics": topics is not None and now_topics != set(topics),
+    # A topic switched off since leaves the feed at once (rule B,
+    # candidates.TOPIC_ON); only one switched on that the scan did not
+    # search leaves the recommendations behind.
+    return {"topics": topics is not None and not now_topics <= set(topics),
             "seeds": seeds is not None and now_seeds != set(seeds)}
 
 
@@ -2579,6 +2583,7 @@ def _merge_umls_topics(
         topic_filters,
         umls_per_paper,
         min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
+        min_similarity=settings.RADAR_UMLS_TOPIC_MIN_SIMILARITY,
         per_paper=settings.RADAR_UMLS_TOPICS_PER_PAPER,
         max_additions=settings.RADAR_UMLS_MAX_TOPIC_ADDITIONS,
         cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),

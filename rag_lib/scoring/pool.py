@@ -24,6 +24,7 @@ rescores when it moves.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from .percentile import percentile_of
@@ -104,6 +105,40 @@ def in_years(year: int | None, year_from: int | None, year_to: int | None) -> bo
     return (year_from is None or year >= year_from) and (year_to is None or year <= year_to)
 
 
+def _bare(tid) -> str:
+    return str(tid).replace("https://openalex.org/", "")
+
+
+def topic_on(sourced_by_topic_id: str | None, paper_topics_json: str | None,
+             topic_filters: dict | None) -> bool:
+    """Whether a candidate's topics let it into the feed: ``candidates.TOPIC_ON`` in SQL.
+
+    In unless a topic brought it in and none of the paper's own topics, nor
+    that topic, is switched on (user 2026-11-06, rule B). An interest with
+    no topic list lets everything in.
+    """
+    if sourced_by_topic_id is None:
+        return True
+    topics = (topic_filters or {}).get("topics") if isinstance(topic_filters, dict) else None
+    if not isinstance(topics, list) or not topics:
+        return True
+    from ..openalex_tiers import is_enabled
+
+    # ``id`` must be a string (json_extract gives a number otherwise).
+    on = {_bare(t["id"]) for t in topics
+          if isinstance(t, dict) and isinstance(t.get("id"), str) and t["id"] and is_enabled(t)}
+    if _bare(sourced_by_topic_id) in on:
+        return True
+    try:
+        own = json.loads(paper_topics_json) if paper_topics_json else {}
+    except (TypeError, ValueError):
+        own = {}
+    if not isinstance(own, dict):
+        return False
+    own_topics = [own.get("primary_topic"), *(own.get("topics") if isinstance(own.get("topics"), list) else [])]
+    return any(isinstance(t, dict) and isinstance(t.get("id"), str) and _bare(t["id"]) in on for t in own_topics)
+
+
 def rescore_profile_pool(
     conn: sqlite3.Connection, profile_id: int, *, alpha: float, beta: float,
 ) -> int:
@@ -114,16 +149,21 @@ def rescore_profile_pool(
     Rows below the threshold get NULL blend and percentile.
     """
     prow = conn.execute(
-        "SELECT threshold, year_from, year_to FROM profiles WHERE id = ?", (profile_id,),
+        "SELECT threshold, year_from, year_to, topic_filters_json FROM profiles WHERE id = ?", (profile_id,),
     ).fetchone()
     threshold = None if prow is None or prow[0] is None else float(prow[0])
     year_from = None if prow is None else prow[1]
     year_to = None if prow is None else prow[2]
+    try:
+        topic_filters = json.loads(prow[3]) if prow is not None and prow[3] else None
+    except (TypeError, ValueError):
+        topic_filters = None
     from ..db.repos.candidates import NOT_SEED
 
     rows = [dict(r) for r in conn.execute(
         f"""
         SELECT pc.openalex_id, pc.score, pc.score_raw, pc.score_reranker_raw, p.year,
+               pc.sourced_by_topic_id, p.topics_json,
                {NOT_SEED} AS not_seed
         FROM profile_candidates pc JOIN papers p USING (openalex_id)
         WHERE pc.profile_id = ?
@@ -131,10 +171,11 @@ def rescore_profile_pool(
         (profile_id,),
     ).fetchall()]
     # The pool is what the feed can show: above the threshold, inside the
-    # interest's years, and not one of its seeds (feed percentiles would
-    # otherwise rank against papers that are never shown).
+    # interest's years, with a topic switched on, and not one of its seeds
+    # (feed percentiles would otherwise rank against papers never shown).
     pool = [r for r in rows if r["not_seed"] and passes(r["score_raw"], threshold)
-            and in_years(r["year"], year_from, year_to)]
+            and in_years(r["year"], year_from, year_to)
+            and topic_on(r["sourced_by_topic_id"], r["topics_json"], topic_filters)]
     scores = pool_scores(pool, alpha=alpha, beta=beta)
     empty = {"score_reranker_norm": None, "score_blended": None, "score_pct": None}
     conn.executemany(

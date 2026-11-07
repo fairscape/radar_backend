@@ -336,13 +336,16 @@ def orcid_works(
     name — nothing is wrong, there is just nothing to import.
     """
     from ...openalex_client import OpenAlexClient
+    from ...secret_text import MESSAGE as SECRET_MESSAGE, looks_like_secret
     from ..services import orcid as orcid_service
 
     oid = orcid_service.normalize_orcid(orcid)
     if not oid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000 with a valid last check digit)",
+            # Not echoed when it looks like a key (RD).
+            detail=(SECRET_MESSAGE if looks_like_secret(orcid) else
+                    f"'{orcid}' is not an ORCID iD (expected 0000-0000-0000-0000 with a valid last check digit)"),
         )
     client = openalex_client or OpenAlexClient(mailto=_users_repo.mailto_from_row(user, settings.RADAR_DEFAULT_MAILTO))
     try:
@@ -461,8 +464,12 @@ def prosopia_works(
     one OpenAlex has today (FUNCTIONAL_SPEC M.4 rule 6).
     """
     from ...openalex_client import OpenAlexClient
+    from ...secret_text import MESSAGE as SECRET_MESSAGE, looks_like_secret
     from ..services import prosopia as prosopia_service
 
+    # A key pasted here is not looked up nor echoed back (RD).
+    if looks_like_secret(ref) or looks_like_secret(base_url):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=SECRET_MESSAGE)
     try:
         listing = prosopia_service.list_works(
             ref, base_url=base_url or settings.RADAR_PROSOPIA_BASE_URL,

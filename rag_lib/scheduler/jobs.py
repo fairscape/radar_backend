@@ -272,14 +272,14 @@ _refresh_again: set[int] = set()
 def stale_rerank_ids(conn, profile_id: int, key: str, limit: int | None = None) -> list[str]:
     """Pool rows (what the feed can show) whose reranker logit is missing or
     was computed against another query set, best cosine first."""
-    from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES
+    from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES, TOPIC_ON
 
     sql = f"""
         SELECT pc.openalex_id
         FROM profile_candidates pc
         JOIN profiles pr ON pr.id = pc.profile_id
         JOIN papers p ON p.openalex_id = pc.openalex_id
-        WHERE pc.profile_id = ? AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+        WHERE pc.profile_id = ? AND {PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED}
           AND (pc.score_reranker_raw IS NULL OR pc.reranker_query_key IS NULL
                OR pc.reranker_query_key != ?)
         ORDER BY pc.score_raw DESC
@@ -813,6 +813,8 @@ def _gather_for_profile_locked(
             # Outside the interest's years counts as below too: the feed
             # (candidates.IN_YEARS) never shows those, yet they were reranked
             # and counted as the run's "new" ("5 new papers", feed unchanged).
+            # candidates.TOPIC_ON needs no test here: a scan fetches only by
+            # the topics switched on, so every paper it brings has one.
             yf, yt = profile_row["year_from"], profile_row["year_to"]
 
             def _reaches_feed(e) -> bool:
@@ -906,7 +908,7 @@ def _gather_for_profile_locked(
                 rescore_candidates(conn, profile_id)
                 reranker, profile = _build_reranker(now_row, settings), None
                 # "New" is what reached the feed; count it on the new scores.
-                from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES
+                from ..db.repos.candidates import IN_YEARS, NOT_SEED, PASSES, TOPIC_ON
 
                 n_new = int(conn.execute(
                     f"""
@@ -916,7 +918,7 @@ def _gather_for_profile_locked(
                     JOIN gather_runs g ON g.id = pc.gather_run_id
                     WHERE pc.profile_id = ? AND pc.gather_run_id = ?
                       AND pc.fetched_at >= g.started_at
-                      AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+                      AND {PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED}
                     """,
                     (profile_id, run_id),
                 ).fetchone()[0])

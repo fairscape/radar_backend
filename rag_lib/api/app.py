@@ -198,6 +198,8 @@ def create_app() -> FastAPI:
     # included (L16). So: when the route's body model holds a secret field
     # anywhere, no error of that request carries input or ctx.
     from fastapi.exceptions import RequestValidationError
+
+    from rag_lib.secret_text import MESSAGE as SECRET_MESSAGE, holds_secret
     from fastapi.encoders import jsonable_encoder
 
     _secret_routes: dict[int, bool] = {}
@@ -245,7 +247,10 @@ def create_app() -> FastAPI:
         errors = []
         secret_body = _route_holds_secret(request)
         for err in exc.errors():
-            if secret_body or _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}:
+            # Text refused as a secret (rag_lib/secret_text.py) is not echoed back either.
+            if (secret_body or _SECRET_FIELDS & {str(part) for part in err.get("loc", ())}
+                    or SECRET_MESSAGE in str(err.get("msg", ""))
+                    or holds_secret(err.get("input"))):
                 err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
             errors.append(_json_safe(jsonable_encoder(err)))
         return JSONResponse(status_code=422, content={"detail": errors})

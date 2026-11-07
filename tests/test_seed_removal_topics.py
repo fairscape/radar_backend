@@ -176,14 +176,18 @@ def test_changed_since_scan(live):
     _remove(conn, pid, W2)
     assert changed() is False                                 # a seed removed is not a topic change
     wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T1, T2, T9])
-    assert changed() is True                                  # T-7
+    # Rule B (2026-11-06): a topic switched off leaves the feed at once.
+    assert changed() is False
+    _scan(conn, pid, uid, [T1, T2, T9])
     wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T1, T2, T3, T9])
+    assert changed() is True                                  # T-7: T3 on, not searched
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T1, T2, T9])
     assert changed() is False                                 # T-9: back as the scan searched
-    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T1])
-    _scan(conn, pid, uid, [T2], error="OpenAlex unavailable")  # a failed scan searched nothing
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=[T1, T3])
+    _scan(conn, pid, uid, [T1, T3], error="OpenAlex unavailable")  # a failed scan searched nothing
     _scan(conn, pid, uid, None, tier="dry_run")              # a trial records no topics
     assert changed() is True
-    _scan(conn, pid, uid, [T1])
+    _scan(conn, pid, uid, [T1, T3])
     assert changed() is False                                 # T-8
 
 

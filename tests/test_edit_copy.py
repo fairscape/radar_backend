@@ -3,8 +3,8 @@
 Edit interest copies the interest; every step changes the copy; Save
 changes writes it back in one go and deletes it; leaving without saving
 discards it with what it brought in that nothing else uses. Saving does
-not scan, refit or rescore (except a new threshold or year range, which
-re-decides the feed); the scan refits. While a copy is open the interest
+not scan, refit or rescore (except a new threshold, year range or set of
+topics switched on, which re-decides the feed); the scan refits. While a copy is open the interest
 cannot be changed or scanned anywhere else.
 """
 
@@ -189,6 +189,20 @@ def test_save_rescored_only_when_threshold_or_years_changed(edit):
     assert rescored == [pid, pid] and _row(conn, pid)["year_from"] == 2020
 
 
+def test_save_rescored_when_the_topics_switched_on_changed(edit):
+    """Rule B: the topics on decide which stored papers are in the feed."""
+    conn, uid, pid, slug, _, rescored = edit
+    on = sorted(enabled_topic_ids(_stored(conn, pid)))
+    _, cslug = _open(conn, uid, slug)
+    wizard.save_topics(conn, user_id=uid, slug=cslug, selected_topic_ids=on)   # as they were
+    edit_copy.save_copy(conn, user_id=uid, slug=cslug)
+    assert rescored == []
+    _, cslug = _open(conn, uid, slug)
+    wizard.save_topics(conn, user_id=uid, slug=cslug, selected_topic_ids=on[:1])
+    edit_copy.save_copy(conn, user_id=uid, slug=cslug)
+    assert rescored == [pid] and sorted(enabled_topic_ids(_stored(conn, pid))) == on[:1]
+
+
 def test_save_refused_without_a_topic_on_or_a_placeable_seed(edit):
     conn, uid, pid, slug, *_ = edit
     before = _snapshot(conn, pid)
@@ -293,6 +307,11 @@ def test_e9_a_copy_with_no_recorded_scan_compares_with_the_interest_as_saved(edi
     assert wizard.outdated(conn, cid) == {"topics": False, "seeds": True}
     on = sorted(enabled_topic_ids(_stored(conn, cid)))
     wizard.save_topics(conn, user_id=uid, slug=cslug, selected_topic_ids=on[:1])
+    # Switched off: the feed follows at once (rule B), nothing to scan for.
+    assert wizard.outdated(conn, cid) == {"topics": False, "seeds": True}
+    profiles_repo.attach_seed(conn, cid, W3)                      # brings T4, off
+    conn.commit()
+    wizard.save_topics(conn, user_id=uid, slug=cslug, selected_topic_ids=[*on[:1], T4])
     assert wizard.outdated(conn, cid) == {"topics": True, "seeds": True}
     assert wizard.outdated(conn, pid) == {"topics": False, "seeds": False}   # the interest: nothing to compare
 

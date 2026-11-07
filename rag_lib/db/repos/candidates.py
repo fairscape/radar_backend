@@ -38,6 +38,57 @@ IN_YEARS = (
     " AND (pr.year_to IS NULL OR p.year IS NULL OR p.year <= pr.year_to))"
 )
 
+# ... and when one of its topics is switched on in the interest (user
+# 2026-11-06, rule B): a paper a topic brought in leaves the feed while that
+# topic is off and comes back when it is on again; nothing is deleted. A
+# paper carries several OpenAlex topics, so it stays while any of them (its
+# primary topic included), or the topic that brought it in, is on. A paper
+# no topic brought in (sourced_by_topic_id NULL), and an interest with no
+# topic list, pass. Ids
+# are compared bare (test stubs use bare ids). Needs ``pc``, ``p`` and ``pr``.
+# Same rule as ``scoring.pool.topic_on``; "on" as ``openalex_tiers.is_enabled``
+# (absent means on, null or false means off).
+def _bare(expr: str) -> str:
+    return f"replace({expr}, 'https://openalex.org/', '')"
+
+
+_IT_ID = _bare("json_extract(it.value, '$.id')")
+_PT_ID = _bare("json_extract(pt.value, '$.id')")
+# The paper's own topics as a JSON array, [] when its record is not one.
+_PAPER_TOPICS = (
+    "(CASE WHEN json_valid(p.topics_json) THEN"
+    " (CASE WHEN json_type(p.topics_json, '$.topics') = 'array'"
+    " THEN json_extract(p.topics_json, '$.topics') ELSE '[]' END) ELSE '[]' END)"
+)
+_PRIMARY = "(CASE WHEN json_valid(p.topics_json) THEN json_extract(p.topics_json, '$.primary_topic.id') END)"
+# ``on`` as Python's bool(): absent is on; null, false, 0, "" and [] are off.
+_IS_ON = (
+    "(CASE json_type(it.value, '$.on')"
+    " WHEN 'true' THEN 1 WHEN 'false' THEN 0 WHEN 'null' THEN 0"
+    " WHEN 'integer' THEN json_extract(it.value, '$.on') != 0"
+    " WHEN 'real' THEN json_extract(it.value, '$.on') != 0"
+    " WHEN 'text' THEN json_extract(it.value, '$.on') != ''"
+    " WHEN 'array' THEN json_array_length(it.value, '$.on') > 0"
+    " WHEN 'object' THEN json_extract(it.value, '$.on') != '{}'"
+    " ELSE 1 END)"
+)
+# Entries that are not objects are skipped, as ``scoring.pool.topic_on``
+# does (CASE, not AND: SQLite may evaluate AND terms in any order, and
+# json_type on a bare string element is an error).
+TOPIC_ON = (
+    "(pc.sourced_by_topic_id IS NULL"
+    " OR COALESCE(json_valid(pr.topic_filters_json), 0) = 0"
+    " OR COALESCE(json_type(pr.topic_filters_json, '$.topics'), '') != 'array'"
+    " OR json_array_length(pr.topic_filters_json, '$.topics') = 0"
+    " OR EXISTS (SELECT 1 FROM json_each(pr.topic_filters_json, '$.topics') it"
+    " WHERE CASE WHEN it.type != 'object' THEN 0"
+    f" WHEN NOT {_IS_ON} THEN 0"
+    f" WHEN {_IT_ID} = {_bare('pc.sourced_by_topic_id')} THEN 1"
+    f" WHEN {_IT_ID} = {_bare(_PRIMARY)} THEN 1"
+    f" ELSE EXISTS (SELECT 1 FROM json_each({_PAPER_TOPICS}) pt"
+    f" WHERE CASE WHEN pt.type = 'object' THEN {_PT_ID} = {_IT_ID} ELSE 0 END) END))"
+)
+
 
 # ... and when it is not one of the interest's own seeds, by id or DOI. A
 # feed paper made a seed kept its candidate row, and a scan finds the seeds
@@ -304,7 +355,7 @@ def unshown_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+          AND {PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED}
           AND pc.shown_at IS NULL
           AND pc.dismissed_at IS NULL
           AND (pc.snoozed_until IS NULL OR pc.snoozed_until < datetime('now'))
@@ -341,7 +392,7 @@ def scores_for_profile(
         SELECT COALESCE(pc.score_raw, pc.score) AS s FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
-        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS} AND {TOPIC_ON}
         ORDER BY s DESC
         """,
         (profile_id,),
@@ -358,7 +409,9 @@ def scored_papers_for_profile(
     threshold compares (``score_raw``, as ``scores_for_profile``). Every
     year is included -- the Threshold tab filters by the range the user
     is trying out, which may be wider than the saved one; filtered here by
-    the saved range, widening the range showed nothing older.
+    the saved range, widening the range showed nothing older. The topics
+    switched on do apply (TOPIC_ON): the tab does not try those out, and the
+    histogram beside it (``scores_for_profile``) counts by them.
     """
     return conn.execute(
         f"""
@@ -366,7 +419,8 @@ def scored_papers_for_profile(
                p.title, p.venue, p.year
         FROM profile_candidates pc
         JOIN papers p USING (openalex_id)
-        WHERE pc.profile_id = ? AND {NOT_SEED}
+        JOIN profiles pr ON pr.id = pc.profile_id
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {TOPIC_ON}
         ORDER BY s DESC
         """,
         (profile_id,),
@@ -422,7 +476,7 @@ def count_saves_dismisses_30d(
         FROM profile_candidates pc
         JOIN profiles pr ON pr.id = pc.profile_id
         JOIN papers p ON p.openalex_id = pc.openalex_id
-        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS}
+        WHERE pc.profile_id = ? AND {NOT_SEED} AND {IN_YEARS} AND {TOPIC_ON}
         """,
         (profile_id,),
     ).fetchone()
@@ -479,7 +533,7 @@ def top_for_profile(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS} AND {NOT_SEED}
+          AND {"NOT " + PASSES if below else PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED}
           -- The feed's own "published since" filter, on top of the interest's range.
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
           AND (? IS NULL OR {BUCKET_SQL} = ?)
@@ -516,7 +570,7 @@ def feed_seed_choices(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED} AND {not_seed_of("?")}
+          AND {PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED} AND {not_seed_of("?")}
           AND pc.dismissed_at IS NULL
         ORDER BY (pc.saved_at IS NULL), COALESCE(pc.score_blended, pc.score) DESC, pc.openalex_id
         """,
@@ -566,7 +620,7 @@ def count_untriaged_for_feed(
         JOIN papers p USING (openalex_id)
         JOIN profiles pr ON pr.id = pc.profile_id
         WHERE pc.profile_id = ?
-          AND {PASSES} AND {IN_YEARS} AND {NOT_SEED}
+          AND {PASSES} AND {IN_YEARS} AND {TOPIC_ON} AND {NOT_SEED}
           AND (? IS NULL OR p.year IS NULL OR p.year >= ?)
           AND (? IS NULL OR {BUCKET_SQL} = ?)
           AND pc.saved_at IS NULL AND pc.dismissed_at IS NULL
@@ -594,7 +648,8 @@ def topic_yield_for_profile(
     and are excluded.
     """
     # What reached the feed: a topic is judged by papers above the threshold
-    # and in the interest's years.
+    # and in the interest's years. Not by TOPIC_ON: a switched-off topic
+    # still shows what it brought, which is what switching it on brings back.
     where = ["pc.profile_id = ?", "pc.sourced_by_topic_id IS NOT NULL", PASSES, IN_YEARS, NOT_SEED]
     params: list = [profile_id]
     if since:
