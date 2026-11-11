@@ -105,3 +105,64 @@ def test_another_users_import_is_not_mine(app, issuer, prosopia, tmp_path):
     body = _mine(app, before=a_imports)
     assert body["profile"]["slug"] == "sheffield-nathan"
     assert body["researcher_id"] is None and body["imported_at"] is None
+
+
+# --- B5-3 (frontend review 2026-11-07): "already stored" and the import's
+# refusal of a second profile name the same person ----------------------
+
+ORCID = "0000-0002-1825-009X"
+
+
+def _orcid_record(rid):
+    return {**RECORD, "rid": rid}
+
+
+def _store_by_orcid(tmp_path, orcid=ORCID):
+    out = {}
+
+    def store():
+        conn = connect(tmp_path / "radar.db")
+        uid = conn.execute("SELECT id FROM users WHERE email = ?", ("alice@example.org",)).fetchone()["id"]
+        out["uid"] = uid
+        out["id"] = researchers_repo.upsert(
+            conn, user_id=uid, source="orcid", key=orcid, name="N by ORCID", orcid=orcid)
+        conn.close()
+    return out, store
+
+
+@pytest.mark.parametrize("rid", [ORCID, "https://orcid.org/0000-0002-1825-009x"])
+def test_a_person_stored_by_orcid_is_this_profile(app, issuer, prosopia, tmp_path, rid):
+    """Stored from their ORCID, the person is the one this Prosopia profile is
+    about: the card opens that researcher instead of offering an Import the
+    server refuses (409). The rid in any ORCID form."""
+    issuer.claims = {"self_rid": rid}
+    prosopia.reply = httpx.Response(200, json=_orcid_record(rid))
+    out, store = _store_by_orcid(tmp_path)
+    body = _mine(app, before=store)
+    assert body["researcher_id"] == out["id"]
+
+
+def test_another_orcid_is_not_this_profile(app, issuer, prosopia, tmp_path):
+    issuer.claims = {"self_rid": ORCID}
+    prosopia.reply = httpx.Response(200, json=_orcid_record(ORCID))
+    _, store = _store_by_orcid(tmp_path, orcid="0000-0001-5109-3700")
+    assert _mine(app, before=store)["researcher_id"] is None
+
+
+def test_card_and_refusal_agree(app, issuer, prosopia, tmp_path):
+    """Class check: whoever the card calls already stored is whom the import
+    refuses as a second profile, and the other way round."""
+    from rag_lib.api.services import researchers as researchers_service
+
+    issuer.claims = {"self_rid": ORCID}
+    prosopia.reply = httpx.Response(200, json=_orcid_record(ORCID))
+    out, store = _store_by_orcid(tmp_path)
+    body = _mine(app, before=store)
+    conn = connect(tmp_path / "radar.db")
+    try:
+        with pytest.raises(researchers_service.ResearcherExists) as refused:
+            researchers_service.refuse_a_second_profile(
+                conn, user_id=out["uid"], source="prosopia", key=RECORD["slug"], orcid=ORCID, refresh_of=None)
+    finally:
+        conn.close()
+    assert refused.value.researcher_id == body["researcher_id"]

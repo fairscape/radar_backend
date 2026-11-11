@@ -27,6 +27,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from rag_lib.db.repos import researchers as researchers_repo
+from rag_lib.prosopia_client import looks_like_orcid, normalize_rid
 
 from .. import oidc, write_lease
 from ..deps import get_current_user, get_db
@@ -132,7 +133,13 @@ def get_my_prosopia(
         paper_count=fields.get("paper_count"),
         url=f"{base}/{slug}",
     )
-    row = researchers_repo.get_by_key(db, int(user["id"]), "prosopia", slug)
+    # The same person as the import's refusal of a second profile: this
+    # Prosopia profile, or a researcher with the same ORCID under either
+    # source. By slug alone the card offered Import for someone stored from
+    # their ORCID, and the import then refused with a 409 (B5-3).
+    # The record's rid only, as the import reads it (review R-5).
+    rid = normalize_rid(record.get("rid") or fields.get("rid"))
+    row = researchers_repo.find_person(db, int(user["id"]), "prosopia", slug, rid if looks_like_orcid(rid) else None)
     return MyProsopia(
         profile=profile,
         researcher_id=int(row["id"]) if row else None,
