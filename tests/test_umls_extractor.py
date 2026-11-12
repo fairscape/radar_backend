@@ -189,3 +189,152 @@ def test_blank_input_returns_nothing_without_loading_the_model(text, monkeypatch
 
     monkeypatch.setattr(extractor, "_get_nlp", _boom)
     assert extract_umls_concepts(text) == []
+
+
+# ---------------------------------------------------------------------------
+# Mentions: the words a concept was read from, in their sentence (CTX-1)
+# ---------------------------------------------------------------------------
+#
+# On a real spaCy Doc (blank English with a sentencizer), so the sentence
+# boundaries are spaCy's own; only the linker is stubbed.
+
+
+@pytest.fixture
+def real_doc(monkeypatch):
+    """Return ``install(text, mentions, kb, abbreviations=())``: ``mentions``
+    is a list of (the mention's text as in ``text``, its (cui, score) list);
+    ``abbreviations`` the mention texts the text defines as short forms."""
+    spacy = pytest.importorskip("spacy")
+    from spacy.tokens import Doc, Span
+
+    if not Span.has_extension("kb_ents"):
+        Span.set_extension("kb_ents", default=[])
+    if not Doc.has_extension("abbreviations"):
+        Doc.set_extension("abbreviations", default=[])
+    blank = spacy.blank("en")
+    blank.add_pipe("sentencizer")
+
+    def install(text, mentions, kb, abbreviations=()):
+        doc = blank(text)
+        ents, at = [], 0
+        for words, _ in mentions:
+            start = text.index(words, at)
+            at = start + len(words)
+            span = doc.char_span(start, at, label="ENTITY")
+            assert span is not None, words
+            ents.append(span)
+        doc.ents = ents
+        # Set on doc.ents' own spans: a span's extension value is keyed by
+        # its label among others, as the linker sets it.
+        for ent, (_, cands) in zip(doc.ents, mentions):
+            ent._.kb_ents = cands
+        doc._.abbreviations = [e for e in doc.ents if e.text in abbreviations]
+        entries = {cui: _KbEntry(name, types) for cui, (name, types) in kb.items()}
+        linker = _Linker(entries)
+        nlp = type("Nlp", (), {"get_pipe": lambda self, n: linker, "__call__": lambda self, t: doc})()
+        monkeypatch.setattr(extractor, "_get_nlp", lambda *a, **k: nlp)
+    return install
+
+
+LONG = " and the cohort was followed for twelve years in four hospitals across the region."
+
+
+def test_a_concept_carries_its_word_and_sentence(real_doc):
+    text = "Insulin resistance rose in obese adults" + LONG + " Nothing else."
+    real_doc(text, [("Insulin resistance", [("C1", 0.97)])], {"C1": ("Insulin Resistance", [DISEASE])})
+    [c] = extract_umls_concepts(text)
+    assert c.mentions == (("Insulin resistance", "Insulin resistance rose in obese adults" + LONG),)
+    assert c.to_dict()["mentions"] == [{"text": "Insulin resistance", "sentence": c.mentions[0][1]}]
+
+
+def test_a_short_sentence_takes_the_next_one_with_it(real_doc):
+    text = "Ticks bite. They carry Lyme disease" + LONG + " A third sentence."
+    real_doc(text, [("Ticks", [("C1", 0.95)])], {"C1": ("Ixodida", [DISEASE])})
+    [c] = extract_umls_concepts(text)
+    assert c.mentions == (("Ticks", "Ticks bite. They carry Lyme disease" + LONG),)
+
+
+def test_a_short_last_sentence_stays_alone(real_doc):
+    text = "They carry Lyme disease" + LONG + " Ticks bite."
+    real_doc(text, [("Ticks", [("C1", 0.95)])], {"C1": ("Ixodida", [DISEASE])})
+    assert extract_umls_concepts(text)[0].mentions == (("Ticks", "Ticks bite."),)
+
+
+def test_a_sentence_is_cut_at_its_limit(real_doc):
+    text = "Malaria spreads " + "widely " * 400 + "today."
+    real_doc(text, [("Malaria", [("C1", 0.95)])], {"C1": ("Malaria", [DISEASE])})
+    [(_, sentence)] = extract_umls_concepts(text)[0].mentions
+    assert len(sentence) == extractor.SENTENCE_MAX_CHARS and sentence.startswith("Malaria spreads widely")
+
+
+def test_the_surest_three_mentions_each_sentence_once(real_doc):
+    s = [f"Sentence {i} says diabetes again{LONG}" for i in range(5)]
+    text = " ".join(s[:2]) + " Diabetes and diabetes twice in this one" + LONG + " " + " ".join(s[2:])
+    mentions = [("diabetes", [("C1", 0.80)]), ("diabetes", [("C1", 0.85)]),
+                ("Diabetes", [("C1", 0.99)]), ("diabetes", [("C1", 0.98)]),
+                ("diabetes", [("C1", 0.90)]), ("diabetes", [("C1", 0.95)]), ("diabetes", [("C1", 0.70)])]
+    real_doc(text, mentions, {"C1": ("Diabetes Mellitus", [DISEASE])})
+    [c] = extract_umls_concepts(text)
+    assert c.confidence == 0.99
+    # 0.99 and 0.98 are one sentence: the next surest takes the second place
+    assert [(w, sent.split(" ")[1]) for w, sent in c.mentions] == [("Diabetes", "and"), ("diabetes", "3"),
+                                                                   ("diabetes", "2")]
+
+
+def test_a_short_word_is_no_mention_unless_the_text_defines_it(real_doc):
+    text = ("Amyotrophic lateral sclerosis (ALS) progressed" + LONG +
+            " The D term in the model of Asp" + LONG)
+    kb = {"C1": ("Amyotrophic Lateral Sclerosis", [DISEASE]), "C2": ("Aspartic Acid", [DRUG]),
+          "C3": ("Asparagine", [DRUG])}
+    real_doc(text, [("ALS", [("C1", 0.93)]), ("D", [("C2", 1.0)]), ("Asp", [("C3", 0.96)])], kb,
+             abbreviations=("ALS",))
+    out = {c.cui: c for c in extract_umls_concepts(text)}
+    # the concepts and their confidence are as before; only the mentions differ
+    assert {cui: c.confidence for cui, c in out.items()} == {"C1": 0.93, "C2": 1.0, "C3": 0.96}
+    # three letters, but the text defines it
+    assert [w for w, _ in out["C1"].mentions] == ["ALS"]
+    assert out["C2"].mentions == () and out["C3"].mentions == ()
+
+
+def test_a_mention_in_a_formula_is_no_mention(real_doc):
+    text = "y = 3.2 x + 0.4 glucose , p < 0.05 , n = 12 , r2 = 0.91 . Glucose uptake was measured" + LONG
+    real_doc(text, [("glucose", [("C1", 0.97)]), ("Glucose", [("C1", 0.92)])], {"C1": ("Glucose", [DRUG])})
+    [c] = extract_umls_concepts(text)
+    assert c.confidence == 0.97
+    assert [s.split()[0] for _, s in c.mentions] == ["Glucose"]
+
+
+@pytest.mark.parametrize("sentence,formula", [
+    ("The cohort was followed for years.", False),
+    ("x = 3 + y ( 2 )", True),
+    ("Glucose 3.2 4.1 5.0 6.6", True),
+    ("Glucose rose 3.2 to 4.1 mmol.", False),
+    ("", True),
+])
+def test_formula_like(sentence, formula):
+    assert extractor._formula_like(sentence) is formula
+
+
+def test_the_spec_numbers():
+    """FUNCTIONAL_SPEC CTX-1: three mentions, the next sentence under 120
+    characters, at most 1000 (review CTX-R5: changing them went unseen)."""
+    assert (extractor.MAX_MENTIONS, extractor._SHORT_SENTENCE, extractor.SENTENCE_MAX_CHARS) == (3, 120, 1000)
+
+
+def test_a_sentence_just_under_the_short_limit_takes_the_next(real_doc):
+    first = "Ticks transmit several bacterial pathogens to humans and to dogs in rural parts of the state."
+    assert 60 < len(first) < 120
+    text = first + " They carry Lyme disease" + LONG
+    real_doc(text, [("Ticks", [("C1", 0.95)])], {"C1": ("Ixodida", [DISEASE])})
+    assert extract_umls_concepts(text)[0].mentions[0][1] == text
+
+
+def test_a_long_sentence_is_cut_around_its_word(real_doc):
+    """Review CTX-R2: a PDF paragraph with no full stop; the word well past
+    the first 1000 characters."""
+    text = "Cohorts were " + "followed and " * 150 + "Borrelia was found in " + "many and " * 150 + "more."
+    real_doc(text, [("Borrelia", [("C1", 0.95)])], {"C1": ("Borrelia", [DISEASE])})
+    [(word, sentence)] = extract_umls_concepts(text)[0].mentions
+    assert len(sentence) == 1000 and "Borrelia" in sentence
+    at = sentence.index("Borrelia")
+    assert 400 < at < 600                       # centred on it

@@ -85,7 +85,7 @@ def test_an_unmatched_seed_without_topics_is_left_without_them(conn):
 
 def test_a_legacy_pdf_topic_is_no_seed_s(conn):
     pid = _interest_with(conn, {"https://openalex.org/W1": _openalex(1), "local:abc": _legacy(500)})
-    codes = wizard._seed_topic_codes(conn, pid)
+    codes = wizard._seed_topic_codes(conn, pid, [])
     assert any(c.endswith("T1") for c in codes) and not any(c.endswith("T500") for c in codes)
 
 

@@ -149,17 +149,24 @@ class Settings(BaseSettings):
     RADAR_UMLS_SPACY_MODEL: str = "en_core_sci_lg"
     RADAR_UMLS_MIN_CONFIDENCE: float = 0.7
     RADAR_UMLS_MAX_CONCEPTS: int = 30
-    # The UMLS topics an interest gets (FUNCTIONAL_SPEC U.2,
+    # The UMLS topics an interest gets (FUNCTIONAL_SPEC U.2 / CTX,
     # rag_lib.umls.topic_mapper.merge_umls_topics): each concept's nearest
-    # topic; from each seed its concepts of MIN_CONFIDENCE or more, PER_PAPER
-    # of them by confidence; MAX_TOPIC_ADDITIONS for the interest. They are
-    # added switched off: words matched literally (a misread "Baseline" is
-    # dental cement at 1.0), so the user picks.
+    # topic the interest does not have yet, of its three nearest (CTX-3b),
+    # found from the sentences it was read in; from each seed its
+    # concepts of MIN_CONFIDENCE or more, PER_PAPER of them by similarity;
+    # MAX_TOPIC_ADDITIONS for the interest, the ones more seeds chose first.
+    # They are added switched off: words matched literally (a misread
+    # "Baseline" is dental cement at 1.0), so the user picks.
+    # Also the bar for mapping at all (a concept under it is not embedded):
+    # a change reaches papers extracted after it only; those extracted
+    # before keep their mappings (review CTX-R4; it is set once, after the
+    # best value is found, and left).
     RADAR_UMLS_TOPIC_MIN_CONFIDENCE: float = 0.9
-    # ...and only a concept whose nearest topic is this close to its name
-    # (UT-1): "BaseLine dental cement" -> "Dental materials and
-    # restorations" is 0.665.
-    RADAR_UMLS_TOPIC_MIN_SIMILARITY: float = 0.80
+    # ...and only a concept whose topic is this similar. No bar (0.0) since
+    # CTX: a sentence against a topic's description measures 0.6-0.8 for
+    # the right topic and the wrong ones alike (records/35); it was 0.80
+    # between two names (UT-1).
+    RADAR_UMLS_TOPIC_MIN_SIMILARITY: float = 0.0
     RADAR_UMLS_TOPICS_PER_PAPER: int = 5
     RADAR_UMLS_MAX_TOPIC_ADDITIONS: int = 20
     RADAR_UMLS_EMBEDDING_MODEL: str = "mxbai-embed-large"

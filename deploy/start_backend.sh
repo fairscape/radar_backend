@@ -75,6 +75,15 @@ if [ -d "$NVIDIA_PKG" ]; then
     export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
+# The UMLS mapper's topic index (review CTX-R1). Not fatal: the site works
+# without it, only no UMLS topic is found; /api/health and `radar.sh
+# status` say so too. See deploy/README.md "UMLS topic index".
+UMLS_CACHE=$(grep -E '^RADAR_UMLS_CACHE_DIR=' "$ENV_FILE" | cut -d= -f2- | tr -d '"\'' ')
+UMLS_CACHE=${UMLS_CACHE:-data/umls_cache}
+for f in openalex_topics_rich.json openalex_topic_rich_embeddings.npz openalex_topic_rich_index.meta.json; do
+    [ -s "$UMLS_CACHE/$f" ] || echo "WARN: $UMLS_CACHE/$f is missing: UMLS concepts cannot be mapped to topics (deploy/README.md \"UMLS topic index\")" >&2
+done
+
 # Loopback only. The public entry point is Caddy on :8080 (behind the
 # Cloudflare tunnel), which drops any identity header a client sends.
 # Binding 0.0.0.0 would let anyone on the campus network reach the API

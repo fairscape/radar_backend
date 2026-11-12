@@ -210,6 +210,13 @@ class OpenAlexClient:
     def reset_api_calls(self) -> None:
         self._api_calls = 0
 
+    TOPIC_FIELDS = "id,display_name,description,keywords,subfield,field,domain"
+
+    def topics_page(self, page: int, per_page: int = 200) -> dict:
+        """One ``page=`` of ``/topics`` with each topic's description and
+        keywords (for the rich topic index, scripts/build_topic_index.py)."""
+        return self._get("/topics", {"per-page": per_page, "page": page, "select": self.TOPIC_FIELDS})
+
     # ------------------------------------------------------------------
     # Per-paper lookup (used by profile_builder). Lifted from the original
     # openalex_lookup.py logic.

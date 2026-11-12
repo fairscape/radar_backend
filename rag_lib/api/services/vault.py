@@ -903,7 +903,15 @@ def _try_extract_umls(
             ).fetchone()
             if row is not None and row[0] is not None:
                 return True
-        return _try_extract_umls_unlocked(conn, settings, openalex_id, text)
+        ok = _try_extract_umls_unlocked(conn, settings, openalex_id, text)
+        # Every caller waits out a failure (review CTX-R1): step 3 and the
+        # upload thread used to retry at once, and step 3 showed "pending"
+        # for an extraction that could only fail again.
+        if ok:
+            _UMLS_FAILED.pop(openalex_id, None)
+        elif settings.RADAR_UMLS_ENABLED:
+            _UMLS_FAILED[openalex_id] = time.monotonic()
+        return ok
 
 
 def backfill_seed_umls(
@@ -1038,12 +1046,14 @@ def _try_extract_umls_unlocked(
 
         concepts_json = json.dumps([c.to_dict() for c in concepts])
 
-        # Map concepts to OpenAlex topics via the topic embedding index
+        # Map concepts to OpenAlex topics via the topic embedding index;
+        # one under the bar is never chosen, so not embedded either.
         cache_dir = str(settings.RADAR_UMLS_CACHE_DIR)
         mapped = map_concepts_to_topics(
             concepts,
             embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
             cache_dir=cache_dir,
+            min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
         )
         # "[]" too: NULL beside concepts is a mapping by the earlier rules,
         # which found no topic near enough (wizard.forget_stale_umls_mappings).
@@ -1060,7 +1070,7 @@ def _try_extract_umls_unlocked(
             "vault.umls_extracted",
             openalex_id=openalex_id,
             n_concepts=len(concepts),
-            n_mapped=len(mapped),
+            n_mapped=len({m.source_cui for m in mapped}),     # concepts, not (concept, topic) pairs
         )
         return True
     except Exception as exc:

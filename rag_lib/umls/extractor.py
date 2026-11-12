@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, asdict
 from threading import Lock
 
@@ -35,9 +36,78 @@ class UmlsConcept:
     tui: str  # semantic type unique identifier, e.g. "T047"
     semantic_type: str  # human-readable, e.g. "Disease or Syndrome"
     confidence: float  # linker similarity score in [0, 1]
+    # Where the text says it (CTX-1): up to MAX_MENTIONS (word, sentence)
+    # pairs, the surest mention first, each sentence once. Its topic is
+    # found from these, not from the name alone (topic_mapper). Empty when
+    # every mention was a short or formula-like one (_usable_mention).
+    mentions: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["mentions"] = [{"text": w, "sentence": s} for w, s in self.mentions]
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Mentions: the words a concept was read from, and their sentence
+# ---------------------------------------------------------------------------
+#
+# The name alone says too little to find a concept's topic: "Middle East
+# Respiratory Syndrome" landed on Inflammatory Bowel Disease, and a misread
+# word cannot be told from a meant one. The sentence it was read in can
+# (records/35: on biomedical papers the primary topic among the five went
+# from 0% to 83% for PDF bodies and from 19% to 78% for abstracts).
+
+MAX_MENTIONS = 3
+# A sentence this short says little on its own; the next one is added.
+_SHORT_SENTENCE = 120
+SENTENCE_MAX_CHARS = 1000
+# A word: a letter and two or more lower-case letters, perhaps with a stop.
+_WORD = re.compile(r"[A-Za-z][a-z]{2,}[.,;:)]?$")
+
+
+def _sentence(doc, ent) -> str:
+    """The sentence ``ent`` is in, with the next one when it is short; over
+    SENTENCE_MAX_CHARS, the part centred on the mention (review CTX-R2: a
+    PDF paragraph without a full stop is one "sentence", and its first
+    1000 characters often did not hold the word at all)."""
+    try:
+        sent = ent.sent
+        span = sent
+        if len(sent.text.strip()) < _SHORT_SENTENCE and sent.end < len(doc):
+            span = doc[sent.start:doc[sent.end].sent.end]
+        raw = span.text
+        at = ent.start_char - span.start_char + len(ent.text) // 2
+    except (AttributeError, ValueError, IndexError):   # no sentence boundaries
+        raw = getattr(ent, "text", "") or ""
+        at = len(raw) // 2
+    text = raw.strip()
+    return _around(text, at - (len(raw) - len(raw.lstrip())))
+
+
+def _around(text: str, at: int, n: int = SENTENCE_MAX_CHARS) -> str:
+    """``text``, or its ``n`` characters centred on position ``at``."""
+    if len(text) <= n:
+        return text
+    start = max(0, min(at - n // 2, len(text) - n))
+    return text[start:start + n]
+
+
+def _formula_like(sentence: str) -> bool:
+    """Under half of the tokens are words: a formula, a table or numbers."""
+    tokens = sentence.split()
+    return not tokens or sum(1 for t in tokens if _WORD.match(t)) / len(tokens) < 0.5
+
+
+def _usable_mention(ent, sentence: str, abbreviations: set) -> bool:
+    """Not a mention to place a concept by (records/35 round 3):
+    - three letters or digits or fewer, unless the text defines it as an
+      abbreviation -- a formula's "D" linked as aspartic acid at 1.0;
+    - in a formula-like sentence."""
+    word = re.sub(r"[^A-Za-z0-9]", "", getattr(ent, "text", "") or "")
+    if len(word) <= 3 and (getattr(ent, "start", None), getattr(ent, "end", None)) not in abbreviations:
+        return False
+    return not _formula_like(sentence)
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +212,13 @@ def extract_umls_concepts(
     linker = nlp.get_pipe("scispacy_linker")
 
     doc = nlp(text)
+    # Short forms the text defines ("Middle East respiratory syndrome
+    # (MERS)"): those are meant, however short (abbreviation_detector).
+    abbreviations = {(a.start, a.end) for a in getattr(getattr(doc, "_", None), "abbreviations", None) or ()}
 
     # Collect concepts, dedup by CUI (keep highest confidence)
     seen: dict[str, UmlsConcept] = {}
+    places: dict[str, list[tuple[float, str, str]]] = {}   # cui -> (score, word, sentence)
 
     for ent in doc.ents:
         if not ent._.kb_ents:
@@ -172,6 +246,10 @@ def extract_umls_concepts(
         if relevant_tui is None:
             continue
 
+        sentence = _sentence(doc, ent)
+        if _usable_mention(ent, sentence, abbreviations):
+            places.setdefault(cui, []).append((score, ent.text, sentence))
+
         # Dedup: keep highest confidence per CUI
         if cui in seen and seen[cui].confidence >= score:
             continue
@@ -185,9 +263,20 @@ def extract_umls_concepts(
         )
 
     # Sort by confidence descending, truncate
-    results = sorted(seen.values(), key=lambda c: c.confidence, reverse=True)
+    results = sorted(seen.values(), key=lambda c: c.confidence, reverse=True)[:max_concepts]
 
-    return results[:max_concepts]
+    # The surest mentions, one per sentence. Which concepts there are and
+    # their confidence do not depend on the mentions.
+    out = []
+    for c in results:
+        chosen: list[tuple[str, str]] = []
+        for _score, word, sentence in sorted(places.get(c.cui, ()), key=lambda m: -m[0]):
+            if all(sentence != s for _, s in chosen):
+                chosen.append((word, sentence))
+            if len(chosen) == MAX_MENTIONS:
+                break
+        out.append(UmlsConcept(c.cui, c.name, c.tui, c.semantic_type, c.confidence, tuple(chosen)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -317,21 +406,25 @@ def _main() -> int:
             print(f"      {c.confidence:.4f}  {c.cui}  {c.name[:42]:44s}"
                   f"[{c.semantic_type}]")
 
-        # The layer the user actually sees: concept names embedded against
-        # the OpenAlex topic index. Same call the upload path makes.
+        # The layer the user actually sees: each concept in its sentences
+        # embedded against the OpenAlex topic index. Same call the upload
+        # path makes.
         t1 = time.monotonic()
         mapped = map_concepts_to_topics(
             fresh,
             embedding_model=settings.RADAR_UMLS_EMBEDDING_MODEL,
             cache_dir=str(settings.RADAR_UMLS_CACHE_DIR),
+            min_confidence=settings.RADAR_UMLS_TOPIC_MIN_CONFIDENCE,
         )
         map_elapsed = time.monotonic() - t1
 
+        # A concept has up to NEIGHBOURS topics, and a topic can be near
+        # several concepts: one entry is a (concept, topic) pair.
         stored_t = {
-            m["topic_id"]: m
+            (m["source_cui"], m["topic_id"]): m
             for m in json.loads(row["umls_mapped_topics_json"] or "[]")
         }
-        now_t = {m.topic_id: m for m in mapped}
+        now_t = {(m.source_cui, m.topic_id): m for m in mapped}
 
         print(f"  -> {len(mapped)} mapped topics, {len(stored_t)} stored"
               f"   ({map_elapsed:.1f}s)")
@@ -358,8 +451,8 @@ def _main() -> int:
                       f"{now_t[tid].display_name[:40]}")
 
         for m in mapped:
-            print(f"        {m.similarity:.4f}  {m.display_name[:44]:46s}"
-                  f"<- {m.source_name[:26]}")
+            print(f"        #{m.rank} {m.similarity:.4f}  {m.display_name[:44]:46s}"
+                  f"<- {m.source_name[:26]} ('{(m.mention or '')[:20]}')")
 
         per_paper.append(mapped)
         from .. import content_topics
@@ -698,18 +791,23 @@ def _main_paper(argv: list[str]) -> int:
         for c in sorted(actual - explained):
             print(f"   only in the function: {c}")
 
-    print("\nstage 1 result — the concepts this paper yields:")
+    print("\nstage 1 result — the concepts this paper yields, and where the text says them:")
     for c in result:
         print(f"  {c.confidence:.4f}  {c.cui}  {c.name[:46]:48s}[{c.semantic_type}]")
+        for word, sentence in c.mentions:
+            print(f"       '{word[:24]}'  in: {sentence[:90]!r}")
+        if not c.mentions:
+            print("       (no usable mention: every one short or formula-like; not mapped)")
 
     # -----------------------------------------------------------------
     # Stage 2 — concepts to OpenAlex topics
     # -----------------------------------------------------------------
     #
-    # Each concept's name is embedded and its one nearest topic in the
-    # precomputed index taken, however near; stage 3 chooses on the
-    # concepts' confidence and leaves out a topic under the similarity bar.
-    from .topic_mapper import map_concepts_to_topics, merge_umls_topics
+    # Each concept is embedded in its sentences ("name: sentence", the
+    # mentions averaged) and its NEIGHBOURS nearest topics in the precomputed
+    # description index taken, however near; stage 3 chooses the nearest,
+    # from concepts of the confidence bar or more.
+    from .topic_mapper import map_concepts_to_topics, NEIGHBOURS, merge_umls_topics
 
     try:
         emb = _flag("--embedding-model") or s.RADAR_UMLS_EMBEDDING_MODEL
@@ -717,26 +815,31 @@ def _main_paper(argv: list[str]) -> int:
         min_sim_t = float(_flag("--topic-similarity") or s.RADAR_UMLS_TOPIC_MIN_SIMILARITY)
         per_seed = int(_flag("--per-paper") or s.RADAR_UMLS_TOPICS_PER_PAPER)
         max_add = int(_flag("--max-additions") or s.RADAR_UMLS_MAX_TOPIC_ADDITIONS)
-    except NameError:  # settings never loaded
+    except NameError:  # settings never loaded: the mapper's own defaults
+        from . import topic_mapper as _tm
         emb = _flag("--embedding-model") or "mxbai-embed-large"
-        min_conf_t = float(_flag("--topic-confidence") or 0.9)
-        min_sim_t = float(_flag("--topic-similarity") or 0.80)
-        per_seed = int(_flag("--per-paper") or 5)
-        max_add = int(_flag("--max-additions") or 20)
+        min_conf_t = float(_flag("--topic-confidence") or _tm.CONFIDENCE)
+        min_sim_t = float(_flag("--topic-similarity") or _tm.SIMILARITY)
+        per_seed = int(_flag("--per-paper") or _tm.PER_PAPER)
+        max_add = int(_flag("--max-additions") or _tm.MAX_TOPICS)
 
     print("\n" + "=" * 96)
-    print(f"stage 2 — the nearest OpenAlex topic of each of {len(result)} concepts (embedder {emb})")
+    print(f"stage 2 — the {NEIGHBOURS} nearest OpenAlex topics of each of {len(result)} concepts (embedder {emb})")
     print("=" * 96)
     t1 = time.monotonic()
     try:
-        mapped = map_concepts_to_topics(result, embedding_model=emb, cache_dir=cache)
+        mapped = map_concepts_to_topics(result, embedding_model=emb, cache_dir=cache,
+                                        min_confidence=min_conf_t)
     except Exception as exc:  # noqa: BLE001 — ollama down, index missing, ...
         print(f"  could not map: {type(exc).__name__}: {str(exc)[:200]}")
         print("  (the embedder runs through ollama — is it up?)")
         return 1
-    print(f"  {len(mapped)} concepts mapped  ({time.monotonic() - t1:.1f}s)")
+    print(f"  {len({m.source_cui for m in mapped})} concepts mapped, {len(mapped)} (concept, topic) pairs"
+          f"  ({time.monotonic() - t1:.1f}s)"
+          f"  (under confidence {min_conf_t} or with no usable mention: not mapped)")
     for m in mapped:
-        print(f"  conf {m.confidence:.4f}  sim {m.similarity:.4f}  {m.source_name[:34]:36s}-> {m.display_name[:46]}")
+        print(f"  #{m.rank} conf {m.confidence:.4f}  sim {m.similarity:.4f}  {m.source_name[:28]:30s}"
+              f"'{(m.mention or '')[:16]}'  -> {m.display_name[:42]}")
 
     # -----------------------------------------------------------------
     # Stage 3 — what the wizard would offer
@@ -788,12 +891,16 @@ def _main_paper(argv: list[str]) -> int:
     except Exception:  # noqa: BLE001
         index = None
 
-    print(f"\n  every concept, by confidence:")
+    print(f"\n  every (concept, topic) pair, nearest first:")
     accepted: list[str] = []
     acc_names: set = set()
+    gave: set = set()
     seen_ids = {i for i, _ in existing}
     seen_names = {n.lower() for _, n in existing if n}
-    for m in sorted(mapped, key=lambda x: (-(x.confidence or 0), x.display_name.lower(), x.topic_id)):
+    usable = [m for m in mapped if _reaches(m.confidence, min_conf_t) and _reaches(m.similarity, min_sim_t)]
+    rest = [m for m in mapped if m not in usable]
+    for m in sorted(usable, key=lambda x: (-x.similarity, -(x.confidence or 0), x.rank, x.display_name.lower(),
+                                           x.topic_id)) + rest:
         dup = None
         if _reaches(m.confidence, min_conf_t) and _reaches(m.similarity, min_sim_t) \
                 and m.topic_id not in seen_ids \
@@ -811,15 +918,19 @@ def _main_paper(argv: list[str]) -> int:
         elif dup:
             why = f"skip  near-duplicate of '{dup[0][:30]}'" + (
                 f" cos={dup[1]:.3f}" if dup[1] is not None else "")
+        elif m.source_cui in gave:
+            why = "skip  this concept already gave a nearer topic"
         elif m.display_name.lower() in acc_names:
-            why = "skip  topic already given by a surer concept"
+            why = "skip  topic already given by a nearer concept"
         elif len(accepted) >= min(per_seed, max_add):
             why = f"cut   ({min(per_seed, max_add)} taken)"
         else:
             accepted.append(m.topic_id)
             acc_names.add(m.display_name.lower())
+            gave.add(m.source_cui)
             why = "OFFER (off)"
-        print(f"    {m.confidence:.4f}  {m.source_name[:30]:32s}-> {m.display_name[:40]:42s}{why}")
+        print(f"    sim {m.similarity:.4f}  conf {m.confidence:.4f}  {m.source_name[:26]:28s}-> "
+              f"{m.display_name[:38]:40s}{why}")
 
     if {t["id"] for t in offered} != set(accepted):
         print("\n  MISMATCH — this walkthrough disagrees with merge_umls_topics();"
@@ -832,7 +943,8 @@ def _main_paper(argv: list[str]) -> int:
     for _, name in existing:
         print(f"  openalex  {name[:60]}")
     for t in offered:
-        print(f"  umls      {t.get('display_name', '')[:60]}  <- {t.get('concept', '')[:30]} (off)")
+        print(f"  umls      {t.get('display_name', '')[:60]}  <- '{t.get('mention') or ''}'"
+              f" (UMLS: {t.get('concept', '')[:30]}) (off)")
     if not offered:
         print("  (UMLS added nothing)")
     return 0

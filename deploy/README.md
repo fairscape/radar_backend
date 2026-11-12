@@ -80,6 +80,30 @@ Two checks hold this up:
 `bind 127.0.0.1` still matters: the backend's own port and Caddy's admin
 socket stay off the network.
 
+## UMLS topic index
+
+UMLS concepts are mapped to OpenAlex topics against a *rich* topic index:
+every topic embedded as its name, OpenAlex's description and keywords
+(FUNCTIONAL_SPEC CTX-2). It is data, not code, and is not in git. Build it
+once before the first release that needs it, and again only when OpenAlex
+changes its topics or `RADAR_UMLS_EMBEDDING_MODEL` changes:
+
+    cd /p/realai/lei/radar_deployment/radar_backend
+    PYTHONNOUSERSITE=1 /bigtemp/nkw3mr/radar_deployment/conda_env312/bin/python \
+        scripts/build_topic_index.py --rich --output-dir data/umls_cache
+
+It fetches the ~4,500 topics (about 23 OpenAlex calls, with the configured
+key) and embeds each through Ollama: minutes on CUDA, over an hour on
+Vulkan. `--topics-json FILE` embeds topics fetched before without calling
+OpenAlex. The three files are swapped in together, so a running backend
+picks the index up on its next mapping; papers whose extraction failed
+meanwhile are retried after six hours, or at once after a restart.
+
+Without it the backend still starts, but no paper's concepts can be mapped
+and old UMLS data is left as it is: `start_backend.sh` warns, the backend
+logs `api.umls_topic_index_unusable`, `/api/health` says
+`"umls_topic_index": "unusable"` and `radar.sh status` shows it.
+
 ## When the data shrinks: pinned copies
 
 `backup.sh` does not try to tell an accident from a deliberate cleanup.

@@ -13,5 +13,9 @@ export OLLAMA_MODELS=/bigtemp/nkw3mr/ollama/models
 export CUDA_VISIBLE_DEVICES=0
 export OLLAMA_KEEP_ALIVE=-1
 export OLLAMA_MAX_LOADED_MODELS=1
+# CUDA, not Vulkan (2026-11-11, records/35): Ollama 0.32.7 picked Vulkan on
+# every start, ~1 s an embedding; on CUDA ~0.1 s, the same vectors.
+export OLLAMA_VULKAN=0
+export GGML_VK_VISIBLE_DEVICES=
 
 exec /bigtemp/nkw3mr/ollama/bin/ollama serve

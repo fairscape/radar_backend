@@ -122,6 +122,13 @@ async def lifespan(app: FastAPI):
             log.info("api.preload_umls.done")
         except Exception as exc:
             log.warning("api.preload_umls.failed", error=str(exc)[:200])
+        # Loaded now, and said loudly when it cannot be: without it no
+        # paper's concepts can be mapped to topics (review CTX-R1).
+        from ..umls.cache import rich_index_problem
+        problem = rich_index_problem(settings.RADAR_UMLS_CACHE_DIR, settings.RADAR_UMLS_EMBEDDING_MODEL)
+        if problem:
+            log.error("api.umls_topic_index_unusable", problem=problem,
+                      fix="python scripts/build_topic_index.py --rich")
 
     try:
         yield

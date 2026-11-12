@@ -211,6 +211,12 @@ do_status() {
 	printf '%-12s %s\n' "backend" "$(backend_up && echo 'up   127.0.0.1:8000' || echo 'DOWN')"
 	printf '%-12s %s\n' "caddy" "$(caddy_up && echo 'up   :8080' || echo 'DOWN')"
 	printf '%-12s %s\n' "tunnel" "$(tunnel_up && echo 'up' || echo 'DOWN')"
+	# Without the rich topic index no UMLS concept is mapped to a topic
+	# (review CTX-R1; deploy/README.md "UMLS topic index").
+	local umls_index
+	umls_index=$(curl -s -m 5 http://127.0.0.1:8000/api/health 2>/dev/null \
+		| grep -o '"umls_topic_index":"[a-z]*"' | cut -d'"' -f4)
+	printf '%-12s %s\n' "umls index" "${umls_index:-?}$([ "$umls_index" = unusable ] && echo '  -> build it: deploy/README.md "UMLS topic index"')"
 
 	local code verdict
 	code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' https://radar.bioxplorer.org/ 2>/dev/null)

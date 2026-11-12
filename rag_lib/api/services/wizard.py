@@ -455,6 +455,7 @@ class TopicsChanging(RuntimeError):
 
 def _aggregate_topics(
     conn: sqlite3.Connection, profile_id: int, *, new_on: bool, profile_topics: bool | None = None,
+    _umls: bool = True,
 ) -> dict:
     """The seeds' aggregated topics, carrying forward prior on/off states.
 
@@ -467,6 +468,9 @@ def _aggregate_topics(
 
     The interests of the Prosopia profiles the papers came from
     (FUNCTIONAL_SPEC M.3) are applied last: marked, and added off.
+
+    ``_umls`` False: the list without the UMLS merge, for the merge's
+    ``also_have`` (``_already_the_interests``).
     """
     prior_on = _prior_topic_states(conn, profile_id)
     stored = _stored_topic_filters(conn, profile_id)
@@ -483,9 +487,12 @@ def _aggregate_topics(
 
     # Best-effort UMLS topic merge: read the per-paper mapped topics
     # that vault.upload() stored and merge novel ones into the filters.
-    # A topic the profile wants is the interest's already: not a UMLS one.
-    topic_filters = _try_merge_umls_topics(
-        conn, profile_id, topic_filters, also_have=(from_profile or {}).get("wanted") or [])
+    # Every topic the list gets after it is the interest's already: not a
+    # UMLS one (``_already_the_interests``).
+    if _umls:
+        topic_filters = _try_merge_umls_topics(
+            conn, profile_id, topic_filters,
+            also_have=_already_the_interests(conn, profile_id, new_on, profile_topics))
     # Before the profile is applied: it marks these as any other topic, and
     # a mark it has on one is not taken for a mark that vanished.
     topic_filters = _keep_unmatched_seed_topics(conn, profile_id, stored, topic_filters)
@@ -575,8 +582,14 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
     saved, on or off, marked ``unmatched``, with no seed counted; the user
     switches it off. One a seed still brings that this rebuild left out
     (OpenAlex's beyond the list's length)
-    stays too, unmarked -- except a UMLS one, which the merge's own rules
-    (its cap, a surer concept) settle. A new interest's draft still follows
+    stays too, unmarked. A UMLS one is brought when a current seed chose it
+    and still maps to it (``_seed_topic_codes``): one no current seed
+    brings is marked ``unmatched``; one a current seed brings that this
+    merge did not choose (its cap, a nearer concept) stays as saved,
+    unmarked, on or off: the UMLS topics can then pass the cap (review
+    K2-R3), which the user took over dropping an off one (11-12: that rule
+    lost the user's state under a profile's "not wanted" and changed a
+    topic's source, K3-R1/R2). A saved topic is never dropped (B3-R1). A new interest's draft still follows
     its seeds: nothing searches by it yet. A copy being edited is the saved
     interest's list (FUNCTIONAL_SPEC E).
     """
@@ -588,7 +601,7 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
     code = researcher_topics.code
     have_ids = {code(t.get("id")) for t in topics if t.get("id")}
     have_names = {(t.get("display_name") or "").lower() for t in topics}
-    brought = _seed_topic_codes(conn, profile_id)
+    brought = _seed_topic_codes(conn, profile_id, [*topics, *(stored.get("topics") or [])])
     # Already in the rebuild but no seed's: a stored copy put back as it was
     # (``_keep_stored_umls`` after a merge that failed).
     for i, t in enumerate(topics):
@@ -601,8 +614,6 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
                 or code(old["id"]) in have_ids or (name and name in have_names)):
             continue
         still = code(old["id"]) in brought
-        if still and old.get("source") == "umls":
-            continue
         # The researcher's marks are put on by ``researcher_topics.apply``,
         # which runs on this list next (as on the rest of it).
         t = {k: v for k, v in old.items() if k not in ("profile", researcher_topics.BEFORE)}
@@ -615,27 +626,87 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
     return {**topic_filters, "topics": [*topics, *kept]}
 
 
-def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int) -> set[str]:
+def _already_the_interests(conn: sqlite3.Connection, profile_id: int, new_on: bool,
+                           profile_topics: bool | None) -> list[dict]:
+    """What the UMLS merge counts as the interest's already (its
+    ``also_have``): every topic the list has without the merge that is not a
+    UMLS one -- the list built once without it (``_aggregate_topics(...,
+    _umls=False)``).
+
+    Several steps put topics in after the merge: the profile's wanted ones,
+    the not-wanted ones the user added, those kept when the profile cannot
+    be read in full, those adopted when the researcher is gone, the
+    Prosopia interests, a saved interest's topics of removed seeds. A UMLS
+    concept took any of them: it changed source and label, was "unmatched"
+    once its seed went, and its near-duplicates came in "new" (test site
+    11-11: the removed seed's "Neuroinflammation and Neurodegeneration
+    Mechanisms", kept on, went to "Patient Discharge", two near-duplicates
+    offered new). Listed by hand they were missed twice (reviews K-R2,
+    K2-R1, K2-R2); built, none is.
+
+    Not the UMLS topics the list without the merge keeps (a saved one a
+    current seed still brings and is on, or no seed brings): counted the
+    interest's, the concept that gives one gave a second topic beside it
+    (review K2-R4, a saved UMLS topic a Prosopia profile then listed)."""
+    code = researcher_topics.code
+    without = _aggregate_topics(conn, profile_id, new_on=new_on, profile_topics=profile_topics, _umls=False)
+    # As the mapped topics write their ids (OpenAlex URLs): a Prosopia
+    # interest or a list may carry a bare code.
+    return [{**t, "id": f"https://openalex.org/{code(t['id'])}"}
+            for t in without.get("topics") or []
+            if t.get("id") and t.get("source") != "umls"]
+
+
+def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int, umls_from: list[dict]) -> set[str]:
     """Every topic a current seed brings, as ``researcher_topics.code``: its
-    OpenAlex topics (``topics_json``) and the ones its UMLS
-    concepts map to (``umls_mapped_topics_json``) -- read from the seeds,
-    not from what a rebuild kept."""
+    OpenAlex topics (``topics_json``, read from the seeds), and the UMLS
+    topics in ``umls_from`` (this rebuild's and the saved list) that a
+    current seed chose (their ``seeds``) and still maps to.
+
+    Not every topic in a seed's ``umls_mapped_topics_json``: since CTX-3b
+    those are each concept's three nearest, candidates, and a concept gives
+    one. A saved UMLS topic only a removed seed chose, which a kept seed
+    has as an unchosen candidate, was taken for "still brought", left to
+    the merge, which did not choose it -- and the user's switched-on topic
+    was gone from the list and the scans (review B3-R1)."""
+    seeds = list(profiles_repo.list_seed_openalex_ids(conn, profile_id))
     out: set[str] = set()
-    for oa_id in profiles_repo.list_seed_openalex_ids(conn, profile_id):
-        row = conn.execute("SELECT topics_json, umls_mapped_topics_json FROM papers WHERE openalex_id = ?",
-                           (oa_id,)).fetchone()
+    for oa_id in seeds:
+        row = conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa_id,)).fetchone()
         if row is None:
             continue
-        for raw, read in ((content_topics.seed_topics_raw(row[0]), lambda d: (d.get("topics") or []) + [d.get("primary_topic")]),
-                          (row[1], lambda d: d)):
-            try:
-                got = read(json.loads(raw)) if raw else []
-            except (ValueError, TypeError, AttributeError):
-                continue
-            for t in got if isinstance(got, list) else []:
-                tid = (t.get("id") or t.get("topic_id")) if isinstance(t, dict) else None
-                if tid:
-                    out.add(researcher_topics.code(tid))
+        try:
+            raw = content_topics.seed_topics_raw(row[0])
+            d = json.loads(raw) if raw else {}
+            got = (d.get("topics") or []) + [d.get("primary_topic")]
+        except (ValueError, TypeError, AttributeError):
+            continue
+        for t in got:
+            tid = t.get("id") if isinstance(t, dict) else None
+            if tid:
+                out.add(researcher_topics.code(tid))
+    # A UMLS topic: a current seed chose it (its ``seeds``) and still has it
+    # among its concepts' topics now. ``seeds`` says who chose it when it
+    # was added; a seed read again since (CTX-5 redoes every older one)
+    # may map elsewhere, and the topic was then said to be that seed's for
+    # good (review K-R1). A seed not read yet (NULL) cannot say: it counts.
+    candidates: dict[str, set[str] | None] = {}
+    for oa_id in seeds:
+        row = conn.execute("SELECT umls_mapped_topics_json FROM papers WHERE openalex_id = ?",
+                           (oa_id,)).fetchone()
+        try:
+            got = json.loads(row[0]) if row is not None and row[0] is not None else None
+            candidates[oa_id] = None if got is None else {
+                researcher_topics.code(e["topic_id"]) for e in got if isinstance(e, dict) and e.get("topic_id")}
+        except (ValueError, TypeError):
+            candidates[oa_id] = None
+    for t in umls_from:
+        if t.get("source") != "umls" or not t.get("id"):
+            continue
+        c = researcher_topics.code(t["id"])
+        if any(oa in candidates and (candidates[oa] is None or c in candidates[oa])
+               for oa in t.get("seeds") or []):
+            out.add(c)
     return out
 
 
@@ -2453,11 +2524,21 @@ def _try_merge_umls_topics(
 
 
 def forget_stale_umls_mappings(conn: sqlite3.Connection, seed_ids: list[str]) -> None:
-    """Send back to extraction the seeds whose stored topic mapping was made
-    by the earlier rules (``topic_mapper.stale_mapping``): the topics are now
-    chosen on the concepts' confidence, which those did not record."""
-    from ...umls.topic_mapper import stale_mapping
+    """Send back to extraction the seeds whose stored UMLS data was made by
+    earlier rules (``topic_mapper.stale_extraction``): the topics are now
+    found from the sentences the concepts were read in (CTX-5), which those
+    did not record."""
+    from ...umls.cache import rich_index_problem
+    from ...umls.topic_mapper import stale_extraction
+    from ..settings import get_settings
 
+    settings = get_settings()
+    problem = rich_index_problem(settings.RADAR_UMLS_CACHE_DIR, settings.RADAR_UMLS_EMBEDDING_MODEL)
+    if problem:
+        # Made again it could not be mapped at all (review CTX-R1): the old
+        # data is kept, and its topics with it, until the index is built.
+        log.warning("wizard.umls_stale_kept_no_index", problem=problem)
+        return
     stale = []
     for oa_id in seed_ids:
         row = conn.execute("SELECT umls_concepts_json, umls_mapped_topics_json FROM papers WHERE openalex_id = ?",
@@ -2472,7 +2553,7 @@ def forget_stale_umls_mappings(conn: sqlite3.Connection, seed_ids: list[str]) ->
         # Concepts and no mapping at all: the earlier rules found no topic
         # near enough to any of them (now each concept has its nearest).
         if (row[1] is None and concepts) or (
-                isinstance(entries, list) and stale_mapping([e for e in entries if isinstance(e, dict)])):
+                isinstance(concepts, list) and isinstance(entries, list) and stale_extraction(concepts, entries)):
             stale.append(oa_id)
     if stale:
         conn.executemany(
@@ -2553,6 +2634,9 @@ def _merge_umls_topics(
                     source_cui=e["source_cui"],
                     source_name=e["source_name"],
                     confidence=e["confidence"],
+                    mention=e.get("mention"),
+                    mapping=e.get("mapping"),
+                    rank=e.get("rank", 1),
                 )
                 for e in json.loads(raw)
             ])

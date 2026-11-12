@@ -383,3 +383,306 @@ def test_on_the_edit_copy_new_topics_stay_new_after_a_tick(live):
         assert _by_id(got)[T4]["on"] is True and _by_id(got)[T5]["on"] is False
     _, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
     assert new == set()
+
+
+# --- review B3-R1: a seed's UMLS candidates are not the topics it brings ---
+
+def _e(cui, tid, name, sim, rank=1):
+    from rag_lib.umls.topic_mapper import MAPPING
+    return {"topic_id": tid, "display_name": name, "similarity": sim, "source_cui": cui,
+            "source_name": cui, "confidence": 0.95, "mention": cui, "mapping": MAPPING, "rank": rank}
+
+
+def _umls_on(conn, monkeypatch, tmp_path, maps):
+    from rag_lib.api import settings as settings_mod
+    monkeypatch.setenv("RADAR_UMLS_ENABLED", "true")
+    monkeypatch.setenv("RADAR_UMLS_CACHE_DIR", str(tmp_path / "umls"))
+    settings_mod.get_settings.cache_clear()
+    concepts = json.dumps([{"cui": "C1", "name": "c", "confidence": 0.95, "semantic_type": "x", "mentions": []}])
+    for w, entries in maps.items():
+        conn.execute("UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? WHERE openalex_id = ?",
+                     (concepts, json.dumps(entries), w))
+    conn.commit()
+
+
+_T5, _T7 = "https://openalex.org/T10005", "https://openalex.org/T10007"
+
+
+def _save_with_seven_on(conn, uid, pid, slug):
+    wizard.aggregate_draft_topics(conn, user_id=uid, slug=slug)
+    on = [t for t, v in _by_id(_stored(conn, pid)).items() if v["on"]] + [_T7]
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=on)
+    assert _by_id(_stored(conn, pid))[_T7]["on"] is True
+    return on
+
+
+def test_b3_r1_a_removed_seeds_umls_topic_a_kept_seed_has_as_a_candidate_stays_unmatched(live, monkeypatch, tmp_path):
+    """W1's concept gave Five; Seven is only its unchosen 2nd nearest. Seven
+    came from W2 and was switched on: removing W2 keeps it, on, unmatched
+    (it was dropped from the list and, on save, from the scans)."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T5, "Five", 0.9), _e("C1", _T7, "Seven", 0.8, 2)],
+                                           W2: [_e("C2", _T7, "Seven", 0.85)]})
+    on = _save_with_seven_on(conn, uid, pid, slug)
+    _remove(conn, pid, W2)
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_T7]["on"] is True and got[_T7].get("unmatched") is True
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=on)
+    assert _by_id(_stored(conn, pid))[_T7]["on"] is True
+
+
+def test_b3_r1b_an_openalex_topic_only_a_removed_seed_had_is_unmatched_whatever_the_candidates(
+        live, monkeypatch, tmp_path):
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T5, "Five", 0.9), _e("C1", T3, "Three", 0.7, 3)]})
+    _remove(conn, pid, W2)
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[T3].get("unmatched") is True
+
+
+def test_b3_r1_a_kept_seeds_umls_topic_the_merge_now_leaves_out_stays_as_saved(live, monkeypatch, tmp_path):
+    """Chosen by a seed that is still there but now cut by the cap: not
+    dropped, and not said to come from no seed."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T7, "Seven", 0.8)], W2: []})
+    _save_with_seven_on(conn, uid, pid, slug)
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T7, "Seven", 0.8), _e("C9", _T5, "Five", 0.95)]})
+    monkeypatch.setenv("RADAR_UMLS_MAX_TOPIC_ADDITIONS", "1")
+    from rag_lib.api import settings as settings_mod
+    settings_mod.get_settings.cache_clear()
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_T5]["source"] == "umls"
+    assert got[_T7]["on"] is True and not got[_T7].get("unmatched")
+
+
+# --- test site 11-11: a saved OpenAlex topic the rebuild left out is still the interest's ---
+
+_T8 = "https://openalex.org/T10008"
+
+
+def test_a_removed_seeds_openalex_topic_kept_in_the_list_is_not_handed_to_a_umls_concept(
+        live, monkeypatch, tmp_path):
+    """W2 brought Three (OpenAlex, on). W1's concept is nearest Three: once
+    W2 is removed, Three is kept, on, unmatched, and stays OpenAlex's; the
+    concept gives its next nearest instead (it took Three, labelled with a
+    concept, test site "Patient Discharge")."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", T3, "Three", 0.9), _e("C1", _T8, "Eight", 0.8, 2)]})
+    _remove(conn, pid, W2)
+    filters, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    got = _by_id(filters)
+    assert got[T3].get("source") is None and got[T3]["on"] is True and got[T3].get("unmatched") is True
+    assert got[_T8]["source"] == "umls" and new == {_T8}
+
+
+def test_a_near_duplicate_of_a_kept_openalex_topic_is_not_offered_new(live, monkeypatch, tmp_path):
+    """Test site 11-11: two "new" topics, each a near-duplicate (cosine
+    0.778, 0.752) of the removed seed's topic still in the list and on."""
+    from rag_lib.umls import topic_mapper
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T8, "Eight", 0.9)]})
+    monkeypatch.setattr(topic_mapper, "get_topic_index", lambda _d: object())
+    monkeypatch.setattr(topic_mapper, "_embedding_similarity",
+                        lambda _i, a, b: 0.78 if {a, b} == {_T8, T3} else 0.1)
+    _remove(conn, pid, W2)
+    filters, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    assert _T8 not in _by_id(filters) and new == set()
+    assert _by_id(filters)[T3].get("unmatched") is True
+
+
+def test_a_new_interests_draft_still_follows_its_seeds(live, monkeypatch, tmp_path):
+    """Nothing is kept on a draft: its removed seed's topic is no topic of
+    the interest's, and the concept nearest it gives it."""
+    conn, uid, pid, slug = live
+    conn.execute("UPDATE profiles SET is_draft = 1, edit_of = NULL WHERE id = ?", (pid,))
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", T3, "Three", 0.9), _e("C1", _T8, "Eight", 0.8, 2)]})
+    _remove(conn, pid, W2)
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[T3]["source"] == "umls" and _T8 not in got
+
+
+def test_k_r1_a_umls_topic_its_seed_no_longer_maps_to_is_unmatched(live, monkeypatch, tmp_path):
+    """Review K-R1: Five records W1 as its seed; W1 read again (CTX-5) maps
+    elsewhere and has Five as no candidate. It stays, on, but no seed
+    brings it: unmatched (it showed as W1's for good)."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T5, "Five", 0.9)], W2: []})
+    wizard.aggregate_draft_topics(conn, user_id=uid, slug=slug)
+    on = [t for t, v in _by_id(_stored(conn, pid)).items() if v["on"]] + [_T5]
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=on)
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T8, "Eight", 0.9)], W2: []})
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_T5]["on"] is True and got[_T5].get("unmatched") is True
+    assert not got[_T8].get("unmatched")
+
+
+def test_k_r1_still_a_candidate_of_its_seed_or_its_seed_not_read_yet_counts(live, monkeypatch, tmp_path):
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T7, "Seven", 0.8)], W2: []})
+    _save_with_seven_on(conn, uid, pid, slug)
+    # Seven now only W1's 2nd nearest, cut by the cap: still W1's
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C9", _T5, "Five", 0.95), _e("C1", _T8, "Eight", 0.9),
+                                                _e("C1", _T7, "Seven", 0.8, 2)]})
+    monkeypatch.setenv("RADAR_UMLS_MAX_TOPIC_ADDITIONS", "1")
+    from rag_lib.api import settings as settings_mod
+    settings_mod.get_settings.cache_clear()
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_T7]["on"] is True and not got[_T7].get("unmatched")
+    # W1 waiting to be read again: nothing says Seven left it
+    conn.execute("UPDATE papers SET umls_concepts_json = NULL, umls_mapped_topics_json = NULL WHERE openalex_id = ?",
+                 (W1,))
+    conn.commit()
+    from rag_lib.researcher_topics import code
+    stored = _stored(conn, pid)["topics"]
+    assert code(_T7) in wizard._seed_topic_codes(conn, pid, stored)
+
+
+# --- review K-R2: every topic put in after the merge is the interest's already ---
+
+_R6 = "https://openalex.org/T10006"
+
+
+def _profile_topic_six(conn, pid, monkeypatch, tmp_path):
+    from rag_lib import researcher_topics as rt
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    s = _stored(conn, pid)
+    s["topics"].append({"id": _R6, "display_name": "Six", "count": 0, "papers": 0, "source": rt.SOURCE,
+                        "profile": rt.INTEREST, "on": True, rt.BEFORE: False})
+    s[rt.FLAG] = True
+    s[rt.CHOICES] = {}
+    conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE id = ?", (json.dumps(s), pid))
+    conn.commit()
+
+
+@pytest.mark.parametrize("read", ["labels_unmapped", "nothing_readable", "read_in_full"])
+def test_k_r2_a_profile_topic_is_not_handed_to_a_umls_concept(live, monkeypatch, tmp_path, read):
+    """Whether the profile is read in full, in part (its labels cannot be
+    mapped just now) or not at all: Six stays the researcher's, and W1's
+    concept gives its next nearest -- the same list each time (it went to
+    the concept and back as the label mapper came and went)."""
+    from rag_lib import researcher_topics as rt
+    conn, uid, pid, slug = live
+    _profile_topic_six(conn, pid, monkeypatch, tmp_path)
+    if read == "labels_unmapped":
+        monkeypatch.setattr(wizard, "_researcher_topics_for",
+                            lambda c, p, live=False: {"wanted": [], "unwanted": [], "labels_unmapped": True})
+    elif read == "nothing_readable":
+        monkeypatch.setattr(wizard, "_researcher_topics_for", lambda c, p, live=False: None)
+        monkeypatch.setattr(wizard, "_has_researcher", lambda c, p: True)
+    else:
+        monkeypatch.setattr(wizard, "_researcher_topics_for",
+                            lambda c, p, live=False: {"wanted": [{"id": _R6, "display_name": "Six"}], "unwanted": []})
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_R6]["source"] == rt.SOURCE and got[_R6]["on"] is True and not got[_R6].get("concept")
+    assert got[_T8]["source"] == "umls"
+
+
+def test_k_r2_a_prosopia_interest_is_not_handed_to_a_umls_concept(live, monkeypatch, tmp_path):
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    # a bare code, as a Prosopia document may give it, and a name of its own:
+    # only the id says it is Six
+    monkeypatch.setattr(wizard, "_prosopia_interests", lambda c, p: [
+        {"profile": "p1", "profile_name": "P1", "id": "T10006", "name": "Six, as Prosopia names it", "label": None}])
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_R6]["source"] == "prosopia" and _T8 in got and got[_T8]["source"] == "umls"
+
+
+def test_k2_r3_a_umls_topic_the_cap_pushes_out_stays_on_or_off(live, monkeypatch, tmp_path):
+    """User 11-12: a saved UMLS topic a kept seed still brings stays as it
+    was when the merge's cap pushes it out, on or off -- the list may pass
+    the cap. Dropping an off one (K2-R3) lost the user's state under a
+    profile's "not wanted" and changed a topic's source (K3-R1/R2)."""
+    from rag_lib.api import settings as settings_mod
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T7, "Seven", 0.8), _e("C2", _R6, "Six", 0.7)], W2: []})
+    wizard.aggregate_draft_topics(conn, user_id=uid, slug=slug)
+    on = [t for t, v in _by_id(_stored(conn, pid)).items() if v["on"]] + [_T7]       # Six left off
+    wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=on)
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _T7, "Seven", 0.8), _e("C2", _R6, "Six", 0.7)],
+                                           W2: [_e("C3", _T8, "Eight", 0.95)]})
+    monkeypatch.setenv("RADAR_UMLS_MAX_TOPIC_ADDITIONS", "1")
+    settings_mod.get_settings.cache_clear()
+    for i in range(2):
+        f, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+        got = _by_id(f)
+        assert got[_T7]["on"] is True and not got[_T7].get("unmatched")
+        assert got[_R6]["on"] is False and not got[_R6].get("unmatched")
+        assert got[_T8]["source"] == "umls" and new == ({_T8} if i == 0 else set())   # saved after the first
+        wizard.save_topics(conn, user_id=uid, slug=slug, selected_topic_ids=on)
+
+
+def test_k3_r1_a_saved_off_umls_topic_a_prosopia_interest_lists_keeps_its_concept_to_itself(
+        live, monkeypatch, tmp_path):
+    """Review K3-R1: as K2-R4 with Six off -- it went to Prosopia and its
+    concept gave Eight, new."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    f, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    wizard.save_topics(conn, user_id=uid, slug=slug,
+                       selected_topic_ids=[t["id"] for t in f["topics"] if t.get("on") and t["id"] != _R6])
+    monkeypatch.setattr(wizard, "_prosopia_interests", lambda c, p: [
+        {"profile": "p1", "profile_name": "P1", "id": _R6, "name": "Six", "label": None}])
+    f, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    got = _by_id(f)
+    assert got[_R6]["source"] == "umls" and got[_R6]["on"] is False
+    assert _T8 not in got and new == set()
+
+
+# --- review K2-R1/R2/R4: what the merge counts as the interest's is built, not listed ---
+
+def _profile_six_on(conn, pid, *, choices, others_off=False):
+    from rag_lib import researcher_topics as rt
+    s = _stored(conn, pid)
+    if others_off:
+        for t in s["topics"]:
+            t["on"] = False
+    s["topics"].append({"id": _R6, "display_name": "Six", "count": 0, "papers": 0, "source": rt.SOURCE,
+                        "profile": rt.INTEREST, "on": True, rt.BEFORE: False})
+    s[rt.FLAG] = True
+    s[rt.CHOICES] = choices
+    conn.execute("UPDATE profiles SET topic_filters_json = ? WHERE id = ?", (json.dumps(s), pid))
+    conn.commit()
+
+
+def test_k2_r1_a_not_wanted_topic_the_user_added_is_not_handed_to_a_umls_concept(live, monkeypatch, tmp_path):
+    from rag_lib import researcher_topics as rt
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    _profile_six_on(conn, pid, choices={"T10006": rt.ADD})
+    monkeypatch.setattr(wizard, "_researcher_topics_for",
+                        lambda c, p, live=False: {"wanted": [], "unwanted": [{"id": _R6, "display_name": "Six"}]})
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_R6]["source"] == rt.SOURCE and not got[_R6].get("concept")
+    assert got[_T8]["source"] == "umls"
+
+
+def test_k2_r2_a_topic_adopted_when_the_researcher_is_gone_is_not_handed_to_a_umls_concept(
+        live, monkeypatch, tmp_path):
+    from rag_lib import researcher_topics as rt
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    _profile_six_on(conn, pid, choices={}, others_off=True)
+    monkeypatch.setattr(wizard, "_researcher_topics_for", lambda c, p, live=False: None)
+    monkeypatch.setattr(wizard, "_has_researcher", lambda c, p: False)
+    got = _by_id(wizard.preview_topics(conn, user_id=uid, slug=slug)[0])
+    assert got[_R6]["source"] == rt.ADOPTED and got[_R6]["on"] is True
+    assert got[_T8]["source"] == "umls"
+
+
+def test_k2_r4_a_saved_umls_topic_a_prosopia_interest_lists_too_keeps_its_concept_to_itself(
+        live, monkeypatch, tmp_path):
+    """Six, W1's concept's topic, saved on; a Prosopia profile then lists
+    Six. The concept still gives Six only -- not Six kept and Eight new."""
+    conn, uid, pid, slug = live
+    _umls_on(conn, monkeypatch, tmp_path, {W1: [_e("C1", _R6, "Six", 0.9), _e("C1", _T8, "Eight", 0.8, 2)], W2: []})
+    f, _ = wizard.preview_topics(conn, user_id=uid, slug=slug)
+    wizard.save_topics(conn, user_id=uid, slug=slug,
+                       selected_topic_ids=[t["id"] for t in f["topics"] if t.get("on")] + [_R6])
+    monkeypatch.setattr(wizard, "_prosopia_interests", lambda c, p: [
+        {"profile": "p1", "profile_name": "P1", "id": _R6, "name": "Six", "label": None}])
+    for _ in range(2):
+        f, new = wizard.preview_topics(conn, user_id=uid, slug=slug)
+        got = _by_id(f)
+        assert _T8 not in got and new == set()
+        assert got[_R6]["source"] == "umls" and got[_R6]["on"] is True

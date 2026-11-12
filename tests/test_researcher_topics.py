@@ -839,7 +839,10 @@ def test_a_read_after_the_researcher_vanished_rebuilds_once(env, monkeypatch):
         conn.close()
     calls = []
     real = wizard._aggregate_topics
-    monkeypatch.setattr(wizard, "_aggregate_topics", lambda *a, **k: calls.append(1) or real(*a, **k))
+    # Rebuilds counted, not the list each builds without the UMLS merge
+    # for its ``also_have`` (wizard._already_the_interests).
+    monkeypatch.setattr(wizard, "_aggregate_topics",
+                        lambda *a, **k: (k.get("_umls", True) and calls.append(1)) or real(*a, **k))
     _topics(app, slug)
     assert len(calls) == 1
     assert _stored(env, slug)["researcher_topics"] is False

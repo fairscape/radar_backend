@@ -37,7 +37,16 @@ def health(
         ollama_model=settings.RADAR_OLLAMA_MODEL if provider == "ollama" else None,
         llm_provider=provider,
         llm_model=model,
+        umls_topic_index=_umls_topic_index(settings),
     )
+
+
+def _umls_topic_index(settings: Settings) -> str | None:
+    if not settings.RADAR_UMLS_ENABLED:
+        return None
+    from ...umls.cache import rich_index_problem
+    problem = rich_index_problem(settings.RADAR_UMLS_CACHE_DIR, settings.RADAR_UMLS_EMBEDDING_MODEL)
+    return "unusable" if problem else "ok"
 
 
 @router.get("/openalex/status")

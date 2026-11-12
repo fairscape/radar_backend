@@ -9,8 +9,17 @@ Output files:
   - openalex_topics.json       — topic metadata [{id, display_name, subfield, field, domain}, ...]
   - openalex_topic_embeddings.npz — row-normalized float32 embedding matrix
 
+With ``--rich`` it builds the index the UMLS mapper searches instead: each
+topic embedded as its name, OpenAlex's description and its keywords
+(``rag_lib.umls.cache.rich_topic_text``), fetched with the configured
+OpenAlex key (``RADAR_OPENALEX_API_KEY``), into openalex_topics_rich.json /
+openalex_topic_rich_embeddings.npz / openalex_topic_rich_index.meta.json.
+``--topics-json PATH`` embeds topics fetched earlier (that same JSON format)
+without calling OpenAlex.
+
 Usage:
     python scripts/build_topic_index.py [--embedding-model specter2] [--output-dir data/umls_cache]
+    python scripts/build_topic_index.py --rich [--topics-json topics.json] [--output-dir data/umls_cache]
 """
 
 from __future__ import annotations
@@ -79,17 +88,52 @@ def fetch_all_topics(mailto: str) -> list[dict]:
     return topics
 
 
-def embed_topics(topics: list[dict], embedding_model: str) -> np.ndarray:
-    """Embed each topic's display_name and return a (N, dim) matrix."""
+def fetch_rich_topics() -> list[dict]:
+    """Every OpenAlex topic with its description and keywords."""
+    from rag_lib.openalex_client import OpenAlexClient
+
+    client = OpenAlexClient(MAILTO)
+    topics: list[dict] = []
+    page = 0
+    while True:
+        page += 1
+        data = client.topics_page(page, PER_PAGE)
+        results = data.get("results") or []
+        for r in results:
+            topics.append({
+                "id": r.get("id", ""),
+                "display_name": r.get("display_name", ""),
+                "description": r.get("description") or "",
+                "keywords": r.get("keywords") or [],
+                "subfield": (r.get("subfield") or {}).get("display_name", ""),
+                "field": (r.get("field") or {}).get("display_name", ""),
+                "domain": (r.get("domain") or {}).get("display_name", ""),
+            })
+        print(f"  Page {page}: fetched {len(results)} topics (total: {len(topics)})")
+        count = (data.get("meta") or {}).get("count")
+        if len(results) < PER_PAGE or (count is not None and page * PER_PAGE >= count):
+            break
+        time.sleep(0.1)
+    print(f"  OpenAlex calls: {client.api_calls}")
+    return topics
+
+
+def topic_text(topic: dict) -> str:
+    """The name-only index's text: the display_name (or its subfield)."""
+    text = topic["display_name"]
+    if not text.strip():
+        text = topic.get("subfield") or topic.get("field") or "unknown"
+    return text
+
+
+def embed_topics(topics: list[dict], embedding_model: str, text=topic_text) -> np.ndarray:
+    """Embed each topic's ``text(topic)`` and return a (N, dim) matrix."""
     embedder = get_embedder(embedding_model)
 
     embeddings = []
     total = len(topics)
     for i, t in enumerate(topics):
-        text = t["display_name"]
-        if not text.strip():
-            text = t.get("subfield") or t.get("field") or "unknown"
-        vec = embedder(text)
+        vec = embedder(text(t))
         embeddings.append(vec)
         if (i + 1) % 100 == 0 or (i + 1) == total:
             print(f"  Embedded {i + 1}/{total} topics")
@@ -116,13 +160,32 @@ def main():
         "--mailto", default=MAILTO,
         help="Email for OpenAlex polite pool",
     )
+    parser.add_argument(
+        "--rich", action="store_true",
+        help="Build the rich index (name + description + keywords) the UMLS mapper searches",
+    )
+    parser.add_argument(
+        "--topics-json", type=Path, default=None,
+        help="With --rich: embed topics from this JSON (as --rich saves them) instead of fetching",
+    )
     args = parser.parse_args()
+    if args.topics_json and not args.rich:
+        parser.error("--topics-json needs --rich")
+
+    from rag_lib.umls import cache
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Fetching OpenAlex topics...")
-    topics = fetch_all_topics(args.mailto)
+    if args.topics_json:
+        topics = json.loads(args.topics_json.read_text(encoding="utf-8"))
+        print(f"Read {len(topics)} topics from {args.topics_json}")
+    elif args.rich:
+        print("Fetching OpenAlex topics with descriptions and keywords...")
+        topics = fetch_rich_topics()
+    else:
+        print(f"Fetching OpenAlex topics...")
+        topics = fetch_all_topics(args.mailto)
     print(f"Fetched {len(topics)} topics total")
 
     if not topics:
@@ -130,22 +193,23 @@ def main():
         sys.exit(1)
 
     print(f"\nEmbedding topics with '{args.embedding_model}'...")
-    embeddings = embed_topics(topics, args.embedding_model)
+    embeddings = embed_topics(topics, args.embedding_model,
+                              cache.rich_topic_text if args.rich else topic_text)
     print(f"Embedding matrix shape: {embeddings.shape}")
 
     # Save
-    topics_path = output_dir / "openalex_topics.json"
-    embeddings_path = output_dir / "openalex_topic_embeddings.npz"
+    if args.rich:
+        names = (cache.RICH_TOPICS_FILE, cache.RICH_EMBEDDINGS_FILE, cache.RICH_META_FILE)
+    else:
+        names = (cache.TOPICS_FILE, cache.EMBEDDINGS_FILE, cache.META_FILE)
+    topics_path, embeddings_path, meta_path = (output_dir / n for n in names)
 
     from datetime import datetime, timezone
 
-    from rag_lib.umls.cache import META_FILE
-
-    meta_path = output_dir / META_FILE
     # Write beside the live files, then swap all three in: a running backend
     # never sees new topics with old vectors, or vectors without their model.
     tmp_topics = topics_path.with_suffix(".json.tmp")
-    tmp_emb = output_dir / "openalex_topic_embeddings.tmp.npz"
+    tmp_emb = embeddings_path.with_name(embeddings_path.stem + ".tmp.npz")
     tmp_meta = meta_path.with_suffix(".json.tmp")
     with open(tmp_topics, "w", encoding="utf-8") as f:
         json.dump(topics, f, ensure_ascii=False)

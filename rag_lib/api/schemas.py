@@ -60,6 +60,10 @@ class Health(_Model):
     ollama_model: str | None = None
     llm_provider: LLMProvider | None = None
     llm_model: str | None = None
+    # "ok" / "unusable": whether UMLS concepts can be mapped to topics (the
+    # rich topic index, scripts/build_topic_index.py --rich); None with
+    # UMLS switched off.
+    umls_topic_index: Literal["ok", "unusable"] | None = None
 
 
 class Profile(_Model):
@@ -236,6 +240,9 @@ class Topic(_Model):
     # concept's confidence (rag_lib.umls.topic_mapper.merge_umls_topics).
     umls_concept: str | None = None
     umls_confidence: float | None = None
+    # ...and the word the seed's text says it with (CTX-4): "analysis" for
+    # the concept "Analysis of substances". None for a topic chosen before.
+    umls_mention: str | None = None
     # A saved interest's topic that no seed brings any more (a seed removed
     # since): kept as saved (FUNCTIONAL_SPEC T.2-2). Set on the edit page's
     # list (``topics/preview``); None elsewhere.

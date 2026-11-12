@@ -2,11 +2,12 @@
 
 The merge decides which UMLS-derived topics get appended to a profile's
 ``topic_filters``; switched on, they feed the OpenAlex gatherer's query,
-and a bad pick pulls off-topic papers into the candidate pool. They are
-chosen on the concepts' confidence: from each seed its concepts of 0.9 or
-more whose nearest topic is 0.80 or more similar to them (UT-1), five of
-them, at most twenty for the interest; added off. The fixtures' mappings
-are near (0.85) unless a test is about the similarity bar.
+and a bad pick pulls off-topic papers into the candidate pool. Since CTX
+(records/35) they are chosen on how near each concept, embedded in the
+sentences it was read from, is to its topic: from each seed its concepts
+of 0.9 or more, the five nearest; at most twenty for the interest, those
+more seeds chose first, then the nearer; added off. There is no
+similarity bar any more (SIMILARITY 0.0).
 """
 
 from __future__ import annotations
@@ -18,14 +19,20 @@ from rag_lib.umls import topic_mapper
 from rag_lib.umls.topic_mapper import MappedTopic, merge_umls_topics
 
 
-def _mt(tid: str, name: str, conf: float, concept: str = "concept", sim: float = 0.85) -> MappedTopic:
+def _mt(tid: str, name: str, conf: float, concept: str = "concept", sim: float = 0.7,
+        mention: str | None = None, cui: str | None = None, rank: int = 1) -> MappedTopic:
+    # Each entry its own concept unless ``cui`` says two are one concept's
+    # neighbours (a concept gives one topic, CTX-3b).
     return MappedTopic(
         topic_id=tid if tid.startswith("https://") else f"https://openalex.org/{tid}",
         display_name=name,
         similarity=sim,
-        source_cui="C0000000",
+        source_cui=cui or f"C-{concept}-{tid}",
+        rank=rank,
         source_name=concept,
         confidence=conf,
+        mention=mention,
+        mapping=topic_mapper.MAPPING,
     )
 
 
@@ -61,82 +68,135 @@ def _umls(filters: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Choosing (U-1 .. U-5, U-8)
+# Choosing (U-1 .. U-5, U-8; CTX-3)
 # ---------------------------------------------------------------------------
 
 
-def test_u1_only_sure_concepts_five_a_seed_by_confidence():
-    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c) for i, c in
-             enumerate([0.95, 0.89, 1.0, 0.92, 0.7, 0.99, 0.9, 0.91, 0.96])]
+def test_u1_only_sure_concepts_five_a_seed_by_similarity():
+    # (confidence, similarity): the 0.89 and the 0.7 are nearest but unsure
+    pairs = [(0.95, 0.60), (0.89, 0.99), (1.0, 0.55), (0.92, 0.75), (0.7, 0.98),
+             (0.99, 0.70), (0.9, 0.80), (0.91, 0.65), (0.96, 0.50)]
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c, sim=s) for i, (c, s) in enumerate(pairs)]
     out = merge_umls_topics(_base("Base"), [paper])
-    # 0.89 and 0.7 are under 0.9; of the seven left, the five surest
-    assert _umls_ids(out) == ["Topic 2", "Topic 5", "Topic 8", "Topic 0", "Topic 3"]
+    # of the seven sure ones, the five nearest, nearest first; not the surest
+    assert _umls_ids(out) == ["Topic 6", "Topic 3", "Topic 5", "Topic 7", "Topic 0"]
 
 
 def test_u1_settings_are_honoured():
-    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c) for i, c in enumerate([0.95, 0.85, 0.8])]
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", c, sim=s) for i, (c, s) in
+             enumerate([(0.95, 0.5), (0.85, 0.7), (0.8, 0.6), (0.79, 0.9)])]
     out = merge_umls_topics(_base("Base"), [paper], min_confidence=0.8, per_paper=2)
-    assert _umls_ids(out) == ["Topic 0", "Topic 1"]
+    assert _umls_ids(out) == ["Topic 1", "Topic 2"]
+
+
+def test_equal_similarity_falls_back_to_confidence_then_name():
+    paper = [_mt("T901", "B topic", 0.91), _mt("T902", "A topic", 0.91), _mt("T903", "C topic", 0.99)]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [paper])) == ["C topic", "A topic", "B topic"]
 
 
 def test_u2_a_concept_whose_topic_the_interest_has_is_skipped_and_the_next_takes_its_place():
     base = _base("Microglia and Neuroinflammation")
-    paper = [_mt(base["topics"][0]["id"], "Microglia and Neuroinflammation", 1.0, "Microglia")] + \
-        [_mt(f"T9{i:02d}", f"Topic {i}", 0.99 - i / 100) for i in range(6)]
+    paper = [_mt(base["topics"][0]["id"], "Microglia and Neuroinflammation", 1.0, "Microglia", sim=0.99)] + \
+        [_mt(f"T9{i:02d}", f"Topic {i}", 0.95, sim=0.9 - i / 100) for i in range(6)]
     out = merge_umls_topics(base, [paper])
     assert _umls_ids(out) == [f"Topic {i}" for i in range(5)]
 
 
-def test_u3_two_concepts_one_topic_count_once_and_the_surer_concept_stays():
-    paper = [_mt("T900", "Immune Response", 0.99, "Immune response"),
-             _mt("T900", "Immune Response", 0.95, "Inflammation"),
-             *[_mt(f"T91{i}", f"Topic {i}", 0.94 - i / 100) for i in range(5)]]
+def test_ctx3b_a_concept_whose_nearest_the_interest_has_gives_its_next():
+    """User 11-11 (option B): the Immunity paper's concepts were all nearest
+    its own Alzheimer topics, so nothing was added."""
+    base = _base("Alzheimer's disease research")
+    own = base["topics"][0]["id"]
+    paper = [_mt(own, "Alzheimer's disease research", 0.95, "Adaptive Immunity", sim=0.75, cui="C1", rank=1),
+             _mt("T901", "Immune responses and vaccinations", 0.95, "Adaptive Immunity", sim=0.69, cui="C1", rank=2),
+             _mt("T902", "T-cell and B-cell Immunology", 0.95, "Adaptive Immunity", sim=0.68, cui="C1", rank=3)]
+    out = merge_umls_topics(base, [paper])
+    assert _umls_ids(out) == ["Immune responses and vaccinations"]
+    assert _umls(out)[0]["concept"] == "Adaptive Immunity"
+
+
+def test_ctx3b_a_concept_gives_one_topic():
+    paper = [_mt(f"T90{k}", f"Topic {k}", 0.95, "one", sim=0.9 - k / 100, cui="C1", rank=k + 1) for k in range(3)] + \
+        [_mt("T910", "Other", 0.95, "two", sim=0.5, cui="C2")]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [paper])) == ["Topic 0", "Other"]
+
+
+def test_ctx3b_a_topic_a_nearer_concept_took_sends_the_concept_to_its_next():
+    paper = [_mt("T901", "Shared", 0.95, "near", sim=0.80, cui="C1"),
+             _mt("T901", "Shared", 0.95, "far", sim=0.70, cui="C2", rank=1),
+             _mt("T902", "Second of far", 0.95, "far", sim=0.65, cui="C2", rank=2)]
+    out = merge_umls_topics(_base("Base"), [paper])
+    assert [(t["display_name"], t["concept"]) for t in _umls(out)] == [("Shared", "near"), ("Second of far", "far")]
+
+
+def test_ctx3b_neighbours_equal_once_rounded_go_nearest_first():
+    """Review B3-R2: similarity is stored to 4 places; a tie went by name."""
+    paper = [_mt("T901", "Zeta", 0.95, "one", sim=0.8, cui="C1", rank=1),
+             _mt("T902", "Alpha", 0.95, "one", sim=0.8, cui="C1", rank=2)]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [paper])) == ["Zeta"]
+
+
+def test_u3_two_concepts_one_topic_count_once_and_the_nearer_concept_stays():
+    paper = [_mt("T900", "Immune Response", 0.95, "Inflammation", sim=0.80, mention="inflamed"),
+             _mt("T900", "Immune Response", 0.99, "Immune response", sim=0.78),
+             *[_mt(f"T91{i}", f"Topic {i}", 0.94, sim=0.70 - i / 100) for i in range(5)]]
     out = merge_umls_topics(_base("Base"), [paper])
     topics = _umls(out)
+    # the topic takes one of the five places, not two
     assert [t["display_name"] for t in topics] == ["Immune Response", *[f"Topic {i}" for i in range(4)]]
-    assert topics[0]["concept"] == "Immune response" and topics[0]["confidence"] == 0.99
+    assert topics[0]["concept"] == "Inflammation" and topics[0]["similarity"] == 0.80
+    assert topics[0]["mention"] == "inflamed" and topics[0]["count"] == 1
 
 
-def test_u4_two_seeds_choosing_one_topic_list_it_once_with_the_best_confidence():
-    a = [_mt("T900", "Shared", 0.93, "from a")]
-    b = [_mt("T900", "Shared", 0.98, "from b"), _mt("T901", "Only b", 0.95)]
+def test_u4_two_seeds_choosing_one_topic_list_it_once_with_the_nearest_concept():
+    a = [_mt("T900", "Shared", 0.93, "from a", sim=0.71)]
+    b = [_mt("T900", "Shared", 0.98, "from b", sim=0.62), _mt("T901", "Only b", 0.95, sim=0.90)]
     topics = _umls(merge_umls_topics(_base("Base"), [a, b]))
+    # two seeds before one, however near the one is
     assert [t["display_name"] for t in topics] == ["Shared", "Only b"]
-    assert topics[0]["concept"] == "from b" and topics[0]["count"] == 2 and topics[0]["papers"] == [0, 1]
+    assert topics[0]["concept"] == "from a" and topics[0]["similarity"] == 0.71
+    assert topics[0]["count"] == 2 and topics[0]["papers"] == [0, 1]
     assert topics[1]["papers"] == [1]
 
 
 def test_u4_identically_named_topics_under_two_ids_are_one():
     """OpenAlex carries "Medical research and treatments" and "Medical
     Research and Treatments" under different ids; one is enough."""
-    a = [_mt("T900", "Medical research and treatments", 0.95)]
-    b = [_mt("T901", "Medical Research and Treatments", 0.99)]
-    assert _umls_ids(merge_umls_topics(_base("Base"), [a, b])) == ["Medical Research and Treatments"]
+    a = [_mt("T900", "Medical research and treatments", 0.95, sim=0.6)]
+    b = [_mt("T901", "Medical Research and Treatments", 0.99, sim=0.7)]
+    topics = _umls(merge_umls_topics(_base("Base"), [a, b]))
+    assert [t["display_name"] for t in topics] == ["Medical Research and Treatments"]
+    assert topics[0]["count"] == 2
 
 
-def test_u5_six_seeds_of_five_topics_keep_the_twenty_surest():
-    seeds = [[_mt(f"T{s}{i}", f"S{s} T{i}", round(0.9 + (s * 5 + i) / 400, 4)) for i in range(5)]
-             for s in range(6)]
-    out = _umls(merge_umls_topics(_base("Base"), seeds))
-    assert len(out) == 20
-    every = sorted((t for p in seeds for t in p), key=lambda m: -m.confidence)
-    assert [t["display_name"] for t in out] == [m.display_name for m in every[:20]]
+def test_u5_more_seeds_first_then_the_nearer_twenty_kept():
+    # topic k is chosen by k % 4 + 1 seeds, at similarity 0.5 + k / 100
+    seeds: list[list[MappedTopic]] = [[] for _ in range(4)]
+    for k in range(30):
+        for s in range(k % 4 + 1):
+            seeds[s].append(_mt(f"T{k:03d}", f"Topic {k}", 0.95, sim=round(0.5 + k / 100, 4)))
+    out = _umls(merge_umls_topics(_base("Base"), seeds, per_paper=30))
+    expected = sorted(range(30), key=lambda k: (-(k % 4 + 1), -k))[:20]
+    assert [t["display_name"] for t in out] == [f"Topic {k}" for k in expected]
+    assert [t["count"] for t in out] == [k % 4 + 1 for k in expected]
 
 
 def test_max_additions_is_respected():
-    paper = [_mt(f"T9{i:02d}", f"Topic {i}", 0.99 - i / 100) for i in range(5)]
-    assert len(_umls_ids(merge_umls_topics(_base("Base"), [paper], max_additions=3))) == 3
+    paper = [_mt(f"T9{i:02d}", f"Topic {i}", 0.99, sim=0.9 - i / 100) for i in range(5)]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [paper], max_additions=3)) == ["Topic 0", "Topic 1", "Topic 2"]
 
 
 def test_u6_added_topics_are_off_and_say_where_they_came_from():
-    out = _umls(merge_umls_topics(_base("Base"), [[_mt("T900", "Topic", 0.97, "Adaptive Immunity")]]))
+    out = _umls(merge_umls_topics(_base("Base"), [[_mt("T900", "Topic", 0.97, "Adaptive Immunity",
+                                                        sim=0.6543, mention="adaptive immune")]]))
     assert out == [{"id": "https://openalex.org/T900", "display_name": "Topic", "count": 1, "source": "umls",
-                    "on": False, "concept": "Adaptive Immunity", "confidence": 0.97, "papers": [0]}]
+                    "on": False, "concept": "Adaptive Immunity", "confidence": 0.97,
+                    "mention": "adaptive immune", "similarity": 0.6543, "papers": [0]}]
 
 
 def test_u8_a_seed_without_a_sure_concept_adds_nothing():
     base = _base("Base")
-    out = merge_umls_topics(base, [[_mt("T900", "Topic", 0.89)], [_mt("T901", "Other", 0.5)]])
+    out = merge_umls_topics(base, [[_mt("T900", "Topic", 0.89, sim=0.99)], [_mt("T901", "Other", 0.5)]])
     assert out == base
 
 
@@ -146,27 +206,16 @@ def test_a_mapping_without_confidence_adds_nothing():
     assert _umls_ids(merge_umls_topics(_base("Base"), [[old]])) == []
 
 
-def test_similarity_is_a_bar_not_a_rank():
-    """UT-1 / UT-a: a concept whose nearest topic is under 0.80 to it is
-    not used and the next concept takes its place; at or above the bar the
-    confidence alone ranks (a nearer topic does not win)."""
-    assert topic_mapper.SIMILARITY == 0.80
-    near = _mt("T900", "Near", 0.91, sim=0.95)
-    at_bar = _mt("T902", "At bar", 0.95, sim=0.80)
-    far = _mt("T901", "Far", 0.99, sim=0.79)
-    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1)) == ["Near"]
-    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, at_bar, far]], per_paper=1)) == ["At bar"]
-    assert _umls_ids(merge_umls_topics(_base("Base"), [[near, far]], per_paper=1,
-                                       min_similarity=0.5)) == ["Far"]
-
-
-def test_scope_noise_is_no_longer_offered():
-    """UT-b: SCoPe's two concepts as stored on the live paper (11-06)."""
-    cement = _mt("T10113", "Dental materials and restorations", 0.9843,
-                 concept="BaseLine dental cement", sim=0.6654)
-    algebra = _mt("T11727", "Advanced Algebra and Logic", 0.9687,
-                  concept="Expression procedure", sim=0.6238)
-    assert _umls_ids(merge_umls_topics(_base("Base"), [[cement, algebra]])) == []
+def test_similarity_ranks_and_is_no_bar_unless_set():
+    """CTX-3: a sentence against a description measures 0.6-0.8 for the
+    right topic and the wrong ones alike, so no bar by default; the
+    nearer wins whatever the confidence. The setting can still set one."""
+    assert topic_mapper.SIMILARITY == 0.0
+    near = _mt("T900", "Near", 0.91, sim=0.75)
+    far = _mt("T901", "Far", 0.99, sim=0.31)
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[far, near]], per_paper=1)) == ["Near"]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[far]])) == ["Far"]
+    assert _umls_ids(merge_umls_topics(_base("Base"), [[far, near]], min_similarity=0.5)) == ["Near"]
 
 
 def test_a_mapping_without_similarity_is_not_used():
@@ -178,13 +227,32 @@ def test_a_mapping_without_similarity_is_not_used():
 def test_the_setting_reaches_the_merge():
     from rag_lib.api.settings import Settings
 
-    assert Settings.model_fields["RADAR_UMLS_TOPIC_MIN_SIMILARITY"].default == 0.80
+    assert Settings.model_fields["RADAR_UMLS_TOPIC_MIN_SIMILARITY"].default == topic_mapper.SIMILARITY == 0.0
 
 
 def test_stale_mapping_is_recognised():
+    # made before CTX: no mapping marker (or another one)
     assert topic_mapper.stale_mapping([{"topic_id": "T1", "similarity": 0.5}])
+    assert topic_mapper.stale_mapping([{"topic_id": "T1", "similarity": 0.5, "mapping": "name-0"}])
+    # one topic a concept (CTX before 3b): mapped again for its neighbours
+    assert topic_mapper.stale_mapping([{"topic_id": "T1", "similarity": 0.5, "mapping": "context-1"}])
+    assert topic_mapper.stale_mapping([_mt("T1", "x", 0.9).to_dict(), {"topic_id": "T2"}])
     assert not topic_mapper.stale_mapping([_mt("T1", "x", 0.9).to_dict()])
     assert not topic_mapper.stale_mapping([])
+
+
+def test_stale_extraction_is_recognised():
+    fresh = {"cui": "C1", "name": "x", "mentions": [{"text": "x", "sentence": "x is."}]}
+    mapped = [_mt("T1", "x", 0.9).to_dict()]
+    assert not topic_mapper.stale_extraction([fresh], mapped)
+    # concepts stored without their sentences
+    assert topic_mapper.stale_extraction([fresh, {"cui": "C2", "name": "y"}], mapped)
+    # a mapping by the earlier rules
+    assert topic_mapper.stale_extraction([fresh], [{"topic_id": "T1"}])
+    # a concept with no usable mention still has the key: not stale
+    assert not topic_mapper.stale_extraction([{"cui": "C3", "name": "z", "mentions": []}], [])
+    assert not topic_mapper.stale_extraction([], [])
+    assert not topic_mapper.stale_extraction(["junk"], [None])
 
 
 # ---------------------------------------------------------------------------
@@ -352,38 +420,65 @@ def test_base_filters_not_mutated():
 # --------------------------------------------------------------------------
 
 
-def _write_index(d, dim: int, model: str | None):
+def _write_index(d, dim: int, model: str | None, *, rich: bool = True):
     import json
 
-    from rag_lib.umls.cache import META_FILE
+    from rag_lib.umls import cache
 
+    names = ((cache.RICH_TOPICS_FILE, cache.RICH_EMBEDDINGS_FILE, cache.RICH_META_FILE) if rich
+             else (cache.TOPICS_FILE, cache.EMBEDDINGS_FILE, cache.META_FILE))
     topics = [{"id": f"https://openalex.org/T{i}", "display_name": f"Topic {i}"} for i in range(3)]
-    (d / "openalex_topics.json").write_text(json.dumps(topics))
-    np.savez_compressed(d / "openalex_topic_embeddings.npz", embeddings=np.eye(3, dim, dtype=np.float32))
+    (d / names[0]).write_text(json.dumps(topics))
+    np.savez_compressed(d / names[1], embeddings=np.eye(3, dim, dtype=np.float32))
     if model:
-        (d / META_FILE).write_text(json.dumps({"embedding_model": model, "dim": dim}))
+        (d / names[2]).write_text(json.dumps({"embedding_model": model, "dim": dim}))
 
 
 @pytest.fixture()
 def fresh_index(monkeypatch):
+    """Fresh index caches and a stub embedder: a text naming "Topic k" points
+    at topic k; the texts embedded are in the list it returns."""
     from rag_lib import embedders
     from rag_lib.umls import cache
 
     monkeypatch.setattr(cache, "_index", None)
+    monkeypatch.setattr(cache, "_rich_index", None)
     dims = {"model-1024": 1024, "model-768": 768}
-    monkeypatch.setattr(embedders, "get_embedder",
-                        lambda name: (lambda text: [1.0] + [0.0] * (dims[name] - 1)))
+    seen: list[str] = []
+
+    def embed(name):
+        def _e(text):
+            seen.append(text)
+            v = [0.0] * dims[name]
+            v[next((k for k in range(3) if f"Topic {k}" in text), 0)] = 1.0
+            return v
+        return _e
+
+    monkeypatch.setattr(embedders, "get_embedder", embed)
+    return seen
 
 
-def _concept():
+def _concept(cui="C1", name="diabetes", confidence=0.95, mentions=(("diabetic", "Diabetic mice were fed."),)):
     from rag_lib.umls.extractor import UmlsConcept
-    return UmlsConcept(cui="C1", name="diabetes", tui="T047", semantic_type="Disease", confidence=0.9)
+    return UmlsConcept(cui=cui, name=name, tui="T047", semantic_type="Disease", confidence=confidence,
+                       mentions=tuple(mentions))
 
 
 def test_an_index_built_with_the_mappers_model_maps(tmp_path, fresh_index):
     _write_index(tmp_path, 1024, "model-1024")
     out = topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
-    assert [m.topic_id for m in out] == ["https://openalex.org/T0"]
+    assert [(m.mention, m.mapping, m.rank) for m in out] == [
+        ("diabetic", topic_mapper.MAPPING, k + 1) for k in range(3)]
+    assert out[0].topic_id == "https://openalex.org/T0"
+    assert {m.topic_id for m in out} == {f"https://openalex.org/T{k}" for k in range(3)}
+    # the concept embedded in its sentence, not its name alone
+    assert fresh_index == ["diabetes: Diabetic mice were fed."]
+
+
+def test_the_rich_index_is_searched_not_the_name_one(tmp_path, fresh_index):
+    _write_index(tmp_path, 1024, "model-1024", rich=False)
+    with pytest.raises(FileNotFoundError, match="build_topic_index.py --rich"):
+        topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
 
 
 def test_an_index_built_with_another_model_is_refused_by_name(tmp_path, fresh_index):
@@ -391,7 +486,7 @@ def test_an_index_built_with_another_model_is_refused_by_name(tmp_path, fresh_in
 
     # Same dimension, different model: used to match nonsense silently.
     _write_index(tmp_path, 1024, "other-1024")
-    with pytest.raises(TopicIndexMismatch, match="build_topic_index.py --embedding-model model-1024"):
+    with pytest.raises(TopicIndexMismatch, match="build_topic_index.py --rich --embedding-model model-1024"):
         topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
 
 
@@ -404,20 +499,73 @@ def test_an_old_index_without_meta_is_refused_on_dimension(tmp_path, fresh_index
         topic_mapper.map_concepts_to_topics([_concept()], embedding_model="model-1024", cache_dir=str(tmp_path))
 
 
-def test_each_concept_gets_its_one_nearest_topic_however_far(tmp_path, fresh_index):
-    from rag_lib.umls.extractor import UmlsConcept
-
+def test_each_concept_gets_its_nearest_topics_however_far(tmp_path, fresh_index):
     _write_index(tmp_path, 1024, "model-1024")
-    concepts = [UmlsConcept(cui="C1", name="a", tui="T1", semantic_type="x", confidence=0.95),
-                UmlsConcept(cui="C2", name="b", tui="T1", semantic_type="x", confidence=0.72)]
+    concepts = [_concept("C1", "a", 0.95, [("a", "About Topic 2.")]),
+                _concept("C2", "b", 0.91, [("b", "Nothing near.")])]
+    out = topic_mapper.map_concepts_to_topics(concepts, embedding_model="model-1024", cache_dir=str(tmp_path),
+                                              neighbours=1)
+    assert [(m.source_cui, m.topic_id) for m in out] == [("C1", "https://openalex.org/T2"),
+                                                        ("C2", "https://openalex.org/T0")]
+
+
+def test_ctx3b_each_concept_keeps_its_neighbours_nearest_first(tmp_path, fresh_index):
+    """CTX-3b: NEIGHBOURS (3) topics a concept, ranked 1, 2, 3, nearest first."""
+    assert topic_mapper.NEIGHBOURS == 3
+    _write_index(tmp_path, 1024, "model-1024")
+    c = _concept(mentions=[("x", "On Topic 2."), ("x", "On Topic 2 again."), ("x", "On Topic 1.")])
+    out = topic_mapper.map_concepts_to_topics([c], embedding_model="model-1024", cache_dir=str(tmp_path))
+    assert [(m.topic_id[-2:], m.rank) for m in out] == [("T2", 1), ("T1", 2), ("T0", 3)]
+    assert out[0].similarity > out[1].similarity > out[2].similarity
+
+
+def test_the_mentions_are_averaged(tmp_path, fresh_index):
+    _write_index(tmp_path, 1024, "model-1024")
+    # by its first sentence alone Topic 0; two of its three say Topic 1
+    c = _concept(mentions=[("x", "On Topic 0."), ("x", "On Topic 1."), ("x", "Again Topic 1.")])
+    out = topic_mapper.map_concepts_to_topics([c], embedding_model="model-1024", cache_dir=str(tmp_path))
+    assert [m.topic_id for m in out if m.rank == 1] == ["https://openalex.org/T1"]
+    assert out[0].similarity == round(2 / 5 ** 0.5, 4)
+    assert len(fresh_index) == 3
+
+
+def test_unsure_concepts_and_ones_without_a_mention_are_not_mapped(tmp_path, fresh_index):
+    _write_index(tmp_path, 1024, "model-1024")
+    concepts = [_concept("C1", "sure", 0.9), _concept("C2", "unsure", 0.89),
+                _concept("C3", "no mention", 0.99, mentions=())]
     out = topic_mapper.map_concepts_to_topics(concepts, embedding_model="model-1024", cache_dir=str(tmp_path))
-    assert [(m.source_cui, m.confidence) for m in out] == [("C1", 0.95), ("C2", 0.72)]
-    assert all(m.topic_id == "https://openalex.org/T0" for m in out)    # one topic each, kept twice
+    assert {m.source_cui for m in out} == {"C1"}
+    assert fresh_index == ["sure: Diabetic mice were fed."]       # nothing embedded for the others
+    out = topic_mapper.map_concepts_to_topics(concepts, embedding_model="model-1024", cache_dir=str(tmp_path),
+                                              min_confidence=0.8)
+    assert [m.source_cui for m in out if m.rank == 1] == ["C1", "C2"]
+
+
+def test_every_map_passes_the_confidence_setting():
+    """Class check: each map_concepts_to_topics call in rag_lib passes
+    min_confidence, so RADAR_UMLS_TOPIC_MIN_CONFIDENCE also decides what is
+    embedded, not only what is chosen."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    missing = []
+    for path in root.joinpath("rag_lib").rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if rel in ("rag_lib/umls/__init__.py", "rag_lib/umls/topic_mapper.py"):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and (getattr(node.func, "id", None)
+                                               or getattr(node.func, "attr", None)) == "map_concepts_to_topics":
+                if not any(k.arg == "min_confidence" for k in node.keywords):
+                    missing.append(f"{rel}:{node.lineno}")
+    assert missing == []
 
 
 def test_a_topic_the_profile_wants_is_already_the_interests():
     wanted = [{"id": "https://openalex.org/T900", "display_name": "Wanted"}]
-    paper = [_mt("T900", "Wanted", 0.99)] + [_mt(f"T9{i}{i}", f"Topic {i}", 0.98 - i / 100) for i in range(1, 6)]
+    paper = [_mt("T900", "Wanted", 0.99, sim=0.9)] + [_mt(f"T9{i}{i}", f"Topic {i}", 0.95, sim=0.8 - i / 100)
+                                                      for i in range(1, 6)]
     out = merge_umls_topics(_base("Base"), [paper], also_have=wanted)
     assert _umls_ids(out) == [f"Topic {i}" for i in range(1, 6)]
 
@@ -483,3 +631,48 @@ def test_every_score_bar_setting_is_checked():
     bars = sorted(n for n, f in Settings.model_fields.items()
                   if f.annotation is float and ("CONFIDENCE" in n or "SIMILARITY" in n))
     assert bars == sorted(SCORE_BARS)
+
+
+def test_the_shown_word_is_the_surest_mention(tmp_path, fresh_index):
+    """Mentions come surest first (extractor); the topic shows that one
+    (review CTX-R5: the last one passed every test)."""
+    _write_index(tmp_path, 1024, "model-1024")
+    c = _concept(mentions=[("surest word", "On Topic 0."), ("least sure", "On Topic 0 too.")])
+    out = topic_mapper.map_concepts_to_topics([c], embedding_model="model-1024", cache_dir=str(tmp_path))
+    assert {m.mention for m in out} == {"surest word"}
+
+
+def test_a_zero_vector_is_near_nothing(tmp_path, fresh_index, monkeypatch):
+    """Review CTX-R6: with no similarity bar a zero vector would still
+    bring in whichever topic came first."""
+    from rag_lib import embedders
+
+    _write_index(tmp_path, 1024, "model-1024")
+    inner = embedders.get_embedder
+
+    def embed(name):
+        real = inner(name)
+        return lambda text: [0.0] * 1024 if "ZERO" in text else (
+            [float("nan")] * 1024 if "NAN" in text else real(text))
+    monkeypatch.setattr(embedders, "get_embedder", embed)
+    only_zero = _concept("C1", "a", 0.95, [("a", "ZERO here.")])
+    nan_and_good = _concept("C2", "b", 0.95, [("b", "NAN here."), ("b", "On Topic 2.")])
+    out = topic_mapper.map_concepts_to_topics([only_zero, nan_and_good], embedding_model="model-1024",
+                                              cache_dir=str(tmp_path))
+    assert [(m.source_cui, m.topic_id, m.similarity) for m in out if m.rank == 1] == [
+        ("C2", "https://openalex.org/T2", 1.0)]
+    assert {m.source_cui for m in out} == {"C2"}
+
+
+def test_the_confidence_class_check_sees_every_caller():
+    """The class check above walks the real callers, not none: vault and the
+    extractor's two walkthroughs."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    found = [p.relative_to(root).as_posix() for p in root.joinpath("rag_lib").rglob("*.py")
+             for node in ast.walk(ast.parse(p.read_text(encoding="utf-8")))
+             if isinstance(node, ast.Call)
+             and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) == "map_concepts_to_topics"]
+    assert sorted(found) == ["rag_lib/api/services/vault.py", "rag_lib/umls/extractor.py", "rag_lib/umls/extractor.py"]
