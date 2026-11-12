@@ -110,6 +110,14 @@ data/umls_cache/openalex_topics.json
 data/umls_cache/openalex_topic_embeddings.npz
 ```
 
+UMLS concepts are mapped against a second, *rich* index (each topic's name,
+description and keywords), which needs building once:
+`scripts/build_topic_index.py --rich --output-dir data/umls_cache`
+(about 23 OpenAlex calls, then one embedding per topic). Without it the
+backend runs but maps no new UMLS concepts, and `/api/health` reports
+`"umls_topic_index": "unusable"`. How the UMLS topics are found and chosen:
+[docs/UMLS_TOPICS.md](docs/UMLS_TOPICS.md).
+
 Ask the RADAR maintainers for `radar-openalex-topic-index.tar.gz`
 (17 MB) and unpack it in the backend directory:
 `mkdir -p data && tar xzf radar-openalex-topic-index.tar.gz -C data`.
