@@ -80,6 +80,30 @@ Two checks hold this up:
 `bind 127.0.0.1` still matters: the backend's own port and Caddy's admin
 socket stay off the network.
 
+## The site's name
+
+The site is https://bioxplorer.org, its only name (since 2026-11,
+record 38; before that https://radar.bioxplorer.org, now retired, as is
+www). Three places have to agree on it:
+
+- `cloudflared-config.yml` routes `bioxplorer.org` to Caddy, and its DNS
+  record points at the tunnel (`cloudflared tunnel route dns radar
+  bioxplorer.org`). Any other name gets the tunnel's 404.
+- `Caddyfile` sends plain http on to https://bioxplorer.org, same path
+  (308).
+- `BIOXPLORER_OIDC_REDIRECT_URI` in the live `.env` is
+  `https://bioxplorer.org/auth/login/callback`, and the same address must
+  be registered with Google (Cloud Console, the Web client) and Prosopia
+  (Nathan's `bioxplorer` client; pending on 2026-11-17, record 38).
+  Where it is not, that sign-in button fails.
+
+The backend has one callback and counts only its origin as its own, so
+it can serve exactly one name: on any other name sign-in fails and
+every write gets 403. Adding a name back therefore means a redirect to
+bioxplorer.org, never serving the site there. `radar.sh status` checks
+200 on bioxplorer.org and "write origin" (which origin the backend takes
+writes from, i.e. what `.env` says).
+
 ## UMLS topic index
 
 UMLS concepts are mapped to OpenAlex topics against a *rich* topic index:

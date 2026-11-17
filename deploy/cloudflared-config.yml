@@ -7,7 +7,11 @@
 tunnel: f2d6db27-82e9-480e-8fd6-6528a922acf3
 credentials-file: /u/nkw3mr/.cloudflared/f2d6db27-82e9-480e-8fd6-6528a922acf3.json
 
+#
+# The site is https://bioxplorer.org, its only name (record 38, 2026-11).
+# radar.bioxplorer.org, the name before, and www are not routed: they get
+# the 404 below. The backend can serve one name only (deploy/README.md).
 ingress:
-  - hostname: radar.bioxplorer.org
+  - hostname: bioxplorer.org
     service: http://localhost:8080
   - service: http_status:404

@@ -1,6 +1,6 @@
 # Changelog: radar_backend
 
-Every update of the live site (https://radar.bioxplorer.org), newest first.
+Every update of the live site (https://bioxplorer.org; https://radar.bioxplorer.org before 2026-11), newest first.
 The frontend has its own changelog (`radar_frontend/CHANGELOG.md`); the two
 are deployed together, and each entry names the frontend commit that went
 live with it.
@@ -22,6 +22,33 @@ soon after, so for those entries "commit" means the first commit that
 contains the change.
 
 ---
+
+## v2026.11.17 (2026-11-17 19:18): the site is https://bioxplorer.org
+Frontend: `v2026.11.17` (docs only).
+
+**For users**
+- The site moved from https://radar.bioxplorer.org to **https://bioxplorer.org**. The old Vercel page that used to be there is gone.
+- radar.bioxplorer.org and www.bioxplorer.org were sent on to the new name at first (19:18), then retired: the tunnel no longer routes them, and their DNS records are removed.
+- Plain http goes to https.
+- Everyone signs in once more, because cookies belong to one name. Data and accounts are unchanged, since accounts go by email.
+- "Sign in with Prosopia" works again once Prosopia lists the new callback.
+
+**Backend**
+- No application code changed.
+- `deploy/Caddyfile`: plain http (`X-Forwarded-Proto: http`) gets a 308 to https://bioxplorer.org.
+- `deploy/cloudflared-config.yml` routes only `bioxplorer.org`.
+- `radar.sh status`:
+  - checks https://bioxplorer.org;
+  - has a new "write origin" line: the backend takes writes only from its callback's origin, so it shows whether `.env` names the right site.
+- `deploy/env.example` and its test: the callback is `https://bioxplorer.org/auth/login/callback`.
+- `deploy/README.md` has a new section, "The site's name".
+
+**Operations**
+- No migration.
+- `.env`: `BIOXPLORER_OIDC_REDIRECT_URI=https://bioxplorer.org/auth/login/callback`. That is the only change.
+- DNS: `bioxplorer.org` is a CNAME to the tunnel (`cloudflared tunnel route dns -f radar bioxplorer.org`).
+- Google has the new callback registered. Prosopia does not yet; Nathan is adding it (record 38).
+- Record 38 has the steps and scripts (`staging-20261117/`).
 
 ## v2026.11.16 (2026-11-16 21:11)
 Frontend: `v2026.11.16`.

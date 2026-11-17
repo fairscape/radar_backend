@@ -120,7 +120,7 @@ def test_deploy_env_example_loads_as_the_live_site(monkeypatch):
     assert s.RADAR_LOG_JSON is False
     assert s.RADAR_HOST == "127.0.0.1"
     assert s.RADAR_NIGHTLY_GATHER_ENABLED is False
-    assert s.BIOXPLORER_OIDC_REDIRECT_URI == "https://radar.bioxplorer.org/auth/login/callback"
+    assert s.BIOXPLORER_OIDC_REDIRECT_URI == "https://bioxplorer.org/auth/login/callback"
     assert s.BIOXPLORER_COOKIE_SECURE is True
     assert s.RADAR_TRUST_EMAIL_HEADER is False
 

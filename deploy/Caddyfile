@@ -26,6 +26,16 @@ http://:8080 {
 	# admin API reported listen [":8080"]). Only this restricts the socket.
 	bind 127.0.0.1
 
+	# The site's only name is bioxplorer.org (record 38, 2026-11; the
+	# tunnel routes no other). The backend has one sign-in callback and
+	# counts only https://bioxplorer.org as its own origin, so over plain
+	# http sign-in fails ("expired": the flow cookie is Secure) and every
+	# write gets 403. Cloudflare passes http through and says so in
+	# X-Forwarded-Proto: send it to https, same path. The watchdog's
+	# probes (Host 127.0.0.1, no such header) are served as before.
+	@plain_http header X-Forwarded-Proto http
+	redir @plain_http https://bioxplorer.org{uri} 308
+
 	encode gzip
 
 	handle /api/* {

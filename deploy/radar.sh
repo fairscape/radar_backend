@@ -1,5 +1,5 @@
 #!/bin/bash
-# RADAR service manager — the four processes behind https://radar.bioxplorer.org
+# RADAR service manager — the four processes behind https://bioxplorer.org
 #
 #   ./radar.sh start      bring everything up (idempotent)
 #   ./radar.sh stop       take everything down
@@ -13,7 +13,7 @@
 #   ollama      127.0.0.1:11434  embeddings for UMLS concepts (GPU 0)
 #   backend     127.0.0.1:8000   FastAPI, conda env, runs inside tmux
 #   caddy       :8080            serves the SPA, proxies /api and /auth
-#   cloudflared                  publishes :8080 as radar.bioxplorer.org
+#   cloudflared                  publishes :8080 as bioxplorer.org
 #
 # Nothing here needs root. `watchdog` is what cron calls every 5 minutes;
 # `start` is what cron calls at @reboot. Both are safe to run by hand at
@@ -223,18 +223,32 @@ do_status() {
 	printf '%-12s %s\n' "umls index" "${umls_index:-?}$umls_fix"
 
 	local code verdict
-	code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' https://radar.bioxplorer.org/ 2>/dev/null)
+	code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' https://bioxplorer.org/ 2>/dev/null)
 	# Since 2026-11 the site signs people in itself (Google / Prosopia
 	# buttons), so the healthy answer from outside is 200: the SPA, whose
-	# login page has the buttons. 302 means Cloudflare Access is still in
-	# front, which is harmless but no longer the setup.
+	# login page has the buttons.
 	case "$code" in
 	200) verdict="(sign-in page)" ;;
-	302) verdict="(Cloudflare Access is still in front)" ;;
-	"")  verdict="(no answer)" ;;
+	000|"") verdict="(no answer)" ;;
 	*)   verdict="(unexpected)" ;;
 	esac
-	printf '%-12s %s\n' "public" "https://radar.bioxplorer.org -> ${code:-no answer} $verdict"
+	printf '%-12s %s\n' "public" "https://bioxplorer.org -> ${code:-no answer} $verdict"
+
+	# The backend takes writes only from the origin of its sign-in
+	# callback (BIOXPLORER_OIDC_REDIRECT_URI in .env). If that still names
+	# another site, sign-in works and every save gets 403, which nothing
+	# above would show. A POST to a path no route has is answered by the
+	# cross-site check (403) or, once past it, 404; no route runs and
+	# nothing is written.
+	local own_origin other_origin
+	own_origin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://bioxplorer.org' http://127.0.0.1:8080/api/radar-sh-origin-check 2>/dev/null)
+	other_origin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://radar.bioxplorer.org' http://127.0.0.1:8080/api/radar-sh-origin-check 2>/dev/null)
+	case "$own_origin $other_origin" in
+	"404 403") verdict="ok (writes from https://bioxplorer.org only)" ;;
+	"403 404") verdict="WRONG: writes are taken from radar.bioxplorer.org only (BIOXPLORER_OIDC_REDIRECT_URI in .env still names it; set it to https://bioxplorer.org/auth/login/callback and restart, record 38)" ;;
+	*)         verdict="unexpected ($own_origin / $other_origin)" ;;
+	esac
+	printf '%-12s %s\n' "write origin" "$verdict"
 
 	# Identity is the sign-in cookie. A request that names someone with the
 	# old headers instead must be refused: Caddy drops them and the backend
