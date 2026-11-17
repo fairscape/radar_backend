@@ -237,6 +237,11 @@ def _is_near_duplicate(
     return _name_similarity(a_name, b_name) >= _DEDUP_NAME_THRESHOLD
 
 
+def _code(topic_id: str) -> str:
+    """A topic's code (T10086) from its OpenAlex URL or the bare code."""
+    return str(topic_id).rstrip("/").rsplit("/", 1)[-1]
+
+
 def merge_umls_topics(
     base_filters: dict[str, Any],
     umls_topics_per_paper: list[list[MappedTopic]],
@@ -261,8 +266,8 @@ def merge_umls_topics(
     concept of the same seed already gave, and one whose concept already
     gave a topic (a concept gives one: its nearest the interest lacks,
     CTX-3b); ``per_paper`` are taken. The
-    seeds' topics together: each once (same id, or the same name under
-    another id), with its nearest concept; ``max_additions`` of them, the
+    seeds' topics together: each once (same id -- URL or bare code -- or the
+    same name under another id), with its nearest concept; ``max_additions`` of them, the
     ones more seeds chose first, then the nearer (records/35: on an
     81-seed interest 7 of its 8 OpenAlex topics are among the twenty when
     it has none yet, against 1 by confidence).
@@ -310,15 +315,23 @@ def merge_umls_topics(
         for t in [*(base_filters.get("topics") or []), *(also_have or [])]
         if t.get("id")
     ]
-    existing_ids = {tid for tid, _ in existing}
+    existing_ids = {_code(tid) for tid, _ in existing}
     existing_names = {n.lower() for _, n in existing if n}
     known: dict[str, bool] = {}     # topic id -> the interest has it already
+
+    def name_now(mt: MappedTopic) -> str:
+        # The topic's name now (the by-name index, built from the rich one,
+        # review U4), not the one stored when the seed was mapped: a seed
+        # mapped before OpenAlex renamed it showed the old name (UF-R6).
+        name_of = getattr(index, "name_of", None)     # a stand-in index may have none
+        return (name_of(mt.topic_id) if name_of else None) or mt.display_name
 
     def has_already(mt: MappedTopic) -> bool:
         if mt.topic_id not in known:
             known[mt.topic_id] = (
-                mt.topic_id in existing_ids
+                _code(mt.topic_id) in existing_ids
                 or mt.display_name.lower() in existing_names
+                or name_now(mt).lower() in existing_names
                 # Synonyms such as "Renal Diseases and Glomerulopathies" vs
                 # "Renal and Vascular Pathologies". Not applied between
                 # the UMLS topics themselves: siblings within one field
@@ -334,25 +347,36 @@ def merge_umls_topics(
         # rounded to 4 places go nearest first (review B3-R2).
         return (-mt.similarity, -(mt.confidence or 0.0), mt.rank, mt.display_name.lower(), mt.topic_id)
 
-    best: dict[str, MappedTopic] = {}       # topic name (lowercased) -> its nearest concept
+    # Keyed by the topic's code, not its name: a seed mapped before the
+    # rich index was rebuilt keeps the name OpenAlex gave the topic then,
+    # and one mapped after has the new name -- the same topic twice, each
+    # chosen by one seed (review U6). Its name is still matched too (the
+    # same name under another id, ``by_name``).
+    best: dict[str, MappedTopic] = {}       # topic code -> its nearest concept
     papers: dict[str, list[int]] = {}
+    by_name: dict[str, str] = {}            # topic name (lowercased) -> its key in ``best``
     for i, paper_topics in enumerate(umls_topics_per_paper):
         usable = [mt for mt in paper_topics
                   if _reaches(mt.confidence, min_confidence) and _reaches(mt.similarity, min_similarity)]
-        chosen: dict[str, MappedTopic] = {}
+        chosen: dict[str, MappedTopic] = {}     # topic code -> the concept that gave it
+        chosen_names: set[str] = set()
         gave: set[str] = set()      # concepts of this seed that gave a topic
         for mt in sorted(usable, key=nearest):
             if len(chosen) >= per_paper:
                 break
-            name = mt.display_name.lower()
-            if mt.source_cui in gave or name in chosen or has_already(mt):
+            key, name = _code(mt.topic_id), mt.display_name.lower()
+            if mt.source_cui in gave or key in chosen or name in chosen_names or has_already(mt):
                 continue
-            chosen[name] = mt
+            chosen[key] = mt
+            chosen_names.add(name)
             gave.add(mt.source_cui)
-        for name, mt in chosen.items():
-            papers.setdefault(name, []).append(i)
-            if name not in best or nearest(mt) < nearest(best[name]):
-                best[name] = mt
+        for key, mt in chosen.items():
+            key = key if key in best else by_name.get(mt.display_name.lower(), key)
+            if i not in papers.setdefault(key, []):
+                papers[key].append(i)
+            if key not in best or nearest(mt) < nearest(best[key]):
+                best[key] = mt
+            by_name.setdefault(mt.display_name.lower(), key)
 
     # The topics more seeds chose first: on a large interest one seed's
     # misread word reaches one seed, the subject reaches many.
@@ -360,7 +384,7 @@ def merge_umls_topics(
     new_entries = [
         {
             "id": best[n].topic_id,
-            "display_name": best[n].display_name,
+            "display_name": name_now(best[n]),
             "count": len(papers[n]),
             "source": "umls",
             "on": False,

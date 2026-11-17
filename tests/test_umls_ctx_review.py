@@ -113,14 +113,14 @@ def test_vault_maps_with_the_topic_confidence_setting(paper):
 
 
 def test_a_failed_extraction_waits_out_its_back_off_whoever_asked(paper):
-    from rag_lib.api.services import vault, wizard
+    from rag_lib.api.services import vault
 
     conn, state = paper
     assert vault._try_extract_umls(conn, SETTINGS, "W1", "text") is False
     assert _umls(conn) == (None, None)               # nothing half-written
     assert vault._recently_failed("W1")
-    # step 3 asks again: not run again while it waits
-    wizard._extract_missing_umls(conn, SETTINGS, ["W1"])
+    # asked again (the umls-backfill job, POST /umls): not run again while it waits
+    vault.backfill_seed_umls(conn, SETTINGS, openalex_ids=["W1"])
     assert len(state["calls"]) == 1
     assert vault.seed_umls_status(conn, SETTINGS, ["W1"])["failed"] == 1
     # a later success clears it

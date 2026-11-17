@@ -563,6 +563,16 @@ def _prosopia_interests(conn: sqlite3.Connection, profile_id: int) -> list[dict]
 
 # A saved topic no seed brings any more (FUNCTIONAL_SPEC T.2-2).
 UNMATCHED = "unmatched"
+# Why (review U2, UF-R1): ``"seed_removed"``, a seed removed in this edit
+# (the saved interest has it, the copy not) brought it -- an OpenAlex
+# topic in its OpenAlex record, a UMLS one in its ``seeds``;
+# ``"no_seed"``, no seed brings it now for another reason: read again
+# (CTX-5 redoes every older one, or its text changed) its concepts give
+# other topics, or OpenAlex classed it again when it was fetched again.
+# The edit page said "its seed paper was removed" of all of them, to a
+# user who had removed none.
+UNMATCHED_WHY = "unmatched_why"
+_UNMATCHED_KEYS = (UNMATCHED, UNMATCHED_WHY)
 # The topics a seed brings: OpenAlex's own (no source), mapped from its UMLS
 # concepts. A researcher's profile or Claude-generated topics are not the
 # seeds'. Not ``pdf_content``: topics once guessed from a PDF's text are
@@ -595,18 +605,29 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
     """
     topics = list(topic_filters.get("topics") or [])
     for t in topics:
-        t.pop(UNMATCHED, None)
+        for k in _UNMATCHED_KEYS:
+            t.pop(k, None)
     if _follows_seeds(conn, profile_id) is not False:
         return {**topic_filters, "topics": topics} if topics else topic_filters
     code = researcher_topics.code
     have_ids = {code(t.get("id")) for t in topics if t.get("id")}
     have_names = {(t.get("display_name") or "").lower() for t in topics}
     brought = _seed_topic_codes(conn, profile_id, [*topics, *(stored.get("topics") or [])])
+    seeds_now = set(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    row = conn.execute("SELECT edit_of FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    removed = ({s for s in profiles_repo.list_seed_openalex_ids(conn, int(row["edit_of"])) if s not in seeds_now}
+               if row is not None and row["edit_of"] is not None else set())
+    removed_openalex = _openalex_topic_codes(conn, removed)
+
+    def why(t: dict) -> str:
+        if t.get("source") == "umls":
+            return "seed_removed" if removed & set(t.get("seeds") or []) else "no_seed"
+        return "seed_removed" if code(t["id"]) in removed_openalex else "no_seed"
     # Already in the rebuild but no seed's: a stored copy put back as it was
     # (``_keep_stored_umls`` after a merge that failed).
     for i, t in enumerate(topics):
         if t.get("id") and t.get("source") in _SEED_SOURCES and code(t["id"]) not in brought:
-            topics[i] = {**t, "count": 0, "papers": 0, UNMATCHED: True}
+            topics[i] = {**t, "count": 0, "papers": 0, UNMATCHED: True, UNMATCHED_WHY: why(t)}
     kept = []
     for old in stored.get("topics") or []:
         name = (old.get("display_name") or "").lower()
@@ -620,6 +641,7 @@ def _keep_unmatched_seed_topics(conn: sqlite3.Connection, profile_id: int, store
         if not still:
             t.update(count=0, papers=0)
             t[UNMATCHED] = True
+            t[UNMATCHED_WHY] = why(t)
         kept.append(t)
         have_ids.add(code(t["id"]))
         have_names.add(name)
@@ -657,21 +679,10 @@ def _already_the_interests(conn: sqlite3.Connection, profile_id: int, new_on: bo
             if t.get("id") and t.get("source") != "umls"]
 
 
-def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int, umls_from: list[dict]) -> set[str]:
-    """Every topic a current seed brings, as ``researcher_topics.code``: its
-    OpenAlex topics (``topics_json``, read from the seeds), and the UMLS
-    topics in ``umls_from`` (this rebuild's and the saved list) that a
-    current seed chose (their ``seeds``) and still maps to.
-
-    Not every topic in a seed's ``umls_mapped_topics_json``: since CTX-3b
-    those are each concept's three nearest, candidates, and a concept gives
-    one. A saved UMLS topic only a removed seed chose, which a kept seed
-    has as an unchosen candidate, was taken for "still brought", left to
-    the merge, which did not choose it -- and the user's switched-on topic
-    was gone from the list and the scans (review B3-R1)."""
-    seeds = list(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+def _openalex_topic_codes(conn: sqlite3.Connection, seed_ids) -> set[str]:
+    """The OpenAlex topics of these papers' OpenAlex records, as ``researcher_topics.code``."""
     out: set[str] = set()
-    for oa_id in seeds:
+    for oa_id in seed_ids:
         row = conn.execute("SELECT topics_json FROM papers WHERE openalex_id = ?", (oa_id,)).fetchone()
         if row is None:
             continue
@@ -685,6 +696,23 @@ def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int, umls_from: list
             tid = t.get("id") if isinstance(t, dict) else None
             if tid:
                 out.add(researcher_topics.code(tid))
+    return out
+
+
+def _seed_topic_codes(conn: sqlite3.Connection, profile_id: int, umls_from: list[dict]) -> set[str]:
+    """Every topic a current seed brings, as ``researcher_topics.code``: its
+    OpenAlex topics (``topics_json``, read from the seeds), and the UMLS
+    topics in ``umls_from`` (this rebuild's and the saved list) that a
+    current seed chose (their ``seeds``) and still maps to.
+
+    Not every topic in a seed's ``umls_mapped_topics_json``: since CTX-3b
+    those are each concept's three nearest, candidates, and a concept gives
+    one. A saved UMLS topic only a removed seed chose, which a kept seed
+    has as an unchosen candidate, was taken for "still brought", left to
+    the merge, which did not choose it -- and the user's switched-on topic
+    was gone from the list and the scans (review B3-R1)."""
+    seeds = list(profiles_repo.list_seed_openalex_ids(conn, profile_id))
+    out = _openalex_topic_codes(conn, seeds)
     # A UMLS topic: a current seed chose it (its ``seeds``) and still has it
     # among its concepts' topics now. ``seeds`` says who chose it when it
     # was added; a seed read again since (CTX-5 redoes every older one)
@@ -714,9 +742,9 @@ def _without_unmatched_marks(topic_filters: dict) -> dict:
     """What is stored: ``unmatched`` is worked out on each aggregation from
     the seeds of the time, so a stored one would go stale (a seed added back)."""
     topics = topic_filters.get("topics")
-    if not topics or not any(UNMATCHED in t for t in topics):
+    if not topics or not any(k in t for t in topics for k in _UNMATCHED_KEYS):
         return topic_filters
-    return {**topic_filters, "topics": [{k: v for k, v in t.items() if k != UNMATCHED} for t in topics]}
+    return {**topic_filters, "topics": [{k: v for k, v in t.items() if k not in _UNMATCHED_KEYS} for t in topics]}
 
 
 def _new_topic_on(t: dict, new_on: bool) -> bool:
@@ -2383,61 +2411,6 @@ def _days_ago(days: int) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-# How long the step-3 backfill may spend running the linker. Extraction
-# is ~0.1s per paper warm and the mapping a few embedding calls, so this
-# covers tens of papers; it exists for the case where every seed is
-# pending at once.
-_UMLS_BACKFILL_BUDGET_S = 30.0
-
-
-def _extract_missing_umls(conn, settings, seed_ids: list[str]) -> None:
-    """Fill in UMLS data for seeds that have none yet.
-
-    Delegates to the same ``_try_extract_umls`` the upload path uses, so
-    there is one implementation of what gets extracted and how it is
-    stored — and one place where a failure is swallowed. Papers that
-    already have concepts are left alone; re-running the linker over
-    them would cost seconds each and change nothing.
-
-    Stops starting new extractions once ``_UMLS_BACKFILL_BUDGET_S`` has
-    elapsed. A paper it does not reach keeps its NULL column and is
-    picked up the next time step 3 is opened, which is a better failure
-    than a request that never returns. The budget is checked before each
-    paper, so one pathologically slow paper can overrun it — the point is
-    to bound the count, not to interrupt work in progress.
-    """
-    from .vault import _recently_failed, _try_extract_umls, _umls_input_text
-
-    pending = []
-    for oa_id in seed_ids:
-        row = papers_repo.get_by_openalex_id(conn, oa_id)
-        # A recent failure waits out its back-off here too: step 3 is
-        # loaded again and again, and each time it re-ran the linker on
-        # every failing seed for up to the whole budget.
-        if row is not None and not row["umls_concepts_json"] and not _recently_failed(oa_id):
-            pending.append(row)
-    if not pending:
-        return
-
-    log.info("wizard.umls_extract_on_demand", n=len(pending))
-    deadline = time.monotonic() + _UMLS_BACKFILL_BUDGET_S
-    done = 0
-    for row in pending:
-        if time.monotonic() >= deadline:
-            log.warning(
-                "wizard.umls_extract_budget_exhausted",
-                done=done, remaining=len(pending) - done,
-            )
-            break
-        _try_extract_umls(
-            conn,
-            settings,
-            row["openalex_id"],
-            _umls_input_text(row["title"], row["abstract"], row["body_text"]),
-        )
-        done += 1
-
-
 # Per interest, how the last UMLS merge went, for the topic pages to warn
 # when UMLS topics could not be (fully) brought in. In memory: it describes
 # the list the user is looking at, which was built moments ago.
@@ -2578,22 +2551,8 @@ def _merge_umls_topics(
     whose UMLS data is missing or unreadable are recorded in ``state``,
     and the stored UMLS topics are kept alongside the merge.
 
-    A seed whose extraction has not landed yet is computed here rather
-    than skipped. This began as a race: ``upload()`` ran extraction on a
-    daemon thread and returned immediately, while the wizard reached this
-    point seconds later — the user uploads in step 1 and clicks through
-    to step 3 — so the column was still NULL and step 3 showed only the
-    OpenAlex topics. Upload is synchronous now, so the race is gone and
-    the usual case is nothing pending. What is left is the genuine
-    backfill: papers whose extraction failed into the blanket ``except``
-    in ``_try_extract_umls``, and papers uploaded while the feature was
-    switched off.
-
-    Per paper the cost is a tenth of a second once the models are warm,
-    but nothing bounded how many papers that covered, and this runs
-    inside a request. ``_extract_missing_umls`` therefore works to a wall
-    clock rather than to the seed count; whatever it does not reach stays
-    pending for the next call.
+    A seed whose extraction has not landed yet is pending, not read here
+    (review U5): see the note below.
     """
     from ..settings import get_settings
     settings = get_settings()
@@ -2606,8 +2565,15 @@ def _merge_umls_topics(
     if not seed_ids:
         return topic_filters
 
-    forget_stale_umls_mappings(conn, seed_ids)
-    _extract_missing_umls(conn, settings, seed_ids)
+    # Nothing is read here (review U5): the seeds are read before the list
+    # is asked for -- step 3 and the edit page's Topics step POST /umls
+    # (which also sends older data back, ``forget_stale_umls_mappings``)
+    # and wait for it; an import's thread reads its seeds, and the
+    # umls-backfill job picks up any other. Read in the request, up to 30 s of it, a list
+    # and every switch on the edit page of an interest saved before CTX
+    # took ~33 s each while its seeds were read a batch at a time, and
+    # the list grew under the user's clicks. A seed not read yet is
+    # pending: the stored UMLS topics are kept beside the merge.
 
     from .vault import _recently_failed
 

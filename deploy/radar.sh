@@ -215,8 +215,12 @@ do_status() {
 	# (review CTX-R1; deploy/README.md "UMLS topic index").
 	local umls_index
 	umls_index=$(curl -s -m 5 http://127.0.0.1:8000/api/health 2>/dev/null \
-		| grep -o '"umls_topic_index":"[a-z]*"' | cut -d'"' -f4)
-	printf '%-12s %s\n' "umls index" "${umls_index:-?}$([ "$umls_index" = unusable ] && echo '  -> build it: deploy/README.md "UMLS topic index"')"
+		| grep -o '"umls_topic_index":"[a-z_]*"' | cut -d'"' -f4)
+	local umls_fix=""
+	[ "$umls_index" = unusable ] && umls_fix='  -> build it: deploy/README.md "UMLS topic index"'
+	# The by-name index names topics other than the rich one does (review U4).
+	[ "$umls_index" = names_differ ] && umls_fix='  -> rebuild the by-name index: deploy/README.md "UMLS topic index"'
+	printf '%-12s %s\n' "umls index" "${umls_index:-?}$umls_fix"
 
 	local code verdict
 	code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' https://radar.bioxplorer.org/ 2>/dev/null)

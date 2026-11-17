@@ -425,9 +425,10 @@ def upload(
     # Chroma indexing (_defer_heavy_indexing) is off for the same reason:
     # its background thread held the DB write lock for seconds per chunk.
     #
-    # Nothing is lost by dropping it: _try_merge_umls_topics computes
-    # whatever a profile's seeds are missing when step 3 asks for the
-    # topics, which is the only place the result is read.
+    # Nothing is lost by dropping it: wizard step 3 and the edit page's
+    # Topics step read the seeds first (POST /umls, a background job) and
+    # show the list once they are read; the umls-backfill job picks up any
+    # other seed (review U5).
 
     row = papers_repo.get_by_openalex_id(conn, openalex_id)
     log.info(

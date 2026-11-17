@@ -15,7 +15,9 @@ topic embedded as its name, OpenAlex's description and its keywords
 OpenAlex key (``RADAR_OPENALEX_API_KEY``), into openalex_topics_rich.json /
 openalex_topic_rich_embeddings.npz / openalex_topic_rich_index.meta.json.
 ``--topics-json PATH`` embeds topics fetched earlier (that same JSON format)
-without calling OpenAlex.
+without calling OpenAlex; without ``--rich`` it builds the by-name index
+from them (their names only), so the two indexes name every topic alike:
+``--topics-json data/umls_cache/openalex_topics_rich.json`` (review U4).
 
 Usage:
     python scripts/build_topic_index.py [--embedding-model specter2] [--output-dir data/umls_cache]
@@ -166,11 +168,9 @@ def main():
     )
     parser.add_argument(
         "--topics-json", type=Path, default=None,
-        help="With --rich: embed topics from this JSON (as --rich saves them) instead of fetching",
+        help="Embed topics from this JSON (as --rich saves them) instead of fetching; without --rich, their names only",
     )
     args = parser.parse_args()
-    if args.topics_json and not args.rich:
-        parser.error("--topics-json needs --rich")
 
     from rag_lib.umls import cache
 
@@ -180,6 +180,9 @@ def main():
     if args.topics_json:
         topics = json.loads(args.topics_json.read_text(encoding="utf-8"))
         print(f"Read {len(topics)} topics from {args.topics_json}")
+        if not args.rich:
+            # The by-name index's format: no description or keywords.
+            topics = [{k: t.get(k) for k in ("id", "display_name", "subfield", "field", "domain")} for t in topics]
     elif args.rich:
         print("Fetching OpenAlex topics with descriptions and keywords...")
         topics = fetch_rich_topics()

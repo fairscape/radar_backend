@@ -129,6 +129,12 @@ async def lifespan(app: FastAPI):
         if problem:
             log.error("api.umls_topic_index_unusable", problem=problem,
                       fix="python scripts/build_topic_index.py --rich")
+        from ..umls.cache import topic_names_problem
+        names = topic_names_problem(settings.RADAR_UMLS_CACHE_DIR)
+        if names:
+            log.error("api.umls_topic_names_differ", problem=names,
+                      fix="python scripts/build_topic_index.py --topics-json "
+                          f"{settings.RADAR_UMLS_CACHE_DIR}/openalex_topics_rich.json")
 
     try:
         yield

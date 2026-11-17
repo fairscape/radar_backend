@@ -44,9 +44,11 @@ def health(
 def _umls_topic_index(settings: Settings) -> str | None:
     if not settings.RADAR_UMLS_ENABLED:
         return None
-    from ...umls.cache import rich_index_problem
-    problem = rich_index_problem(settings.RADAR_UMLS_CACHE_DIR, settings.RADAR_UMLS_EMBEDDING_MODEL)
-    return "unusable" if problem else "ok"
+    from ...umls.cache import rich_index_problem, topic_names_problem
+    if rich_index_problem(settings.RADAR_UMLS_CACHE_DIR, settings.RADAR_UMLS_EMBEDDING_MODEL):
+        return "unusable"
+    # Usable, but "already has" compares by names the mapper no longer uses (review U4).
+    return "names_differ" if topic_names_problem(settings.RADAR_UMLS_CACHE_DIR) else "ok"
 
 
 @router.get("/openalex/status")

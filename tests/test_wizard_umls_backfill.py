@@ -1,14 +1,15 @@
-"""Step 3 computes UMLS data for seeds whose extraction has not landed.
+"""Building a topic list reads no seed (review U5).
 
-``vault.upload`` starts extraction on a daemon thread and returns, but
-the wizard reads ``papers.umls_mapped_topics_json`` synchronously a few
-seconds later — the user uploads in step 1 and clicks through to step 3.
-The column was still NULL, so step 3 showed only the OpenAlex topics and
-said nothing about the half that was still being computed.
+The seeds are read before the list is asked for: step 3 and the edit
+page's Topics step POST /umls and wait (that also sends data made by
+earlier rules back to extraction), an upload reads its own at once, and
+the umls-backfill job picks up any other. The list used to read them
+itself, up to 30 s a request: on an interest saved before CTX, the edit
+page's list and every switch took ~33 s each while the seeds were read a
+batch at a time, and the list grew under the user's clicks. A seed not
+read yet is pending, and the stored UMLS topics are kept beside it.
 
-These tests stub the extractor: what matters here is which papers are
-handed to it and what text they are handed, not what SciSpacy does with
-it.
+The extractor is a stub: what matters is that nothing calls it here.
 """
 
 from __future__ import annotations
@@ -25,15 +26,16 @@ from rag_lib.db.repos import (
     users as users_repo,
 )
 
-
-class _Settings:
-    RADAR_UMLS_ENABLED = True
-    RADAR_UMLS_MAX_TOPIC_ADDITIONS = 10
-    RADAR_UMLS_CACHE_DIR = "/nonexistent"
+_EMPTY = {"topics": [], "subfields": [], "fields": [], "domains": []}
 
 
 @pytest.fixture
-def db(tmp_path):
+def db(tmp_path, monkeypatch):
+    from rag_lib.api import settings as settings_mod
+
+    monkeypatch.setenv("RADAR_UMLS_ENABLED", "true")
+    monkeypatch.setenv("RADAR_UMLS_CACHE_DIR", str(tmp_path / "umls_cache"))
+    settings_mod.get_settings.cache_clear()
     conn = connect(tmp_path / "radar.db")
     apply_migrations(conn)
     user = users_repo.upsert(conn, "demo@example.com")
@@ -41,122 +43,56 @@ def db(tmp_path):
         conn, user_id=int(user["id"]), name="p",
         embedding_model="placeholder-v1", n_seed=0, topic_filters={},
     )
-    yield conn, int(pid)
+    called: list[str] = []
+    monkeypatch.setattr("rag_lib.api.services.vault._try_extract_umls",
+                        lambda c, s, oid, text: called.append(oid))
+    forgot: list[list[str]] = []
+    monkeypatch.setattr(wizard_service, "forget_stale_umls_mappings",
+                        lambda c, ids: forgot.append(list(ids)))
+    yield conn, int(pid), called, forgot
     conn.close()
+    settings_mod.get_settings.cache_clear()
 
 
-def _seed(conn, profile_id, oid, *, concepts=None, title="A Title",
-          abstract="an abstract", body="body text"):
-    papers_repo.upsert(conn, {
-        "openalex_id": oid, "title": title, "abstract": abstract,
-        "body_text": body, "source": "user_pdf",
-    })
-    if concepts is not None:
-        conn.execute(
-            "UPDATE papers SET umls_concepts_json = ? WHERE openalex_id = ?",
-            (json.dumps(concepts), oid),
-        )
+def _seed(conn, profile_id, oid, *, concepts=None, mapped=None):
+    papers_repo.upsert(conn, {"openalex_id": oid, "title": "A Title", "abstract": "an abstract",
+                              "body_text": "body text", "source": "user_pdf"})
+    conn.execute("UPDATE papers SET umls_concepts_json = ?, umls_mapped_topics_json = ? WHERE openalex_id = ?",
+                 (None if concepts is None else json.dumps(concepts),
+                  None if mapped is None else json.dumps(mapped), oid))
     conn.commit()
     profiles_repo.attach_seed(conn, profile_id, oid)
     conn.commit()
 
 
-def test_a_seed_with_no_concepts_is_extracted_on_demand(db, monkeypatch):
-    conn, pid = db
+def test_a_seed_not_read_yet_is_pending_not_read_here(db):
+    conn, pid, called, forgot = db
     _seed(conn, pid, "W_PENDING")
-
-    called: list[str] = []
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: called.append(oid),
-    )
-    wizard_service._extract_missing_umls(conn, _Settings(), ["W_PENDING"])
-
-    assert called == ["W_PENDING"]
+    wizard_service._try_merge_umls_topics(conn, pid, dict(_EMPTY))
+    assert called == [] and forgot == []
+    state = wizard_service.umls_topics_state(pid)
+    assert state["available"] is False and state["reason"] == "pending" and state["n"] == 1
 
 
-def test_a_seed_that_already_has_concepts_is_left_alone(db, monkeypatch):
-    """Re-running the linker costs seconds a paper and changes nothing."""
-    conn, pid = db
-    _seed(conn, pid, "W_DONE", concepts=[{"cui": "C0011860"}])
-
-    called: list[str] = []
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: called.append(oid),
-    )
-    wizard_service._extract_missing_umls(conn, _Settings(), ["W_DONE"])
-
-    assert called == []
-
-
-def test_only_the_pending_seeds_are_extracted(db, monkeypatch):
-    conn, pid = db
-    _seed(conn, pid, "W_DONE", concepts=[{"cui": "C1"}])
-    _seed(conn, pid, "W_PENDING_A")
-    _seed(conn, pid, "W_PENDING_B")
-
-    called: list[str] = []
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: called.append(oid),
-    )
-    wizard_service._extract_missing_umls(
-        conn, _Settings(), ["W_DONE", "W_PENDING_A", "W_PENDING_B"],
-    )
-
-    assert called == ["W_PENDING_A", "W_PENDING_B"]
-
-
-def test_the_text_handed_to_the_extractor_leads_with_the_title(db, monkeypatch):
-    """Same selection rule as the upload path — the title first, because
-    an abstract that only ever says "T2DM" yields no diabetes concept."""
-    conn, pid = db
-    _seed(conn, pid, "W1",
-          title="Early detection of type 2 diabetes mellitus",
-          abstract="T2DM screening with ML")
-
-    seen: dict = {}
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: seen.update(text=text),
-    )
-    wizard_service._extract_missing_umls(conn, _Settings(), ["W1"])
-
-    assert seen["text"].startswith("Early detection of type 2 diabetes mellitus")
-    assert "T2DM screening with ML" in seen["text"]
+def test_data_made_by_earlier_rules_is_left_as_it_is_by_a_build(db):
+    """Sent back to extraction by POST /umls only: a build used to NULL it
+    and then read it inside the request."""
+    conn, pid, called, forgot = db
+    old = [{"topic_id": "https://openalex.org/T9", "display_name": "Nine", "similarity": 0.9,
+            "source_cui": "C1", "source_name": "c", "confidence": 0.95, "mapping": "context-1"}]
+    _seed(conn, pid, "W_OLD", concepts=[{"cui": "C1", "name": "c", "confidence": 0.95}], mapped=old)
+    wizard_service._try_merge_umls_topics(conn, pid, dict(_EMPTY))
+    assert called == [] and forgot == []
+    row = conn.execute("SELECT umls_mapped_topics_json FROM papers WHERE openalex_id = 'W_OLD'").fetchone()
+    assert json.loads(row[0]) == old
 
 
 def test_nothing_runs_when_umls_is_disabled(db, monkeypatch):
-    conn, pid = db
+    conn, pid, called, forgot = db
     _seed(conn, pid, "W1")
-
-    called: list[str] = []
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: called.append(oid),
-    )
-
-    class _Off(_Settings):
-        RADAR_UMLS_ENABLED = False
-
-    monkeypatch.setattr(wizard_service, "get_settings", lambda: _Off(),
-                        raising=False)
-    monkeypatch.setattr("rag_lib.api.settings.get_settings", lambda: _Off())
-    out = wizard_service._try_merge_umls_topics(
-        conn, pid, {"topics": [], "subfields": [], "fields": [], "domains": []},
-    )
-
-    assert called == []
-    assert out == {"topics": [], "subfields": [], "fields": [], "domains": []}
-
-
-def test_an_unknown_seed_id_does_not_raise(db, monkeypatch):
-    conn, pid = db
-    called: list[str] = []
-    monkeypatch.setattr(
-        "rag_lib.api.services.vault._try_extract_umls",
-        lambda c, s, oid, text: called.append(oid),
-    )
-    wizard_service._extract_missing_umls(conn, _Settings(), ["W_MISSING"])
-    assert called == []
+    monkeypatch.setenv("RADAR_UMLS_ENABLED", "false")
+    from rag_lib.api import settings as settings_mod
+    settings_mod.get_settings.cache_clear()
+    out = wizard_service._try_merge_umls_topics(conn, pid, dict(_EMPTY))
+    assert called == [] and forgot == []
+    assert out == _EMPTY

@@ -884,7 +884,7 @@ def _main_paper(argv: list[str]) -> int:
     # Narrate the same decisions, then check the narration against the real
     # merge — same contract as the stage-1 walkthrough above.
     from .cache import get_topic_index
-    from .topic_mapper import _embedding_similarity, _is_near_duplicate, _reaches
+    from .topic_mapper import _code, _embedding_similarity, _is_near_duplicate, _reaches
 
     try:
         index = get_topic_index(cache)
@@ -895,7 +895,7 @@ def _main_paper(argv: list[str]) -> int:
     accepted: list[str] = []
     acc_names: set = set()
     gave: set = set()
-    seen_ids = {i for i, _ in existing}
+    seen_ids = {_code(i) for i, _ in existing}
     seen_names = {n.lower() for _, n in existing if n}
     usable = [m for m in mapped if _reaches(m.confidence, min_conf_t) and _reaches(m.similarity, min_sim_t)]
     rest = [m for m in mapped if m not in usable]
@@ -903,7 +903,7 @@ def _main_paper(argv: list[str]) -> int:
                                            x.topic_id)) + rest:
         dup = None
         if _reaches(m.confidence, min_conf_t) and _reaches(m.similarity, min_sim_t) \
-                and m.topic_id not in seen_ids \
+                and _code(m.topic_id) not in seen_ids \
                 and m.display_name.lower() not in seen_names:
             dup = next(((en, _embedding_similarity(index, m.topic_id, eid))
                         for eid, en in existing
@@ -913,14 +913,14 @@ def _main_paper(argv: list[str]) -> int:
             why = f"skip  confidence under {min_conf_t}"
         elif not _reaches(m.similarity, min_sim_t):
             why = f"skip  similarity {m.similarity} under {min_sim_t}"
-        elif m.topic_id in seen_ids or m.display_name.lower() in seen_names:
+        elif _code(m.topic_id) in seen_ids or m.display_name.lower() in seen_names:
             why = "skip  the paper's own topic"
         elif dup:
             why = f"skip  near-duplicate of '{dup[0][:30]}'" + (
                 f" cos={dup[1]:.3f}" if dup[1] is not None else "")
         elif m.source_cui in gave:
             why = "skip  this concept already gave a nearer topic"
-        elif m.display_name.lower() in acc_names:
+        elif _code(m.topic_id) in {_code(a) for a in accepted} or m.display_name.lower() in acc_names:
             why = "skip  topic already given by a nearer concept"
         elif len(accepted) >= min(per_seed, max_add):
             why = f"cut   ({min(per_seed, max_add)} taken)"

@@ -107,10 +107,18 @@ def test_a_mapping_stored_by_the_earlier_rules_goes_back_to_extraction(db, monke
     extracted = []
     monkeypatch.setattr("rag_lib.api.services.vault._try_extract_umls",
                         lambda c, s, oid, text: extracted.append(oid))
+    # A list built reads and forgets nothing (review U5) ...
     wizard_service._aggregate_topics(conn, pid, new_on=True)
-    assert sorted(extracted) == ["W1", "W3"]
-    for oid in ("W1", "W3"):
-        assert conn.execute("SELECT umls_concepts_json FROM papers WHERE openalex_id = ?", (oid,)).fetchone()[0] is None
+    assert extracted == []
+    # (W1's entries, without a confidence, are unreadable: bad data goes back as before)
+    assert all(conn.execute("SELECT umls_concepts_json FROM papers WHERE openalex_id = ?", (oid,)).fetchone()[0]
+               is not None for oid in ("W2", "W3", "W4"))
+    # ... POST /umls, which the pages wait on first, sends the stale ones back
+    _seed(conn, pid, "W1", old)
+    wizard_service.forget_stale_umls_mappings(conn, ["W1", "W2", "W3", "W4"])
+    gone = {oid for oid in ("W1", "W2", "W3", "W4")
+            if conn.execute("SELECT umls_concepts_json FROM papers WHERE openalex_id = ?", (oid,)).fetchone()[0] is None}
+    assert gone == {"W1", "W3"}
 
 
 def test_step_3_entry_sends_an_old_mapping_back_before_it_waits(db):

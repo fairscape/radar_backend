@@ -63,7 +63,7 @@ class Health(_Model):
     # "ok" / "unusable": whether UMLS concepts can be mapped to topics (the
     # rich topic index, scripts/build_topic_index.py --rich); None with
     # UMLS switched off.
-    umls_topic_index: Literal["ok", "unusable"] | None = None
+    umls_topic_index: Literal["ok", "unusable", "names_differ"] | None = None
 
 
 class Profile(_Model):
@@ -247,6 +247,10 @@ class Topic(_Model):
     # since): kept as saved (FUNCTIONAL_SPEC T.2-2). Set on the edit page's
     # list (``topics/preview``); None elsewhere.
     unmatched: bool | None = None
+    # Why no seed brings it (only with ``unmatched``): "seed_removed", a seed
+    # removed in this edit brought it; "no_seed", another reason (a seed read
+    # again, or classed again by OpenAlex). wizard.UNMATCHED_WHY.
+    unmatched_why: Literal["seed_removed", "no_seed"] | None = None
     # The Prosopia profiles that list it as an interest (FUNCTIONAL_SPEC
     # M.3): ``[{"profile"}]``, their names; None when none does.
     prosopia: list[dict] | None = None

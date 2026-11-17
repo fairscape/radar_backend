@@ -161,7 +161,9 @@ by confidence, then rank, then name. Skip a pair when:
 Take `RADAR_UMLS_TOPICS_PER_PAPER` (5) per seed.
 
 **Across seeds**:
-- Each topic is listed once, with its nearest concept.
+- Each topic is listed once, with its nearest concept. "Once" is by topic
+  id (URL or bare code), then by name: a topic OpenAlex renamed between two
+  index builds keeps one entry.
 - More seeds first, then nearer.
 - At most `RADAR_UMLS_MAX_TOPIC_ADDITIONS` (20) for the interest.
 
@@ -221,7 +223,8 @@ dropped by a rebuild.**
 
 | Case | What happens |
 |---|---|
-| No current seed brings the topic (its seed was removed, or its seed now maps elsewhere) | Kept, on or off as saved, marked *unmatched* ("brought by seed papers you removed") |
+| No current seed brings the topic, and a seed removed in this edit brought it (an OpenAlex topic in its OpenAlex record, a UMLS topic in its `seeds`) | Kept, on or off as saved, marked *unmatched*, `unmatched_why: "seed_removed"` ("its seed paper was removed") |
+| No current seed brings the topic for another reason: a seed read again maps elsewhere (CTX-5, or its text changed), or OpenAlex classed a seed again when it was fetched again | Kept, on or off as saved, marked *unmatched*, `unmatched_why: "no_seed"` ("no seed brings it now") |
 | A current seed still brings it, but the merge did not choose it (cap, or a nearer concept) | Kept as saved, on or off, not marked (T-5c). The UMLS topics may then pass 20 |
 | A topic the new seeds bring | Shown *new*, off |
 | A new interest's draft | Follows its seeds: nothing is kept |
@@ -247,7 +250,20 @@ openalex_topic_rich_index.meta.json    {"embedding_model": "mxbai-embed-large", 
 **What each row is**: a topic embedded as its name, OpenAlex's description
 and its keywords, higher-scored first (`cache.rich_topic_text`). The older
 name-only files (`openalex_topics.json`, `openalex_topic_embeddings.npz`)
-are still used for the "already has it" test and by other features.
+are still used for the "already has it" test and by other features. They
+must name every topic as the rich index does: built months apart, 56 names
+had changed, and a topic renamed from a broad name to a narrow one was
+compared by the broad one. Rebuild them from the rich index's topics (names
+only, no OpenAlex call):
+
+```sh
+python scripts/build_topic_index.py --topics-json data/umls_cache/openalex_topics_rich.json --output-dir data/umls_cache
+```
+
+Restart the backend after: each index is loaded once per process. When the
+two disagree, the startup log says so (`api.umls_topic_names_differ`),
+`/api/health` reports `"umls_topic_index": "names_differ"` and so does
+`radar.sh status`.
 
 **Build**:
 
@@ -273,19 +289,24 @@ mapped:
 
 ## 8. When extraction runs, and older data
 
-- **When**: at upload or import (`vault._try_extract_umls`), and for seeds
-  still missing data when the topic list is built
-  (`wizard._extract_missing_umls`).
+- **When**: by an import's thread for its seeds (`vault.backfill_seed_umls`,
+  which runs `vault._try_extract_umls`; an upload does not read at once); when wizard
+  step 3 or the edit page's Topics step opens (`POST /api/profiles/{key}/umls`,
+  a background job the page polls; the list is shown once every seed is
+  read); and every 15 minutes for any seed still missing data
+  (`umls-backfill`). Building a topic list or saving a switch never reads a
+  seed: a seed not read yet is *pending*, and the saved UMLS topics are kept.
 - **Failures**: a failed extraction waits `_UMLS_RETRY_AFTER_S` (6 h) before
   the next try, and the list says "failed" rather than "computing".
-- **Older data** is extracted again once, the next time an interest's topics
-  are built (`wizard.forget_stale_umls_mappings`,
+- **Older data** is extracted again once, when step 3 or the edit page's
+  Topics step next opens (`wizard.forget_stale_umls_mappings`,
   `topic_mapper.stale_extraction`). Older data means either:
   - concepts stored without `mentions`, or
   - a mapping whose `mapping` is not `context-2`: name-only, or one topic
     per concept.
 
-  The first build after the 2026-11-12 release is slower for that reason.
+  The first time an interest saved before the 2026-11-12 release is
+  edited, its Topics step shows the seeds being read before the list.
 - **Nothing found**: `"[]"` is not older data.
 
 ## 9. Settings

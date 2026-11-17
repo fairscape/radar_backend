@@ -100,7 +100,22 @@ def test_the_name_only_build_is_unchanged(script, tmp_path, monkeypatch):
     assert sorted(p.name for p in out.iterdir()) == sorted([cache.TOPICS_FILE, cache.EMBEDDINGS_FILE, cache.META_FILE])
 
 
-def test_topics_json_needs_rich(script, tmp_path, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["x", "--topics-json", str(tmp_path / "t.json")])
-    with pytest.raises(SystemExit):
-        script.main()
+def test_topics_json_without_rich_builds_the_name_index_from_their_names(script, tmp_path, monkeypatch):
+    """Review U4: the by-name index rebuilt from the rich index's topics,
+    so both name every topic alike -- names only, no OpenAlex call."""
+    from rag_lib.umls import cache
+
+    topics = [{**_topic(i), "subfield": "Sub", "field": "F", "domain": "D"} for i in range(2)]
+    src = tmp_path / "topics.json"
+    src.write_text(json.dumps(topics))
+    monkeypatch.setattr(script, "fetch_all_topics", lambda mailto: pytest.fail("fetched"))
+    texts = []
+    monkeypatch.setattr(script, "get_embedder", lambda name: (lambda t: texts.append(t) or [1.0, 0.0]))
+    out = tmp_path / "cache"
+    monkeypatch.setattr(sys, "argv", ["x", "--topics-json", str(src), "--output-dir", str(out),
+                                      "--embedding-model", "model-x"])
+    script.main()
+    assert texts == ["Topic 0", "Topic 1"]
+    assert sorted(p.name for p in out.iterdir()) == sorted([cache.TOPICS_FILE, cache.EMBEDDINGS_FILE, cache.META_FILE])
+    assert json.loads((out / cache.TOPICS_FILE).read_text())[0] == {
+        "id": "https://openalex.org/T0", "display_name": "Topic 0", "subfield": "Sub", "field": "F", "domain": "D"}

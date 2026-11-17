@@ -104,6 +104,20 @@ and old UMLS data is left as it is: `start_backend.sh` warns, the backend
 logs `api.umls_topic_index_unusable`, `/api/health` says
 `"umls_topic_index": "unusable"` and `radar.sh status` shows it.
 
+The older by-name index (`openalex_topics.json`,
+`openalex_topic_embeddings.npz`), used to tell whether an interest already
+has a topic, must name the topics as the rich one does (review U4). Rebuild
+it from the rich index's topics, names only, without calling OpenAlex, and
+restart the backend (each index is loaded once per process):
+
+    PYTHONNOUSERSITE=1 /bigtemp/nkw3mr/radar_deployment/conda_env312/bin/python \
+        scripts/build_topic_index.py --topics-json data/umls_cache/openalex_topics_rich.json \
+        --output-dir data/umls_cache
+
+When they disagree the backend logs `api.umls_topic_names_differ`,
+`/api/health` says `"umls_topic_index": "names_differ"` and `radar.sh status`
+shows it.
+
 ## When the data shrinks: pinned copies
 
 `backup.sh` does not try to tell an accident from a deliberate cleanup.

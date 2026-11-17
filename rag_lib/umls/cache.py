@@ -82,6 +82,11 @@ class TopicIndex:
             t["id"]: i for i, t in enumerate(topics) if t.get("id")
         }
 
+    def name_of(self, topic_id: str) -> str | None:
+        """The topic's name in this index, or None when it is not in it."""
+        row = self._row_by_id.get(topic_id)
+        return None if row is None else self.topics[row].get("display_name")
+
     def vector_for(self, topic_id: str) -> np.ndarray | None:
         """Row-normalized embedding for an OpenAlex topic id.
 
@@ -188,6 +193,28 @@ def rich_index_problem(cache_dir: str | Path, embedding_model: str | None) -> st
     except Exception as exc:  # noqa: BLE001 -- missing file, mismatch, bad JSON, bad npz
         return f"{type(exc).__name__}: {exc}"[:300]
     return None
+
+
+def topic_names_problem(cache_dir: str | Path) -> str | None:
+    """How the by-name index (the "already has" check) and the rich index
+    (the mapper's) disagree on the topics or their names, or None when they
+    agree or one cannot be read (said elsewhere). Built months apart, 56 of
+    the names had changed: the check compared each by its old name, and a
+    topic renamed from a broad one ("Cancer Research and Treatment", now
+    "Cancer Nanomedicine") was a near-duplicate of dozens (review U4).
+    Rebuild the by-name one from the rich one's topics:
+    ``python scripts/build_topic_index.py --topics-json <dir>/openalex_topics_rich.json``."""
+    try:
+        names = {t.get("id"): t.get("display_name") for t in get_topic_index(cache_dir).topics}
+        rich = {t.get("id"): t.get("display_name") for t in get_rich_topic_index(cache_dir).topics}
+    except Exception:  # noqa: BLE001 -- missing or unreadable: not this check's to say
+        return None
+    renamed = sorted(i for i in names.keys() & rich.keys() if names[i] != rich[i])
+    only = len(names.keys() ^ rich.keys())
+    if not renamed and not only:
+        return None
+    eg = f"; e.g. {renamed[0]}: {names[renamed[0]]!r} is now {rich[renamed[0]]!r}" if renamed else ""
+    return f"{len(renamed)} topics named differently and {only} in only one of the two indexes{eg}"[:300]
 
 
 def get_rich_topic_index(cache_dir: str | Path) -> TopicIndex:
