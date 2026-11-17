@@ -9,6 +9,13 @@ The deployed system runs via Docker Compose — see
 [radar_deployment](https://github.com/fairscape/radar_deployment).
 This README covers the standalone backend.
 
+## Branches and releases
+
+- `main` is what runs online at https://radar.bioxplorer.org. Each update online is tagged `vYYYY.MM.DD`.
+- `develop` holds changes that have been reviewed, tested and tried on the test site, but are not online yet.
+- `functional-spec-oct2026` was the development branch until 2026-11-16. It is frozen at the v2026.11.16 commit; use `develop`.
+- [CHANGELOG.md](CHANGELOG.md) says what changed in each update online. `radar_frontend` has its own changelog; the two repositories are deployed together.
+
 ## What it does
 
 - **Profiles.** A user uploads ~10 seed PDFs; the backend pulls
